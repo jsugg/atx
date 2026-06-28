@@ -1,2 +1,3 @@
-.local/
 .serena/
+target/
+*.profraw
