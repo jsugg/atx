@@ -1,0 +1,46 @@
+[package]
+name = "atx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Reliable per-user command scheduler for macOS and Linux"
+repository = "https://github.com/jsugg/atx"
+readme = "README.md"
+license = "MIT"
+keywords = ["scheduler", "cli", "jobs", "timer", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
+include = [
+    "src/**",
+    "migrations/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE-MIT",
+]
+
+[[bin]]
+name = "atx"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+overflow-checks = true
+strip = "symbols"
+incremental = false
