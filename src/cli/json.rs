@@ -1,0 +1,1 @@
+//! Stable machine-readable output.

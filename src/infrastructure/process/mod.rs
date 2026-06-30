@@ -1,0 +1,1 @@
+//! Native process adapter.

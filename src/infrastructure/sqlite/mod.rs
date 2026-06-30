@@ -1,0 +1,1 @@
+//! `SQLite` job-store adapter.
