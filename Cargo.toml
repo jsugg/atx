@@ -11,13 +11,13 @@ keywords = ["scheduler", "cli", "jobs", "timer", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
 include = [
-    "src/**",
-    "migrations/**",
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE-MIT",
+    "/src/**",
+    "/migrations/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
 ]
 
 [[bin]]
