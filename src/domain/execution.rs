@@ -1,1 +1,288 @@
 //! Command execution specification.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use thiserror::Error;
+
+const MAX_ARGUMENT_BYTES: usize = 128 * 1024;
+const MAX_SERIALIZED_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionMode {
+    Direct,
+    Shell,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SecretString(String);
+
+impl SecretString {
+    fn new(value: String) -> Result<Self, ExecutionError> {
+        if value.contains('\0') {
+            return Err(ExecutionError::ContainsNul("environment value"));
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SecretString {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct Environment(BTreeMap<String, SecretString>);
+
+impl Environment {
+    pub(crate) const fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub(crate) fn from_pairs<K, V, I>(pairs: I) -> Result<Self, ExecutionError>
+    where
+        K: Into<String>,
+        V: Into<String>,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let mut values = BTreeMap::new();
+        for (key, value) in pairs {
+            let key = key.into();
+            validate_environment_key(&key)?;
+            values.insert(key, SecretString::new(value.into())?);
+        }
+        Ok(Self(values))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &SecretString)> {
+        self.0.iter().map(|(key, value)| (key.as_str(), value))
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(key, value)| key.len() + value.expose().len() + 2)
+            .sum()
+    }
+}
+
+fn validate_environment_key(key: &str) -> Result<(), ExecutionError> {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(ExecutionError::InvalidEnvironmentKey);
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        return Err(ExecutionError::InvalidEnvironmentKey);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StdinPolicy {
+    Null,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputPolicy {
+    BoundedFile,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ExecutionSpec {
+    mode: ExecutionMode,
+    argv: Vec<String>,
+    working_directory: PathBuf,
+    environment: Environment,
+    stdin: StdinPolicy,
+    stdout: OutputPolicy,
+    stderr: OutputPolicy,
+    shell_path: Option<PathBuf>,
+}
+
+impl ExecutionSpec {
+    pub(crate) fn new(
+        mode: ExecutionMode,
+        argv: Vec<String>,
+        working_directory: String,
+        environment: Environment,
+    ) -> Result<Self, ExecutionError> {
+        if argv.is_empty() {
+            return Err(ExecutionError::EmptyArguments);
+        }
+        if mode == ExecutionMode::Shell && argv.len() != 1 {
+            return Err(ExecutionError::ShellArgumentCount);
+        }
+        for argument in &argv {
+            if argument.contains('\0') {
+                return Err(ExecutionError::ContainsNul("argument"));
+            }
+            if argument.len() > MAX_ARGUMENT_BYTES {
+                return Err(ExecutionError::ArgumentTooLarge);
+            }
+        }
+
+        let working_directory = PathBuf::from(working_directory);
+        if !working_directory.is_absolute() {
+            return Err(ExecutionError::WorkingDirectoryNotAbsolute);
+        }
+
+        let serialized_size = argv.iter().map(String::len).sum::<usize>()
+            + environment.serialized_size()
+            + working_directory.as_os_str().len();
+        if serialized_size > MAX_SERIALIZED_BYTES {
+            return Err(ExecutionError::SerializedSizeExceeded);
+        }
+
+        Ok(Self {
+            mode,
+            argv,
+            working_directory,
+            environment,
+            stdin: StdinPolicy::Null,
+            stdout: OutputPolicy::BoundedFile,
+            stderr: OutputPolicy::BoundedFile,
+            shell_path: (mode == ExecutionMode::Shell).then(|| PathBuf::from("/bin/sh")),
+        })
+    }
+
+    pub(crate) fn mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    pub(crate) fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+
+    pub(crate) fn environment(&self) -> &Environment {
+        &self.environment
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub(crate) enum ExecutionError {
+    #[error("command arguments cannot be empty")]
+    EmptyArguments,
+    #[error("shell mode requires exactly one command string")]
+    ShellArgumentCount,
+    #[error("{0} cannot contain NUL")]
+    ContainsNul(&'static str),
+    #[error("one command argument exceeds 128 KiB")]
+    ArgumentTooLarge,
+    #[error("argv and environment exceed 1 MiB")]
+    SerializedSizeExceeded,
+    #[error("working directory must be absolute")]
+    WorkingDirectoryNotAbsolute,
+    #[error("invalid environment variable name")]
+    InvalidEnvironmentKey,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::{Environment, ExecutionMode, ExecutionSpec};
+
+    #[test]
+    fn direct_mode_preserves_arguments() {
+        let spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec![
+                "printf".to_owned(),
+                "%s\n".to_owned(),
+                "a; rm -rf /".to_owned(),
+            ],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid direct execution");
+
+        assert_eq!(spec.argv(), ["printf", "%s\n", "a; rm -rf /"]);
+    }
+
+    #[test]
+    fn shell_mode_requires_one_string() {
+        assert!(
+            ExecutionSpec::new(
+                ExecutionMode::Shell,
+                vec!["echo".to_owned(), "hello".to_owned()],
+                "/tmp".to_owned(),
+                Environment::empty(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn environment_values_are_redacted_everywhere() {
+        let environment =
+            Environment::from_pairs([("TOKEN", "swordfish")]).expect("valid environment value");
+        let spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            environment,
+        )
+        .expect("valid execution");
+
+        assert!(!format!("{spec:?}").contains("swordfish"));
+        assert!(
+            !serde_json::to_string(&spec)
+                .expect("serializable")
+                .contains("swordfish")
+        );
+    }
+
+    #[test]
+    fn rejects_nul_and_oversize_arguments() {
+        assert!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                vec!["bad\0arg".to_owned()],
+                "/tmp".to_owned(),
+                Environment::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                vec!["x".repeat(128 * 1024 + 1)],
+                "/tmp".to_owned(),
+                Environment::empty(),
+            )
+            .is_err()
+        );
+    }
+}
