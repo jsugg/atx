@@ -18,6 +18,19 @@ pub(crate) enum JobState {
 }
 
 impl JobState {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Scheduled,
+        Self::Waiting,
+        Self::Starting,
+        Self::Running,
+        Self::CancelRequested,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Interrupted,
+        Self::Missed,
+    ];
+
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -39,6 +52,16 @@ pub(crate) enum RunState {
 }
 
 impl RunState {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Starting,
+        Self::Running,
+        Self::CancelRequested,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Interrupted,
+    ];
+
     pub(crate) const fn is_terminal(self) -> bool {
         matches!(
             self,

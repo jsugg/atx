@@ -17,4 +17,5 @@ mod run;
 mod schedule;
 #[allow(dead_code)]
 mod state;
+#[allow(dead_code)]
 mod transition;
