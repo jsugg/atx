@@ -105,6 +105,10 @@ impl Revision {
 pub(crate) struct UtcTimestamp(Timestamp);
 
 impl UtcTimestamp {
+    pub(crate) const fn from_jiff(timestamp: Timestamp) -> Self {
+        Self(timestamp)
+    }
+
     pub(crate) fn from_second(second: i64) -> Result<Self, PrimitiveError> {
         Timestamp::new(second, 0)
             .map(Self)

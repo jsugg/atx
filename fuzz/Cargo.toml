@@ -9,6 +9,7 @@ rust-version = "1.85"
 cargo-fuzz = true
 
 [dependencies]
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 libfuzzer-sys = "0.4.13"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.19"
@@ -16,6 +17,13 @@ thiserror = "2.0.19"
 [[bin]]
 name = "duration"
 path = "fuzz_targets/duration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "calendar"
+path = "fuzz_targets/calendar.rs"
 test = false
 doc = false
 bench = false

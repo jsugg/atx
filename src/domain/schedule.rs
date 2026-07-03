@@ -60,6 +60,22 @@ impl Schedule {
         }
     }
 
+    pub(crate) fn one_shot_absolute(
+        original_input: String,
+        timezone: String,
+        timezone_database_version: String,
+        resolved_due_utc: UtcTimestamp,
+        dst_resolution: DstResolution,
+    ) -> Self {
+        Self::OneShotAbsolute {
+            original_input,
+            timezone,
+            timezone_database_version,
+            resolved_due_utc,
+            dst_resolution,
+        }
+    }
+
     pub(crate) const fn next_due_utc(&self) -> UtcTimestamp {
         match self {
             Self::OneShotRelative {
