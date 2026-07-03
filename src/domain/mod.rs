@@ -2,6 +2,8 @@
 
 // Domain contracts are built before their application services are wired.
 #[allow(dead_code)]
+mod duration;
+#[allow(dead_code)]
 mod error;
 #[allow(dead_code)]
 mod execution;

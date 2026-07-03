@@ -3,26 +3,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub(crate) use super::duration::DurationSeconds;
 use super::primitives::UtcTimestamp;
-
-pub(crate) const MAX_DURATION_SECONDS: u64 = 365 * 24 * 60 * 60;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct DurationSeconds(u64);
-
-impl DurationSeconds {
-    pub(crate) fn new(seconds: u64) -> Result<Self, ScheduleError> {
-        if !(1..=MAX_DURATION_SECONDS).contains(&seconds) {
-            return Err(ScheduleError::DurationOutOfRange);
-        }
-        Ok(Self(seconds))
-    }
-
-    pub(crate) const fn get(self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,8 +88,6 @@ impl Schedule {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub(crate) enum ScheduleError {
-    #[error("duration must be between one second and 365 days")]
-    DurationOutOfRange,
     #[error("the resolved deadline must be in the future")]
     DeadlineNotFuture,
 }
