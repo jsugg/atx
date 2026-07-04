@@ -1,5 +1,7 @@
 //! Operating-system and persistence adapters.
 
+// Adapters are built before CLI/application wiring.
+#[allow(dead_code)]
 pub(crate) mod config;
 pub(crate) mod paths;
 pub(crate) mod process;

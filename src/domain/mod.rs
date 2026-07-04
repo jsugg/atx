@@ -30,3 +30,4 @@ mod transition;
 
 pub(crate) use primitives::UtcTimestamp;
 pub(crate) use recurrence::ElapsedInstant;
+pub(crate) use schedule::{DurationSeconds, RuntimeTier};
