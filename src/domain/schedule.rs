@@ -107,3 +107,37 @@ pub(crate) enum ScheduleError {
     #[error("the resolved deadline must be in the future")]
     DeadlineNotFuture,
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::{DstResolution, DurationSeconds, Schedule};
+    use crate::domain::primitives::UtcTimestamp;
+
+    #[test]
+    fn every_schedule_reports_its_next_due_and_tzdb() {
+        let due = UtcTimestamp::from_second(2_000).expect("valid timestamp");
+        let relative =
+            Schedule::one_shot_relative(DurationSeconds::new(30).expect("duration"), due);
+        assert_eq!(relative.next_due_utc(), due);
+        assert_eq!(relative.timezone_database_version(), "not-applicable");
+
+        let absolute = Schedule::one_shot_absolute(
+            "2030-01-01".to_owned(),
+            "UTC".to_owned(),
+            "test".to_owned(),
+            due,
+            DstResolution::Reject,
+        );
+        assert_eq!(absolute.next_due_utc(), due);
+        assert_eq!(absolute.timezone_database_version(), "test");
+
+        let recurring = Schedule::RecurringInterval {
+            interval: DurationSeconds::new(60).expect("duration"),
+            persisted_anchor_utc: due,
+        };
+        assert_eq!(recurring.next_due_utc(), due);
+        assert_eq!(recurring.timezone_database_version(), "not-applicable");
+    }
+}

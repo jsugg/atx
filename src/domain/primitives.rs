@@ -195,4 +195,18 @@ mod tests {
             serde_json::from_str(&encoded).expect("timestamp should deserialize");
         assert_eq!(decoded, timestamp);
     }
+
+    #[test]
+    fn getters_return_validated_values() {
+        let name = Name::new("tea").expect("valid name");
+        let description = Description::new("brew timer").expect("valid description");
+        let sequence = Sequence::new(7).expect("valid sequence");
+        let timestamp = UtcTimestamp::from_second(10).expect("valid timestamp");
+
+        assert_eq!(name.as_str(), "tea");
+        assert_eq!(description.as_str(), "brew timer");
+        assert_eq!(sequence.get(), 7);
+        assert_eq!(timestamp.as_jiff().as_second(), 10);
+        assert!(serde_json::from_str::<Name>(&format!("\"{}\"", "x".repeat(257))).is_err());
+    }
 }

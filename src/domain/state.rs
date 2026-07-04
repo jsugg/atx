@@ -78,4 +78,21 @@ mod tests {
     fn unknown_state_does_not_decode() {
         assert!(serde_json::from_str::<JobState>("\"teleported\"").is_err());
     }
+
+    #[test]
+    fn terminal_flags_match_contract() {
+        for state in JobState::ALL {
+            assert_eq!(
+                state.is_terminal(),
+                matches!(
+                    state,
+                    JobState::Succeeded
+                        | JobState::Failed
+                        | JobState::Cancelled
+                        | JobState::Interrupted
+                        | JobState::Missed
+                )
+            );
+        }
+    }
 }

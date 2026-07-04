@@ -131,4 +131,25 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn finish_time_and_outcome_kinds_are_checked() {
+        let created = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let earlier = UtcTimestamp::from_second(99).expect("valid timestamp");
+        let run = Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            created,
+            created,
+        );
+        assert!(
+            run.clone()
+                .with_outcome(earlier, RunOutcome::Failure("spawn".to_owned()))
+                .is_err()
+        );
+        assert!(
+            run.with_outcome(created, RunOutcome::Interrupted("unknown".to_owned()))
+                .is_ok()
+        );
+    }
 }

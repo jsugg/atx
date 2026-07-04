@@ -283,5 +283,33 @@ mod tests {
 
         assert_eq!(resolved.timezone_database_version(), bundled_tzdb_version());
         assert_ne!(resolved.timezone_database_version(), "unknown");
+        assert_eq!(resolved.original_input(), "2026-08-01T09:30");
+        assert_eq!(resolved.timezone(), "America/Sao_Paulo");
+        assert_eq!(resolved.dst_resolution(), DstResolution::Reject);
+    }
+
+    #[test]
+    fn rejects_bad_zone_and_past_calendar_values() {
+        let now = UtcTimestamp::from_str("2026-01-01T00:00:00Z").expect("valid timestamp");
+        assert!(
+            resolve_calendar(
+                "2027-01-01",
+                &TimeZoneSelection::Named("No/Such_Zone".to_owned()),
+                DstResolution::Reject,
+                false,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_calendar(
+                "2025-01-01",
+                &TimeZoneSelection::Utc,
+                DstResolution::Reject,
+                false,
+                now,
+            )
+            .is_err()
+        );
     }
 }

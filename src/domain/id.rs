@@ -212,4 +212,14 @@ mod tests {
         let decoded: JobId = serde_json::from_str(&encoded).expect("ID should deserialize");
         assert_eq!(decoded, id);
     }
+
+    #[test]
+    fn parsing_rejects_noncanonical_digits_and_accepts_case() {
+        let id = JobId::from_u128(31);
+        assert_eq!(id.to_string().to_uppercase().parse::<JobId>(), Ok(id));
+        assert!("0000000000000000000000000o".parse::<JobId>().is_err());
+        assert!("short".parse::<JobId>().is_err());
+        assert!(serde_json::from_str::<JobId>("\"short\"").is_err());
+        assert_eq!(RunId::new().as_uuid().get_version_num(), 7);
+    }
 }

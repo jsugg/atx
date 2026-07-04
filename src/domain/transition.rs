@@ -220,16 +220,37 @@ mod tests {
 
     #[test]
     fn recurring_run_can_return_job_to_waiting() {
-        assert!(
-            job_transition(
+        let transition = job_transition(
+            JobState::Running,
+            JobState::Waiting,
+            true,
+            TransitionActor::Monitor,
+            "next occurrence",
+        );
+        assert_eq!(
+            transition.map(|value| (value.from(), value.to(), value.reason().to_owned(),)),
+            Ok((
                 JobState::Running,
                 JobState::Waiting,
-                true,
-                TransitionActor::Monitor,
-                "next occurrence",
-            )
-            .is_ok()
+                "next occurrence".to_owned(),
+            ))
         );
+    }
+
+    #[test]
+    fn transition_reasons_must_be_safe_and_nonempty() {
+        for reason in ["", "bad\0reason"] {
+            assert!(
+                run_transition(
+                    RunState::Starting,
+                    RunState::Running,
+                    TransitionActor::Supervisor,
+                    reason,
+                )
+                .is_err(),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]

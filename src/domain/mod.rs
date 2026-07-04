@@ -18,6 +18,8 @@ mod job;
 #[allow(dead_code)]
 mod primitives;
 #[allow(dead_code)]
+mod recurrence;
+#[allow(dead_code)]
 mod run;
 #[allow(dead_code)]
 mod schedule;
@@ -25,3 +27,6 @@ mod schedule;
 mod state;
 #[allow(dead_code)]
 mod transition;
+
+pub(crate) use primitives::UtcTimestamp;
+pub(crate) use recurrence::ElapsedInstant;

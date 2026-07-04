@@ -285,4 +285,46 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn validates_environment_cwd_and_total_size() {
+        assert!(Environment::from_pairs([("BAD-KEY", "value")]).is_err());
+        assert!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                vec!["true".to_owned()],
+                "relative".to_owned(),
+                Environment::empty(),
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                vec!["x".repeat(128 * 1024); 8],
+                "/tmp".to_owned(),
+                Environment::empty(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn getters_preserve_validated_values() {
+        let environment = Environment::from_pairs([("PATH", "/bin")]).expect("valid environment");
+        let spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            environment,
+        )
+        .expect("valid execution");
+
+        assert_eq!(spec.mode(), ExecutionMode::Direct);
+        assert_eq!(spec.working_directory(), std::path::Path::new("/tmp"));
+        let values = spec.environment().iter().collect::<Vec<_>>();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, "PATH");
+        assert_eq!(values[0].1.expose(), "/bin");
+    }
 }

@@ -38,10 +38,9 @@ fn parse_date(input: &str) -> Result<Date, CalendarSyntaxError> {
 
 fn parse_time(input: &str) -> Result<Time, CalendarSyntaxError> {
     let bytes = input.as_bytes();
-    let valid_shape = (bytes.len() == 5 && bytes[2] == b':')
-        || (bytes.len() == 8 && bytes[2] == b':' && bytes[5] == b':');
-    if !valid_shape {
-        return Err(CalendarSyntaxError::InvalidTime);
+    match bytes {
+        [_, _, b':', _, _] | [_, _, b':', _, _, b':', _, _] => {}
+        _ => return Err(CalendarSyntaxError::InvalidTime),
     }
 
     let hour = parse_i8(&input[0..2])?;
@@ -98,7 +97,7 @@ pub(crate) enum CalendarSyntaxError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CalendarSyntax, parse_calendar};
+    use super::{CalendarSyntax, parse_calendar, parse_time};
 
     #[test]
     fn parses_supported_shapes() {
@@ -122,12 +121,26 @@ mod tests {
         for input in [
             "24:00",
             "12:60",
+            "12345",
+            "12345678",
+            "12:34567",
+            "12345:67",
+            "2026/08-01",
+            "2026-08/01",
             "2026-02-30",
+            "2026-08-01X09:30",
             "2026-08-01T09:30Z",
             "2026-08-01T09:30+01:00",
             "tomorrow",
         ] {
             assert!(parse_calendar(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn time_parser_checks_every_separator() {
+        for input in ["12x34", "12x34:56", "12:34x56"] {
+            assert!(parse_time(input).is_err(), "{input}");
         }
     }
 }

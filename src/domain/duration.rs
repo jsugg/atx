@@ -40,18 +40,22 @@ impl FromStr for DurationSeconds {
 
         while index < bytes.len() {
             let number_start = index;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
-            }
-            if number_start == index {
+            let digit_count = bytes[index..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if digit_count == 0 {
                 return Err(DurationError::ExpectedNumber);
             }
+            index = index
+                .checked_add(digit_count)
+                .ok_or(DurationError::Overflow)?;
 
             let number = input[number_start..index]
                 .parse::<u64>()
                 .map_err(|_| DurationError::Overflow)?;
             let unit = *bytes.get(index).ok_or(DurationError::ExpectedUnit)?;
-            index += 1;
+            index = index.checked_add(1).ok_or(DurationError::Overflow)?;
 
             let (rank, multiplier) = match unit {
                 b'h' => {
@@ -77,9 +81,13 @@ impl FromStr for DurationSeconds {
                 .ok_or(DurationError::Overflow)?;
 
             if index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                    index += 1;
-                }
+                let whitespace_count = bytes[index..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_whitespace())
+                    .count();
+                index = index
+                    .checked_add(whitespace_count)
+                    .ok_or(DurationError::Overflow)?;
                 if index == bytes.len() {
                     return Err(DurationError::ExpectedNumber);
                 }
@@ -183,8 +191,25 @@ mod tests {
         for input in ["", "0s", "-5m", "1.5h", "30s1m", "1m1m", "1 h"] {
             assert!(DurationSeconds::from_str(input).is_err(), "{input}");
         }
+        assert_eq!(MAX_DURATION_SECONDS, 31_536_000);
+        assert!(DurationSeconds::from_str("8760h").is_ok());
         assert!(DurationSeconds::from_str("8761h").is_err());
         assert!(DurationSeconds::from_str("18446744073709551616s").is_err());
+    }
+
+    #[test]
+    fn serde_uses_canonical_validated_strings() {
+        let duration = DurationSeconds::new(90).expect("valid duration");
+        assert_eq!(
+            serde_json::to_string(&duration).expect("serialize duration"),
+            "\"1m30s\""
+        );
+        assert_eq!(
+            serde_json::from_str::<DurationSeconds>("\"90s\"").expect("deserialize duration"),
+            duration
+        );
+        assert!(serde_json::from_str::<DurationSeconds>("\"0s\"").is_err());
+        assert!(DurationSeconds::from_str("0h1m").is_err());
     }
 
     proptest! {

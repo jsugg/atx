@@ -127,5 +127,34 @@ mod tests {
 
         assert_eq!(job.revision().get(), 1);
         assert_eq!(job.next_due_utc(), due);
+        assert_eq!(job.state(), crate::domain::state::JobState::Scheduled);
+        assert_eq!(job.schedule().next_due_utc(), due);
+        assert_eq!(job.execution().argv(), ["true"]);
+        assert_eq!(job.id().as_uuid().get_version_num(), 7);
+    }
+
+    #[test]
+    fn rejects_nonfuture_deadline() {
+        let now = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let schedule =
+            Schedule::one_shot_relative(DurationSeconds::new(30).expect("valid duration"), now);
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid execution");
+        assert!(
+            Job::new(
+                now,
+                schedule,
+                MissedPolicy::Hold,
+                RuntimeTier::Session,
+                execution,
+                501,
+            )
+            .is_err()
+        );
     }
 }
