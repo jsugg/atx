@@ -8,5 +8,6 @@ pub(crate) mod paths;
 pub(crate) mod process;
 pub(crate) mod runtime;
 pub(crate) mod service;
+#[allow(dead_code)]
 pub(crate) mod sqlite;
 pub(crate) mod time;

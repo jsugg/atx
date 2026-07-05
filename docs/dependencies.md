@@ -7,8 +7,12 @@ Current choices:
 - `serde` and `serde_json` keep persisted and command-line data formats typed.
 - `uuid` creates sortable UUIDv7 identifiers.
 - `jiff` handles checked date/time work and ships timezone data in the binary.
+- `toml` reads the small config file without a home-grown parser.
+- `rustix` gives the filesystem and process code safe Unix system calls.
+- `rusqlite` ships SQLite with the binary and keeps transactions typed.
 - `thiserror` keeps error types readable without hiding their causes.
-- `proptest` is test-only and checks parser and state-machine invariants.
+- `proptest` and `tempfile` are test-only. They cover generated invariants and
+  filesystem behavior without touching a real ATX directory.
 
 Before adding a crate, check:
 
