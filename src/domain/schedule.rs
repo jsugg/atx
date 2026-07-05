@@ -29,7 +29,7 @@ pub(crate) enum DstResolution {
     Later,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Schedule {
     OneShotRelative {

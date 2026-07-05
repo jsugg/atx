@@ -28,6 +28,12 @@ mod state;
 #[allow(dead_code)]
 mod transition;
 
-pub(crate) use primitives::UtcTimestamp;
+#[allow(unused_imports)]
+pub(crate) use execution::{Environment, ExecutionMode, ExecutionSpec};
+pub(crate) use id::JobId;
+pub(crate) use job::{Job, JobSnapshot};
+pub(crate) use primitives::{Description, Name, Revision, UtcTimestamp};
 pub(crate) use recurrence::ElapsedInstant;
-pub(crate) use schedule::{DurationSeconds, RuntimeTier};
+pub(crate) use schedule::{DurationSeconds, MissedPolicy, RuntimeTier, Schedule};
+pub(crate) use state::JobState;
+pub(crate) use transition::TransitionActor;

@@ -4,13 +4,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_ARGUMENT_BYTES: usize = 128 * 1024;
 const MAX_SERIALIZED_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExecutionMode {
     Direct,
@@ -103,13 +103,13 @@ fn validate_environment_key(key: &str) -> Result<(), ExecutionError> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StdinPolicy {
     Null,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OutputPolicy {
     BoundedFile,
@@ -188,6 +188,65 @@ impl ExecutionSpec {
     pub(crate) fn environment(&self) -> &Environment {
         &self.environment
     }
+
+    pub(crate) fn to_persistence_json(&self) -> Result<String, ExecutionStorageError> {
+        let environment = self
+            .environment
+            .iter()
+            .map(|(key, value)| (key.to_owned(), value.expose().to_owned()))
+            .collect();
+        serde_json::to_string(&PersistedExecutionSpec {
+            mode: self.mode,
+            argv: self.argv.clone(),
+            working_directory: self.working_directory.clone(),
+            environment,
+            stdin: self.stdin,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            shell_path: self.shell_path.clone(),
+        })
+        .map_err(|error| ExecutionStorageError::Json(error.to_string()))
+    }
+
+    pub(crate) fn from_persistence_json(input: &str) -> Result<Self, ExecutionStorageError> {
+        let stored: PersistedExecutionSpec = serde_json::from_str(input)
+            .map_err(|error| ExecutionStorageError::Json(error.to_string()))?;
+        if stored.stdin != StdinPolicy::Null
+            || stored.stdout != OutputPolicy::BoundedFile
+            || stored.stderr != OutputPolicy::BoundedFile
+        {
+            return Err(ExecutionStorageError::InvalidPolicy);
+        }
+        let environment =
+            Environment::from_pairs(stored.environment).map_err(ExecutionStorageError::Invalid)?;
+        let mut execution = Self::new(
+            stored.mode,
+            stored.argv,
+            stored.working_directory.to_string_lossy().into_owned(),
+            environment,
+        )
+        .map_err(ExecutionStorageError::Invalid)?;
+        match (stored.mode, stored.shell_path) {
+            (ExecutionMode::Direct, None) => {}
+            (ExecutionMode::Shell, Some(path)) if path.is_absolute() => {
+                execution.shell_path = Some(path);
+            }
+            _ => return Err(ExecutionStorageError::InvalidShell),
+        }
+        Ok(execution)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedExecutionSpec {
+    mode: ExecutionMode,
+    argv: Vec<String>,
+    working_directory: PathBuf,
+    environment: BTreeMap<String, String>,
+    stdin: StdinPolicy,
+    stdout: OutputPolicy,
+    stderr: OutputPolicy,
+    shell_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -206,6 +265,18 @@ pub(crate) enum ExecutionError {
     WorkingDirectoryNotAbsolute,
     #[error("invalid environment variable name")]
     InvalidEnvironmentKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub(crate) enum ExecutionStorageError {
+    #[error("stored execution JSON is invalid: {0}")]
+    Json(String),
+    #[error("stored execution is invalid: {0}")]
+    Invalid(ExecutionError),
+    #[error("stored execution policies are unsupported")]
+    InvalidPolicy,
+    #[error("stored shell path does not match execution mode")]
+    InvalidShell,
 }
 
 #[cfg(test)]

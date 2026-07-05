@@ -1,5 +1,10 @@
 //! `SQLite` job-store adapter.
 
+mod job_store;
+
+#[allow(unused_imports)]
+pub(crate) use job_store::JobStore;
+
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -179,6 +184,43 @@ pub(crate) enum StoreError {
     InvalidBusyTimeout,
     #[error("SQLite connection pragmas did not stick")]
     PragmaMismatch,
+    #[error("job already exists")]
+    AlreadyExists,
+    #[error("job was not found")]
+    NotFound,
+    #[error("job revision changed")]
+    Conflict,
+    #[error("page size must be between 1 and 100")]
+    InvalidPageSize,
+    #[error("database stayed busy past its configured timeout")]
+    Busy,
+    #[error("stored record is corrupt: {0}")]
+    Corrupt(String),
+    #[error("domain operation failed: {0}")]
+    Domain(String),
+}
+
+fn map_write_error(error: rusqlite::Error) -> StoreError {
+    match &error {
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            StoreError::Busy
+        }
+        _ => StoreError::Sqlite(error),
+    }
+}
+
+fn map_read_error(error: rusqlite::Error) -> StoreError {
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error {
+        if let Some(StoreError::Corrupt(message)) = source.downcast_ref::<StoreError>() {
+            return StoreError::Corrupt(message.clone());
+        }
+    }
+    StoreError::Sqlite(error)
 }
 
 #[cfg(test)]

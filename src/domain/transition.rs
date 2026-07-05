@@ -35,6 +35,10 @@ impl<S: Copy> Transition<S> {
     pub(crate) fn reason(&self) -> &str {
         &self.reason
     }
+
+    pub(crate) const fn actor(&self) -> TransitionActor {
+        self.actor
+    }
 }
 
 fn transition<S: Copy>(

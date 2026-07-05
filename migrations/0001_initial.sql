@@ -11,8 +11,8 @@ CREATE TABLE migrations (
 CREATE TABLE jobs (
     id TEXT PRIMARY KEY NOT NULL,
     revision INTEGER NOT NULL CHECK (revision > 0),
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
+    name TEXT,
+    description TEXT,
     created_at_utc TEXT NOT NULL,
     updated_at_utc TEXT NOT NULL,
     state TEXT NOT NULL CHECK (

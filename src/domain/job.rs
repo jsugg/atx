@@ -8,6 +8,7 @@ use super::id::JobId;
 use super::primitives::{Description, Name, PrimitiveError, Revision, UtcTimestamp};
 use super::schedule::{MissedPolicy, RuntimeTier, Schedule, ScheduleError};
 use super::state::JobState;
+use super::transition::{Transition, TransitionActor, TransitionError, job_transition};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct Job {
@@ -82,6 +83,87 @@ impl Job {
     pub(crate) fn execution(&self) -> &ExecutionSpec {
         &self.execution
     }
+
+    pub(crate) fn snapshot(&self) -> JobSnapshot {
+        JobSnapshot {
+            id: self.id,
+            revision: self.revision,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            created_at_utc: self.created_at_utc,
+            updated_at_utc: self.updated_at_utc,
+            state: self.state,
+            runtime_tier: self.runtime_tier,
+            schedule: self.schedule.clone(),
+            missed_policy: self.missed_policy,
+            execution: self.execution.clone(),
+            next_due_utc: self.next_due_utc,
+            timezone_database_version: self.timezone_database_version.clone(),
+            owner_uid: self.owner_uid,
+        }
+    }
+
+    pub(crate) fn rehydrate(snapshot: JobSnapshot) -> Result<Self, JobError> {
+        if snapshot.created_at_utc > snapshot.updated_at_utc
+            || snapshot.timezone_database_version.is_empty()
+            || snapshot.timezone_database_version.contains('\0')
+        {
+            return Err(JobError::CorruptSnapshot);
+        }
+        Ok(Self {
+            id: snapshot.id,
+            revision: snapshot.revision,
+            name: snapshot.name,
+            description: snapshot.description,
+            created_at_utc: snapshot.created_at_utc,
+            updated_at_utc: snapshot.updated_at_utc,
+            state: snapshot.state,
+            runtime_tier: snapshot.runtime_tier,
+            schedule: snapshot.schedule,
+            missed_policy: snapshot.missed_policy,
+            execution: snapshot.execution,
+            next_due_utc: snapshot.next_due_utc,
+            timezone_database_version: snapshot.timezone_database_version,
+            owner_uid: snapshot.owner_uid,
+        })
+    }
+
+    pub(crate) fn transition(
+        &mut self,
+        to: JobState,
+        recurring: bool,
+        actor: TransitionActor,
+        reason: &str,
+        now: UtcTimestamp,
+    ) -> Result<Transition<JobState>, JobError> {
+        if now < self.updated_at_utc {
+            return Err(JobError::TimeMovedBackward);
+        }
+        let transition = job_transition(self.state, to, recurring, actor, reason)
+            .map_err(JobError::Transition)?;
+        self.revision = self.revision.next().map_err(JobError::Primitive)?;
+        self.state = to;
+        self.updated_at_utc = now;
+        Ok(transition)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JobSnapshot {
+    pub(crate) id: JobId,
+    pub(crate) revision: Revision,
+    pub(crate) name: Option<Name>,
+    pub(crate) description: Option<Description>,
+    pub(crate) created_at_utc: UtcTimestamp,
+    pub(crate) updated_at_utc: UtcTimestamp,
+    pub(crate) state: JobState,
+    pub(crate) runtime_tier: RuntimeTier,
+    pub(crate) schedule: Schedule,
+    pub(crate) missed_policy: MissedPolicy,
+    pub(crate) execution: ExecutionSpec,
+    pub(crate) next_due_utc: UtcTimestamp,
+    pub(crate) timezone_database_version: String,
+    pub(crate) owner_uid: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -90,6 +172,12 @@ pub(crate) enum JobError {
     Primitive(PrimitiveError),
     #[error(transparent)]
     Schedule(ScheduleError),
+    #[error(transparent)]
+    Transition(TransitionError),
+    #[error("stored job snapshot violates domain invariants")]
+    CorruptSnapshot,
+    #[error("job update time cannot move backward")]
+    TimeMovedBackward,
 }
 
 #[cfg(test)]
