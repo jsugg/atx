@@ -21,7 +21,7 @@ const JOB_COLUMNS: &str = "
 const MAX_PAGE_SIZE: usize = 100;
 
 pub(crate) struct JobStore {
-    database: Database,
+    pub(super) database: Database,
 }
 
 impl JobStore {
@@ -280,7 +280,7 @@ fn is_constraint(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::expect_used)]
 
     use std::time::{Duration, Instant};
@@ -294,7 +294,7 @@ mod tests {
         RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
 
-    fn sample_job(now: i64, due: i64) -> Job {
+    pub(crate) fn sample_job(now: i64, due: i64) -> Job {
         let now = UtcTimestamp::from_second(now).expect("valid timestamp");
         let due = UtcTimestamp::from_second(due).expect("valid timestamp");
         let schedule =

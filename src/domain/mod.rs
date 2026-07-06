@@ -30,10 +30,11 @@ mod transition;
 
 #[allow(unused_imports)]
 pub(crate) use execution::{Environment, ExecutionMode, ExecutionSpec};
-pub(crate) use id::JobId;
+pub(crate) use id::{JobId, RunId};
 pub(crate) use job::{Job, JobSnapshot};
-pub(crate) use primitives::{Description, Name, Revision, UtcTimestamp};
+pub(crate) use primitives::{Description, Name, Revision, Sequence, UtcTimestamp};
 pub(crate) use recurrence::ElapsedInstant;
+pub(crate) use run::{ClaimToken, ProcessIdentitySnapshot, Run, RunOutcome, RunSnapshot};
 pub(crate) use schedule::{DurationSeconds, MissedPolicy, RuntimeTier, Schedule};
-pub(crate) use state::JobState;
+pub(crate) use state::{JobState, RunState};
 pub(crate) use transition::TransitionActor;

@@ -10,6 +10,7 @@ Current choices:
 - `toml` reads the small config file without a home-grown parser.
 - `rustix` gives the filesystem and process code safe Unix system calls.
 - `rusqlite` ships SQLite with the binary and keeps transactions typed.
+- `getrandom` creates run-claim tokens straight from the operating system.
 - `thiserror` keeps error types readable without hiding their causes.
 - `proptest` and `tempfile` are test-only. They cover generated invariants and
   filesystem behavior without touching a real ATX directory.

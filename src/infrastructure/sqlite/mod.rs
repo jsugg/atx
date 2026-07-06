@@ -1,6 +1,7 @@
 //! `SQLite` job-store adapter.
 
 mod job_store;
+mod run_store;
 
 #[allow(unused_imports)]
 pub(crate) use job_store::JobStore;
@@ -198,6 +199,12 @@ pub(crate) enum StoreError {
     Corrupt(String),
     #[error("domain operation failed: {0}")]
     Domain(String),
+    #[error("this job occurrence already has a run claim")]
+    DuplicateClaim,
+    #[error("run claim token did not match")]
+    InvalidClaim,
+    #[error("operating-system randomness failed: {0}")]
+    Random(String),
 }
 
 fn map_write_error(error: rusqlite::Error) -> StoreError {

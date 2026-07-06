@@ -55,11 +55,13 @@ CREATE TABLE runs (
     exit_code INTEGER,
     terminating_signal INTEGER,
     failure TEXT,
+    outcome_json TEXT CHECK (outcome_json IS NULL OR json_valid(outcome_json)),
     stdout_path TEXT,
     stderr_path TEXT,
     stdout_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stdout_truncated IN (0, 1)),
     stderr_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stderr_truncated IN (0, 1)),
     UNIQUE (job_id, sequence),
+    UNIQUE (job_id, scheduled_for_utc),
     CHECK (exit_code IS NULL OR terminating_signal IS NULL)
 ) STRICT;
 
