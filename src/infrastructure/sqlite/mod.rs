@@ -1,6 +1,7 @@
 //! `SQLite` job-store adapter.
 
 mod job_store;
+mod retention;
 mod run_store;
 
 #[allow(unused_imports)]
