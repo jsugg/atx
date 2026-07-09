@@ -9,6 +9,7 @@ dependencies = [
  "getrandom 0.4.3",
  "jiff",
  "jiff-tzdb",
+ "libc",
  "proptest",
  "rusqlite",
  "rustix",

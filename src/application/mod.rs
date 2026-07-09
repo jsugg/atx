@@ -11,3 +11,6 @@ mod rerun;
 mod retain;
 mod show;
 mod submit;
+
+#[allow(unused_imports)]
+pub(crate) use clock::{ClockError, ElapsedClock, WallClock};

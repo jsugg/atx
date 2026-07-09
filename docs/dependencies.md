@@ -9,6 +9,8 @@ Current choices:
 - `jiff` handles checked date/time work and ships timezone data in the binary.
 - `toml` reads the small config file without a home-grown parser.
 - `rustix` gives the filesystem and process code safe Unix system calls.
+- `libc` is limited to the small macOS clock and process shims that Rust's
+  standard library does not expose.
 - `rusqlite` ships SQLite with the binary and keeps transactions typed.
 - `getrandom` creates run-claim tokens straight from the operating system.
 - `thiserror` keeps error types readable without hiding their causes.
