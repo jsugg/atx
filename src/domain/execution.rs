@@ -189,6 +189,10 @@ impl ExecutionSpec {
         &self.environment
     }
 
+    pub(crate) fn shell_path(&self) -> Option<&Path> {
+        self.shell_path.as_deref()
+    }
+
     pub(crate) fn to_persistence_json(&self) -> Result<String, ExecutionStorageError> {
         let environment = self
             .environment

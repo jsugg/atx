@@ -1,5 +1,10 @@
 //! Native process adapter.
 
+mod spawn;
+
+#[allow(unused_imports)]
+pub(crate) use spawn::{NativeProcessRunner, SpawnedChild};
+
 use std::io;
 
 use thiserror::Error;
