@@ -5,6 +5,7 @@
 pub(crate) mod config;
 #[allow(dead_code)]
 pub(crate) mod paths;
+#[allow(dead_code)]
 pub(crate) mod process;
 #[allow(dead_code)]
 pub(crate) mod runtime;
