@@ -29,6 +29,15 @@ impl RunArtifacts {
     pub(crate) const fn stderr_file(&self) -> &File {
         &self.stderr_file
     }
+
+    pub(crate) fn into_parts(self) -> (PathBuf, PathBuf, File, File) {
+        (
+            self.stdout_path,
+            self.stderr_path,
+            self.stdout_file,
+            self.stderr_file,
+        )
+    }
 }
 
 pub(crate) fn create_run_artifacts(

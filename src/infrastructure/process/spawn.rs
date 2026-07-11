@@ -2,7 +2,7 @@
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, Output, Stdio};
 
 use thiserror::Error;
 
@@ -88,6 +88,20 @@ impl SpawnedChild {
         &mut self.child
     }
 
+    pub(crate) fn take_output(&mut self) -> Result<(ChildStdout, ChildStderr), SpawnError> {
+        let stdout = self.child.stdout.take().ok_or(SpawnError::MissingPipe)?;
+        let stderr = self.child.stderr.take().ok_or(SpawnError::MissingPipe)?;
+        Ok((stdout, stderr))
+    }
+
+    pub(crate) fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    pub(crate) fn terminate_and_wait(&mut self) {
+        reap_failed_spawn(&mut self.child);
+    }
+
     pub(crate) fn wait_with_output(self) -> io::Result<Output> {
         self.child.wait_with_output()
     }
@@ -105,6 +119,8 @@ pub(crate) enum SpawnError {
     Inspection(#[from] ProcessError),
     #[error("spawned command did not enter its dedicated process group")]
     ProcessGroupSetup,
+    #[error("spawned command output pipe is unavailable")]
+    MissingPipe,
 }
 
 #[cfg(test)]

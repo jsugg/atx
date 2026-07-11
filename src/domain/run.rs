@@ -143,9 +143,6 @@ impl Run {
         }
         validate_identity(&monitor_identity)?;
         validate_identity(&command_identity)?;
-        if monitor_identity.process_group_id != command_identity.process_group_id {
-            return Err(RunError::ProcessGroupMismatch);
-        }
         validate_log_path(&stdout_path)?;
         validate_log_path(&stderr_path)?;
         self.started_at_utc = Some(started_at_utc);
@@ -229,13 +226,6 @@ impl Run {
         }
         if let Some(identity) = &snapshot.command_identity {
             validate_identity(identity)?;
-        }
-        if let (Some(monitor), Some(command)) =
-            (&snapshot.monitor_identity, &snapshot.command_identity)
-        {
-            if monitor.process_group_id != command.process_group_id {
-                return Err(RunError::ProcessGroupMismatch);
-            }
         }
         if let Some(path) = &snapshot.stdout_path {
             validate_log_path(path)?;
@@ -325,8 +315,6 @@ pub(crate) enum RunError {
     InvalidState,
     #[error("process identity is incomplete")]
     InvalidIdentity,
-    #[error("monitor and command process groups differ")]
-    ProcessGroupMismatch,
     #[error("log path must stay below the run directory")]
     InvalidLogPath,
     #[error("stored run timeline is inconsistent")]
