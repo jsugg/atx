@@ -213,7 +213,8 @@ mod tests {
             mode,
             arguments.iter().map(ToString::to_string).collect(),
             "/".to_owned(),
-            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin"), ("TOKEN", "swordfish")])
+                .expect("environment"),
         )
         .expect("execution")
     }
@@ -304,6 +305,7 @@ mod tests {
                 assert_eq!(completed.outcome(), Some(&expected));
             } else {
                 assert!(matches!(completed.outcome(), Some(RunOutcome::Failure(_))));
+                assert!(!format!("{:?}", completed.outcome()).contains("swordfish"));
             }
         }
     }

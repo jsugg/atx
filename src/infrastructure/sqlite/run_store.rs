@@ -6,6 +6,7 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{JobStore, StoreError, map_read_error, map_write_error};
+use crate::application::{CancellationStore, CancellationStoreError};
 use crate::domain::{
     ClaimToken, JobId, ProcessIdentitySnapshot, Run, RunId, RunOutcome, RunSnapshot, RunState,
     Sequence, UtcTimestamp,
@@ -206,6 +207,39 @@ impl JobStore {
         }
         Ok(completed)
     }
+
+    pub(crate) fn request_run_cancellation(
+        &mut self,
+        id: RunId,
+        claim_token: ClaimToken,
+    ) -> Result<Run, StoreError> {
+        let run = load_run(self.database.connection(), id)?.ok_or(StoreError::NotFound)?;
+        verify_claim(&run, claim_token)?;
+        if run.state() == RunState::CancelRequested || run.state().is_terminal() {
+            return Ok(run);
+        }
+        let previous_state = encode_run_state(run.state());
+        let requested = run
+            .request_cancellation()
+            .map_err(|error| StoreError::Domain(error.to_string()))?;
+        let changed = self
+            .database
+            .connection()
+            .execute(
+                "UPDATE runs SET state = 'cancel_requested'
+                 WHERE id = ?1 AND state = ?2 AND claim_token = ?3",
+                params![
+                    id.to_string(),
+                    previous_state,
+                    claim_token.as_bytes().as_slice(),
+                ],
+            )
+            .map_err(map_write_error)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        Ok(requested)
+    }
 }
 
 fn load_run(connection: &Connection, id: RunId) -> Result<Option<Run>, StoreError> {
@@ -377,6 +411,22 @@ fn is_constraint(error: &rusqlite::Error) -> bool {
     )
 }
 
+impl CancellationStore for JobStore {
+    fn load_for_cancellation(&self, id: RunId) -> Result<Option<Run>, CancellationStoreError> {
+        self.load_run(id)
+            .map_err(|error| CancellationStoreError(error.to_string()))
+    }
+
+    fn commit_cancellation(
+        &mut self,
+        id: RunId,
+        claim_token: ClaimToken,
+    ) -> Result<Run, CancellationStoreError> {
+        self.request_run_cancellation(id, claim_token)
+            .map_err(|error| CancellationStoreError(error.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -497,5 +547,52 @@ mod tests {
             store.load_run(run_id).expect("load").expect("run").id(),
             run_id
         );
+    }
+
+    #[test]
+    fn cancellation_request_is_idempotent_and_natural_exit_wins() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 10),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        let requested = store
+            .request_run_cancellation(running.id(), running.claim_token())
+            .expect("request");
+        assert_eq!(requested.state(), RunState::CancelRequested);
+        assert_eq!(
+            store
+                .request_run_cancellation(running.id(), running.claim_token())
+                .expect("repeat"),
+            requested
+        );
+        let completed = store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                UtcTimestamp::from_second(1_003).expect("finished"),
+                RunOutcome::Exit(0),
+            )
+            .expect("natural completion");
+        assert_eq!(completed.state(), RunState::Succeeded);
     }
 }

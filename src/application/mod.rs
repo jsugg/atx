@@ -1,5 +1,6 @@
 //! Application services and infrastructure ports.
 
+#[allow(dead_code)]
 mod cancel;
 #[allow(dead_code)]
 mod clock;
@@ -12,5 +13,10 @@ mod retain;
 mod show;
 mod submit;
 
+#[allow(unused_imports)]
+pub(crate) use cancel::{
+    CancelRunError, CancelRunResult, CancellationStore, CancellationStoreError, GroupCancellation,
+    ProcessCancellationError, ProcessGroupCanceller, cancel_claimed_run,
+};
 #[allow(unused_imports)]
 pub(crate) use clock::{ClockError, ElapsedClock, WallClock};

@@ -127,6 +127,21 @@ impl Run {
         self.finished_at_utc
     }
 
+    pub(crate) fn command_identity(&self) -> Option<&ProcessIdentitySnapshot> {
+        self.command_identity.as_ref()
+    }
+
+    pub(crate) fn request_cancellation(mut self) -> Result<Self, RunError> {
+        match self.state {
+            RunState::Starting | RunState::Running => {
+                self.state = RunState::CancelRequested;
+                Ok(self)
+            }
+            RunState::CancelRequested => Ok(self),
+            _ => Err(RunError::InvalidState),
+        }
+    }
+
     pub(crate) fn mark_running(
         mut self,
         started_at_utc: UtcTimestamp,

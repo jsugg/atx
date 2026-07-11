@@ -1,7 +1,12 @@
 //! Native process adapter.
 
+mod cancel;
 mod spawn;
 
+#[allow(unused_imports)]
+pub(crate) use cancel::NativeGroupCanceller;
+#[allow(unused_imports)]
+pub(crate) use cancel::{CancellationResult, cancel_validated_group};
 #[allow(unused_imports)]
 pub(crate) use spawn::{NativeProcessRunner, SpawnedChild};
 
