@@ -38,7 +38,8 @@ pub(crate) fn write_frame(writer: &mut impl Write, message: &IpcMessage) -> Resu
 pub(crate) fn read_frame(reader: &mut impl Read) -> Result<IpcMessage, IpcError> {
     let mut length = [0_u8; 4];
     reader.read_exact(&mut length)?;
-    let length = usize::try_from(u32::from_be_bytes(length)).map_err(|_| IpcError::FrameTooLarge)?;
+    let length =
+        usize::try_from(u32::from_be_bytes(length)).map_err(|_| IpcError::FrameTooLarge)?;
     if length == 0 || length > MAX_FRAME_BYTES {
         return Err(IpcError::FrameTooLarge);
     }
@@ -61,7 +62,8 @@ impl RuntimeGuard {
         identity: &ProcessIdentitySnapshot,
         inspector: &NativeProcessInspector,
     ) -> Result<Self, IpcError> {
-        ensure_private_dir(runtime_directory).map_err(|error| IpcError::Runtime(error.to_string()))?;
+        ensure_private_dir(runtime_directory)
+            .map_err(|error| IpcError::Runtime(error.to_string()))?;
         let lock_path = runtime_directory.join("supervisor.lock");
         acquire_lock(&lock_path, identity, inspector)?;
         let lock_inode = fs::symlink_metadata(&lock_path)?.ino();
@@ -136,7 +138,9 @@ fn acquire_lock(
                 let bytes = fs::read(path)?;
                 let owner: ProcessIdentitySnapshot =
                     serde_json::from_slice(&bytes).map_err(|_| IpcError::MalformedLock)?;
-                if inspector.classify(&owner).map_err(|error| IpcError::Runtime(error.to_string()))?
+                if inspector
+                    .classify(&owner)
+                    .map_err(|error| IpcError::Runtime(error.to_string()))?
                     == IdentityStatus::Alive
                 {
                     return Err(IpcError::AlreadyRunning);
