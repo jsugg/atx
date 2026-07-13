@@ -12,7 +12,7 @@ use crate::domain::{
     Sequence, UtcTimestamp,
 };
 
-const RUN_COLUMNS: &str = "
+pub(super) const RUN_COLUMNS: &str = "
     id, job_id, sequence, scheduled_for_utc, created_at_utc, started_at_utc,
     finished_at_utc, state, claim_token, monitor_identity_json,
     command_identity_json, process_group_id, exit_code, terminating_signal,
@@ -242,7 +242,7 @@ impl JobStore {
     }
 }
 
-fn load_run(connection: &Connection, id: RunId) -> Result<Option<Run>, StoreError> {
+pub(super) fn load_run(connection: &Connection, id: RunId) -> Result<Option<Run>, StoreError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1");
     connection
         .query_row(&sql, [id.to_string()], decode_run_row)
@@ -250,7 +250,7 @@ fn load_run(connection: &Connection, id: RunId) -> Result<Option<Run>, StoreErro
         .map_err(map_read_error)
 }
 
-fn decode_run_row(row: &Row<'_>) -> rusqlite::Result<Run> {
+pub(super) fn decode_run_row(row: &Row<'_>) -> rusqlite::Result<Run> {
     decode_run_row_inner(row)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }

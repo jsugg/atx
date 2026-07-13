@@ -6,3 +6,5 @@ mod heap;
 mod ipc;
 #[allow(dead_code)]
 mod loop_driver;
+#[allow(dead_code)]
+mod recovery;

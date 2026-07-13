@@ -131,6 +131,10 @@ impl Run {
         self.command_identity.as_ref()
     }
 
+    pub(crate) fn monitor_identity(&self) -> Option<&ProcessIdentitySnapshot> {
+        self.monitor_identity.as_ref()
+    }
+
     pub(crate) fn request_cancellation(mut self) -> Result<Self, RunError> {
         match self.state {
             RunState::Starting | RunState::Running => {

@@ -14,6 +14,9 @@ use std::io;
 
 use thiserror::Error;
 
+use crate::application::{
+    IdentityInspectionError, IdentityInspector, IdentityStatus as RecoveryIdentityStatus,
+};
 use crate::domain::ProcessIdentitySnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,6 +53,21 @@ impl NativeProcessInspector {
         validate_snapshot(expected)?;
         let current = self.inspect(expected.pid)?;
         Ok(classify_identity(expected, current.as_ref()))
+    }
+}
+
+impl IdentityInspector for NativeProcessInspector {
+    fn classify(
+        &self,
+        identity: &ProcessIdentitySnapshot,
+    ) -> Result<RecoveryIdentityStatus, IdentityInspectionError> {
+        NativeProcessInspector::classify(self, identity)
+            .map(|status| match status {
+                IdentityStatus::Alive => RecoveryIdentityStatus::Alive,
+                IdentityStatus::Dead => RecoveryIdentityStatus::Dead,
+                IdentityStatus::Reused => RecoveryIdentityStatus::Changed,
+            })
+            .map_err(|error| IdentityInspectionError(error.to_string()))
     }
 }
 

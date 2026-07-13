@@ -6,6 +6,7 @@ mod cancel;
 mod clock;
 mod history;
 mod list;
+#[allow(dead_code)]
 mod reconcile;
 mod remove;
 mod rerun;
@@ -20,3 +21,9 @@ pub(crate) use cancel::{
 };
 #[allow(unused_imports)]
 pub(crate) use clock::{ClockError, ElapsedClock, WallClock};
+#[allow(unused_imports)]
+pub(crate) use reconcile::{
+    CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveredDeadline,
+    RecoveryAction, RecoveryPlan, RecoveryRecord, RecoveryStore, RecoveryStoreError,
+    StartupReconciliationError, reconcile_startup,
+};

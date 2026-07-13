@@ -1,11 +1,16 @@
 //! `SQLite` job-store adapter.
 
 mod job_store;
+mod reconcile;
 mod retention;
 mod run_store;
 
 #[allow(unused_imports)]
 pub(crate) use job_store::JobStore;
+#[allow(unused_imports)]
+pub(crate) use reconcile::StartupStore;
+#[allow(unused_imports)]
+pub(crate) use retention::RetentionPolicy;
 
 use std::fs::{self, OpenOptions};
 use std::io;

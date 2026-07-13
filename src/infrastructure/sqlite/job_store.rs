@@ -13,7 +13,7 @@ use crate::domain::{
     Schedule, TransitionActor, UtcTimestamp,
 };
 
-const JOB_COLUMNS: &str = "
+pub(super) const JOB_COLUMNS: &str = "
     id, revision, name, description, created_at_utc, updated_at_utc, state,
     runtime_tier, schedule_json, missed_policy, execution_json, next_due_utc,
     timezone_database_version, owner_uid
@@ -178,7 +178,7 @@ impl JobStore {
     }
 }
 
-fn load_job(connection: &Connection, id: JobId) -> Result<Option<Job>, StoreError> {
+pub(super) fn load_job(connection: &Connection, id: JobId) -> Result<Option<Job>, StoreError> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
     connection
         .query_row(&sql, [id.to_string()], decode_job_row)
@@ -186,7 +186,7 @@ fn load_job(connection: &Connection, id: JobId) -> Result<Option<Job>, StoreErro
         .map_err(map_read_error)
 }
 
-fn decode_job_row(row: &Row<'_>) -> rusqlite::Result<Job> {
+pub(super) fn decode_job_row(row: &Row<'_>) -> rusqlite::Result<Job> {
     decode_job_row_inner(row)
         .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
 }

@@ -80,6 +80,10 @@ impl Job {
         &self.schedule
     }
 
+    pub(crate) const fn missed_policy(&self) -> MissedPolicy {
+        self.missed_policy
+    }
+
     pub(crate) fn execution(&self) -> &ExecutionSpec {
         &self.execution
     }
