@@ -1,6 +1,7 @@
 //! `SQLite` job-store adapter.
 
 mod job_store;
+mod management;
 mod reconcile;
 mod retention;
 mod run_store;
@@ -22,8 +23,11 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::process::geteuid;
 use thiserror::Error;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 1;
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../../../migrations/0001_initial.sql"))];
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../../../migrations/0001_initial.sql")),
+    (2, include_str!("../../../migrations/0002_hidden_jobs.sql")),
+];
 const MAX_BUSY_TIMEOUT_MS: u128 = 2_147_483_647;
 
 pub(crate) struct Database {
@@ -279,7 +283,10 @@ mod tests {
                 .expect("index query");
             assert_eq!(count, 1, "{index}");
         }
-        assert_eq!(database.schema_version().expect("schema version"), 1);
+        assert_eq!(
+            database.schema_version().expect("schema version"),
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]

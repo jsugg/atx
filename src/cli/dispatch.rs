@@ -10,20 +10,28 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::args::{
-    ColorArg, DstArg, ManagementCommand, MissedArg, ParsedCli, SchedulingArgs, parse_from,
+    ColorArg, DstArg, GlobalArgs, ManagementCommand, MissedArg, ParsedCli, SchedulingArgs,
+    parse_from,
 };
 use super::exit;
 use crate::application::{
-    ElapsedClock, SubmissionOutcome, SubmissionStore, SubmissionStoreError, SupervisorAckError,
-    SupervisorAcknowledger, WallClock, submit_job,
+    CancelRunResult, ElapsedClock, ManagementError, ManagementStore, SubmissionOutcome,
+    SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
+    cancel_claimed_run, list_jobs, list_runs, remove_job, rerun_job, resolve_job, submit_job,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
-    ExecutionSpec, Job, MissedPolicy, Name, RuntimeTier, Schedule, TimeZoneSelection, UtcTimestamp,
-    parse_calendar, relative_deadline, resolve_calendar,
+    ExecutionSpec, Job, JobState, MissedPolicy, Name, Run, RunOutcome, RunState, RuntimeTier,
+    Schedule, TimeZoneSelection, TransitionActor, UtcTimestamp, parse_calendar, relative_deadline,
+    resolve_calendar,
 };
 use crate::infrastructure::config::{ColorMode, Config, ConfigOverrides, Verbosity, load_config};
-use crate::infrastructure::paths::{PathEnvironment, Platform, ensure_private_dir, resolve_paths};
+use crate::infrastructure::paths::{
+    PathEnvironment, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
+};
+use crate::infrastructure::process::{
+    IdentityStatus as NativeIdentityStatus, NativeGroupCanceller, NativeProcessInspector,
+};
 use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::sqlite::{Database, JobStore};
 use crate::infrastructure::time::NativeClock;
@@ -47,11 +55,12 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     };
     match parsed {
         ParsedCli::Schedule(args) => run_schedule(&args),
-        ParsedCli::Management { global, command } => run_management(global.json, &command),
+        ParsedCli::Management { global, command } => run_management(&global, &command),
     }
 }
 
-fn run_management(json: bool, command: &ManagementCommand) -> ExitCode {
+fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode {
+    let json = global.json;
     match command {
         ManagementCommand::Version => {
             if json {
@@ -74,14 +83,268 @@ fn run_management(json: bool, command: &ManagementCommand) -> ExitCode {
                 exit::supervision()
             }
         },
-        _ => {
-            print_error(
-                json,
-                "CAPABILITY_UNAVAILABLE",
-                "This command is not wired yet.",
-            );
-            exit::capability()
+        _ => match manage(global, command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                print_error(error.json, error.code, &error.message);
+                error.exit
+            }
+        },
+    }
+}
+
+fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliError> {
+    let (mut store, paths, config) = open_management(global)?;
+    match command {
+        ManagementCommand::List { state, limit } => {
+            let state = state
+                .as_deref()
+                .map(parse_job_state)
+                .transpose()
+                .map_err(|error| CliError::usage(global.json, error))?;
+            let jobs = list_jobs(&store, state, None, *limit)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            render_jobs(&jobs, global);
         }
+        ManagementCommand::Show { job } => {
+            let job = resolve_job(&store, job)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            render_value(&job, global);
+        }
+        ManagementCommand::History { job, limit } => {
+            let job_id = job
+                .as_deref()
+                .map(|prefix| resolve_job(&store, prefix).map(|job| job.id()))
+                .transpose()
+                .map_err(|error| management_cli_error(global.json, error))?;
+            let runs = list_runs(&store, job_id, *limit)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            render_runs(&runs, global);
+        }
+        ManagementCommand::Ps => {
+            let runs = store
+                .active_runs()
+                .map_err(|error| CliError::storage(global.json, error))?;
+            render_processes(&runs, global)?;
+        }
+        ManagementCommand::Cancel { job, grace } => {
+            let grace = grace
+                .as_deref()
+                .map(str::parse::<DurationSeconds>)
+                .transpose()
+                .map_err(|error| CliError::usage(global.json, error))?
+                .unwrap_or(config.cancel_grace());
+            let cancelled = cancel_job(&mut store, job, grace)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            render_value(&cancelled, global);
+        }
+        ManagementCommand::Remove {
+            job,
+            cancel,
+            keep_history: _,
+        } => {
+            let current = resolve_job(&store, job)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            if !current.state().is_terminal() && *cancel {
+                cancel_job(&mut store, job, config.cancel_grace())
+                    .map_err(|error| management_cli_error(global.json, error))?;
+            }
+            let removed = remove_job(&mut store, job)
+                .map_err(|error| management_cli_error(global.json, error))?;
+            render_value(&removed, global);
+        }
+        ManagementCommand::Run { job, yes } => {
+            let clock = NativeClock;
+            let rerun = rerun_job(
+                &mut store,
+                job,
+                *yes,
+                clock
+                    .now_utc()
+                    .map_err(|error| CliError::internal(global.json, error))?,
+            )
+            .map_err(|error| management_cli_error(global.json, error))?;
+            SessionAcknowledger::new(paths.state_dir().to_owned(), paths.runtime_dir().to_owned())
+                .acknowledge(rerun.id(), rerun.revision())
+                .map_err(|error| CliError::supervision(global.json, error))?;
+            render_value(&rerun, global);
+        }
+        ManagementCommand::Doctor | ManagementCommand::Service { .. } => {
+            return Err(CliError::capability(
+                global.json,
+                "this command is not wired yet",
+            ));
+        }
+        ManagementCommand::Version | ManagementCommand::Supervisor { .. } => {}
+    }
+    Ok(())
+}
+
+fn open_management(global: &GlobalArgs) -> Result<(JobStore, PlatformPaths, Config), CliError> {
+    let paths = platform_paths(global.state_dir.as_deref())
+        .map_err(|error| CliError::permission(global.json, error))?;
+    let config = load_effective_config(&paths, global, false)
+        .map_err(|error| CliError::usage(global.json, error))?;
+    let database_path = paths.state_dir().join("atx.db");
+    if !database_path.is_file() {
+        return Err(CliError::not_found(
+            global.json,
+            "ATX has no state database yet",
+        ));
+    }
+    let database = Database::open(&database_path, Duration::from_secs(2))
+        .map_err(|error| CliError::storage(global.json, error))?;
+    Ok((JobStore::new(database), paths, config))
+}
+
+fn cancel_job(
+    store: &mut JobStore,
+    prefix: &str,
+    grace: DurationSeconds,
+) -> Result<Job, ManagementError> {
+    let job = resolve_job(store, prefix)?;
+    if job.state() == JobState::Cancelled {
+        return Ok(job);
+    }
+    if job.state().is_terminal() {
+        return Err(ManagementError::StateConflict(
+            "completed job cannot be cancelled",
+        ));
+    }
+    let clock = NativeClock;
+    let now = clock.now_utc().map_err(management_store_error)?;
+    let active = store
+        .latest_active_run(job.id())
+        .map_err(ManagementError::from)?;
+    let requested = store
+        .transition_job(
+            job.id(),
+            job.revision(),
+            JobState::CancelRequested,
+            false,
+            TransitionActor::Cli,
+            "cancel requested",
+            now,
+        )
+        .map_err(management_store_error)?;
+
+    let Some(run) = active else {
+        return store
+            .transition_job(
+                requested.id(),
+                requested.revision(),
+                JobState::Cancelled,
+                false,
+                TransitionActor::Cli,
+                "cancelled before command start",
+                now,
+            )
+            .map_err(management_store_error);
+    };
+    let terminal_run = cancel_active_run(store, &run, grace, clock)?;
+    finish_job_cancellation(store, requested.id(), terminal_run.state(), clock)
+}
+
+fn cancel_active_run(
+    store: &mut JobStore,
+    run: &Run,
+    grace: DurationSeconds,
+    clock: NativeClock,
+) -> Result<Run, ManagementError> {
+    let boot_identity = clock.boot_identity().map_err(management_store_error)?;
+    let inspector = NativeProcessInspector::new(boot_identity);
+    let grace_duration = Duration::from_secs(grace.get());
+    let result = cancel_claimed_run(
+        store,
+        &NativeGroupCanceller::new(&inspector, grace_duration),
+        run.id(),
+        run.claim_token(),
+    )
+    .map_err(management_store_error)?;
+    if let CancelRunResult::CommittedBeforeSpawn(run) = result {
+        store
+            .record_run_terminal(
+                run.id(),
+                run.claim_token(),
+                clock.now_utc().map_err(management_store_error)?,
+                RunOutcome::Cancelled("cancelled before command start".to_owned()),
+            )
+            .map_err(management_store_error)?;
+    }
+
+    let deadline = std::time::Instant::now()
+        .checked_add(grace_duration + Duration::from_secs(2))
+        .ok_or(ManagementError::StateConflict("cancel wait overflowed"))?;
+    let terminal_run = loop {
+        let current = store
+            .load_run(run.id())
+            .map_err(management_store_error)?
+            .ok_or(ManagementError::StateConflict("active run disappeared"))?;
+        if current.state().is_terminal() {
+            break current;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ManagementError::StateConflict(
+                "run did not stop before the cancellation deadline",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    Ok(terminal_run)
+}
+
+fn finish_job_cancellation(
+    store: &mut JobStore,
+    job_id: crate::domain::JobId,
+    run_state: RunState,
+    clock: NativeClock,
+) -> Result<Job, ManagementError> {
+    let target = match run_state {
+        RunState::Succeeded => JobState::Succeeded,
+        RunState::Cancelled => JobState::Cancelled,
+        RunState::Failed => JobState::Failed,
+        RunState::Interrupted => JobState::Interrupted,
+        _ => {
+            return Err(ManagementError::StateConflict(
+                "run remained nonterminal after cancellation",
+            ));
+        }
+    };
+    let current = store.load(job_id).map_err(management_store_error)?;
+    let current = current.ok_or(ManagementError::NotFound)?;
+    if current.state().is_terminal() {
+        return Ok(current);
+    }
+    store
+        .transition_job(
+            current.id(),
+            current.revision(),
+            target,
+            false,
+            TransitionActor::Cli,
+            "cancellation finished",
+            clock.now_utc().map_err(management_store_error)?,
+        )
+        .map_err(management_store_error)
+}
+
+fn management_store_error(error: impl std::fmt::Display) -> ManagementError {
+    ManagementError::Store(crate::application::ManagementStoreError(error.to_string()))
+}
+
+fn parse_job_state(value: &str) -> Result<JobState, &'static str> {
+    match value {
+        "scheduled" => Ok(JobState::Scheduled),
+        "waiting" => Ok(JobState::Waiting),
+        "starting" => Ok(JobState::Starting),
+        "running" => Ok(JobState::Running),
+        "cancel_requested" => Ok(JobState::CancelRequested),
+        "succeeded" => Ok(JobState::Succeeded),
+        "failed" => Ok(JobState::Failed),
+        "cancelled" => Ok(JobState::Cancelled),
+        "interrupted" => Ok(JobState::Interrupted),
+        "missed" => Ok(JobState::Missed),
+        _ => Err("unknown job state"),
     }
 }
 
@@ -110,8 +373,8 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
     }
     let paths = platform_paths(args.global.state_dir.as_deref())
         .map_err(|error| CliError::permission(json, error))?;
-    let config =
-        load_effective_config(&paths, args).map_err(|error| CliError::usage(json, error))?;
+    let config = load_effective_config(&paths, &args.global, args.options.durable)
+        .map_err(|error| CliError::usage(json, error))?;
     let clock = NativeClock;
     let wall_now = clock
         .now_utc()
@@ -170,7 +433,8 @@ fn platform_paths(
 
 fn load_effective_config(
     paths: &crate::infrastructure::paths::PlatformPaths,
-    args: &SchedulingArgs,
+    global: &GlobalArgs,
+    durable: bool,
 ) -> Result<Config, String> {
     let config_path = paths.state_dir().join("config.toml");
     let file = match fs::read_to_string(&config_path) {
@@ -180,15 +444,15 @@ fn load_effective_config(
     };
     let environment = std::env::vars().collect::<Vec<_>>();
     let overrides = ConfigOverrides {
-        default_runtime: args.options.durable.then_some(RuntimeTier::Durable),
-        color: Some(match args.global.color {
+        default_runtime: durable.then_some(RuntimeTier::Durable),
+        color: Some(match global.color {
             ColorArg::Auto => ColorMode::Auto,
             ColorArg::Always => ColorMode::Always,
             ColorArg::Never => ColorMode::Never,
         }),
-        verbosity: Some(if args.global.quiet {
+        verbosity: Some(if global.quiet {
             Verbosity::Quiet
-        } else if args.global.verbose > 0 {
+        } else if global.verbose > 0 {
             Verbosity::Verbose
         } else {
             Verbosity::Normal
@@ -444,6 +708,96 @@ const fn map_missed(value: MissedArg) -> MissedPolicy {
     }
 }
 
+fn render_jobs(jobs: &[Job], global: &GlobalArgs) {
+    if global.json {
+        if let Ok(value) = serde_json::to_string(jobs) {
+            println!("{value}");
+        }
+    } else if !global.quiet {
+        for job in jobs {
+            println!("{}\t{:?}\t{}", job.id(), job.state(), job.next_due_utc());
+        }
+    }
+}
+
+fn render_runs(runs: &[crate::domain::Run], global: &GlobalArgs) {
+    if global.json {
+        if let Ok(value) = serde_json::to_string(runs) {
+            println!("{value}");
+        }
+    } else if !global.quiet {
+        for run in runs {
+            println!("{}\t{}\t{:?}", run.id(), run.job_id(), run.state());
+        }
+    }
+}
+
+fn render_value<T: Serialize + std::fmt::Debug>(value: &T, global: &GlobalArgs) {
+    if global.json {
+        if let Ok(value) = serde_json::to_string(value) {
+            println!("{value}");
+        }
+    } else if !global.quiet {
+        println!("{value:#?}");
+    }
+}
+
+#[derive(Serialize)]
+struct ProcessView {
+    job_id: String,
+    run_id: String,
+    role: &'static str,
+    pid: u32,
+    process_group_id: i32,
+    state: RunState,
+}
+
+fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<(), CliError> {
+    let clock = NativeClock;
+    let inspector = NativeProcessInspector::new(
+        clock
+            .boot_identity()
+            .map_err(|error| CliError::internal(global.json, error))?,
+    );
+    let mut processes = Vec::new();
+    for run in runs {
+        for (role, identity) in [
+            ("monitor", run.monitor_identity()),
+            ("command", run.command_identity()),
+        ] {
+            if let Some(identity) = identity {
+                if inspector
+                    .classify(identity)
+                    .map_err(|error| CliError::internal(global.json, error))?
+                    == NativeIdentityStatus::Alive
+                {
+                    processes.push(ProcessView {
+                        job_id: run.job_id().to_string(),
+                        run_id: run.id().to_string(),
+                        role,
+                        pid: identity.pid,
+                        process_group_id: identity.process_group_id,
+                        state: run.state(),
+                    });
+                }
+            }
+        }
+    }
+    if global.json {
+        if let Ok(value) = serde_json::to_string(&processes) {
+            println!("{value}");
+        }
+    } else if !global.quiet {
+        for process in processes {
+            println!(
+                "{}\t{}\t{}\t{}",
+                process.job_id, process.run_id, process.role, process.pid
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct SubmissionView<'a> {
     job_id: String,
@@ -489,6 +843,19 @@ fn print_error(json: bool, code: &str, message: &str) {
         );
     } else {
         eprintln!("atx: {message}");
+    }
+}
+
+fn management_cli_error(json: bool, error: ManagementError) -> CliError {
+    match error {
+        ManagementError::NotFound
+        | ManagementError::Ambiguous(_)
+        | ManagementError::InvalidPrefix => CliError::not_found(json, error),
+        ManagementError::StateConflict(_) | ManagementError::ConfirmationRequired => {
+            CliError::conflict(json, error)
+        }
+        ManagementError::InvalidLimit => CliError::usage(json, error),
+        ManagementError::Store(_) => CliError::storage(json, error),
     }
 }
 
@@ -570,12 +937,24 @@ impl CliError {
         Self::new(exit::capability(), "CAPABILITY_UNAVAILABLE", json, error)
     }
 
+    fn not_found(json: bool, error: impl std::fmt::Display) -> Self {
+        Self::new(exit::not_found(), "JOB_NOT_FOUND", json, error)
+    }
+
+    fn conflict(json: bool, error: impl std::fmt::Display) -> Self {
+        Self::new(exit::conflict(), "STATE_CONFLICT", json, error)
+    }
+
     fn storage(json: bool, error: impl std::fmt::Display) -> Self {
         Self::new(exit::storage(), "STORAGE_ERROR", json, error)
     }
 
     fn permission(json: bool, error: impl std::fmt::Display) -> Self {
         Self::new(exit::permission(), "PERMISSION_ERROR", json, error)
+    }
+
+    fn supervision(json: bool, error: impl std::fmt::Display) -> Self {
+        Self::new(exit::supervision(), "SUPERVISION_ERROR", json, error)
     }
 
     fn internal(json: bool, error: impl std::fmt::Display) -> Self {

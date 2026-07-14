@@ -86,8 +86,11 @@ impl JobStore {
         let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidPageSize)?;
         let connection = self.database.connection();
         let sql = match after {
-            Some(_) => format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id > ?1 ORDER BY id LIMIT ?2"),
-            None => format!("SELECT {JOB_COLUMNS} FROM jobs ORDER BY id LIMIT ?1"),
+            Some(_) => format!(
+                "SELECT {JOB_COLUMNS} FROM jobs
+                 WHERE hidden = 0 AND id > ?1 ORDER BY id LIMIT ?2"
+            ),
+            None => format!("SELECT {JOB_COLUMNS} FROM jobs WHERE hidden = 0 ORDER BY id LIMIT ?1"),
         };
         let mut statement = connection.prepare(&sql)?;
         let rows = match after {

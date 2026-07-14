@@ -5,6 +5,7 @@ mod cancel;
 #[allow(dead_code)]
 mod clock;
 mod history;
+#[allow(dead_code)]
 mod list;
 #[allow(dead_code)]
 mod reconcile;
@@ -21,6 +22,11 @@ pub(crate) use cancel::{
 };
 #[allow(unused_imports)]
 pub(crate) use clock::{ClockError, ElapsedClock, WallClock};
+#[allow(unused_imports)]
+pub(crate) use list::{
+    MAX_MANAGEMENT_RESULTS, ManagementError, ManagementStore, ManagementStoreError, list_jobs,
+    list_runs, remove_job, rerun_job, resolve_job,
+};
 #[allow(unused_imports)]
 pub(crate) use reconcile::{
     CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveredDeadline,

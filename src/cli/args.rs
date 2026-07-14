@@ -11,7 +11,8 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
     version,
     about = "Run commands later without keeping a terminal open",
     args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
+    subcommand_negates_reqs = true,
+    subcommand_precedence_over_arg = true
 )]
 struct RawCli {
     #[command(flatten)]
@@ -35,23 +36,23 @@ struct RawCli {
 #[derive(Clone, Debug, Args, Eq, PartialEq)]
 pub(crate) struct GlobalArgs {
     /// Suppress successful human output.
-    #[arg(short, long, conflicts_with = "verbose")]
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub(crate) quiet: bool,
 
     /// Print extra diagnostics. Repeat for more detail.
-    #[arg(short, long, action = ArgAction::Count)]
+    #[arg(short, long, global = true, action = ArgAction::Count)]
     pub(crate) verbose: u8,
 
     /// Print machine-readable JSON.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub(crate) json: bool,
 
     /// Control colored output.
-    #[arg(long, value_enum, default_value_t = ColorArg::Auto)]
+    #[arg(long, global = true, value_enum, default_value_t = ColorArg::Auto)]
     pub(crate) color: ColorArg,
 
     /// Use a different state directory.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     pub(crate) state_dir: Option<PathBuf>,
 }
 
@@ -228,6 +229,8 @@ pub(crate) enum ServiceAction {
 pub(crate) fn parse_from(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<ParsedCli, clap::Error> {
+    let mut args = args.into_iter().collect::<Vec<_>>();
+    normalize_management_order(&mut args);
     let raw = RawCli::try_parse_from(args)?;
     if let Some(command) = raw.management {
         return Ok(ParsedCli::Management {
@@ -253,6 +256,71 @@ pub(crate) fn parse_from(
         when: raw.when,
         argv: raw.argv,
     }))
+}
+
+fn normalize_management_order(args: &mut Vec<OsString>) {
+    if args.len() < 3 || args.get(1).is_some_and(|value| is_management_name(value)) {
+        return;
+    }
+    let mut skip_value = false;
+    for index in 1..args.len() {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        let value = args[index].to_string_lossy();
+        if value == "--" {
+            return;
+        }
+        if option_takes_value(&value) {
+            skip_value = !value.contains('=');
+            continue;
+        }
+        if is_management_name(&args[index]) {
+            let command = args.remove(index);
+            args.insert(1, command);
+            return;
+        }
+    }
+}
+
+fn is_management_name(value: &std::ffi::OsStr) -> bool {
+    matches!(
+        value.to_str(),
+        Some(
+            "list"
+                | "ls"
+                | "show"
+                | "cancel"
+                | "rm"
+                | "run"
+                | "ps"
+                | "history"
+                | "doctor"
+                | "service"
+                | "version"
+                | "help"
+                | "__supervisor"
+        )
+    )
+}
+
+fn option_takes_value(value: &str) -> bool {
+    let name = value.split_once('=').map_or(value, |(name, _)| name);
+    matches!(
+        name,
+        "--color"
+            | "--state-dir"
+            | "--tz"
+            | "--dst"
+            | "--cwd"
+            | "--name"
+            | "--description"
+            | "--env"
+            | "--env-file"
+            | "--missed"
+            | "--every"
+    )
 }
 
 #[cfg(test)]
@@ -319,7 +387,8 @@ mod tests {
     #[test]
     fn reserved_management_commands_do_not_parse_as_schedules() {
         let parsed =
-            parse_from(["atx", "ls", "--limit", "7"].map(Into::into)).expect("management command");
+            parse_from(["atx", "--state-dir", "/tmp/atx", "ls", "--limit", "7"].map(Into::into))
+                .expect("management command");
         assert!(matches!(
             parsed,
             ParsedCli::Management {

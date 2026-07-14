@@ -10,6 +10,14 @@ pub(crate) fn capability() -> ExitCode {
     ExitCode::from(5)
 }
 
+pub(crate) fn not_found() -> ExitCode {
+    ExitCode::from(3)
+}
+
+pub(crate) fn conflict() -> ExitCode {
+    ExitCode::from(4)
+}
+
 pub(crate) fn storage() -> ExitCode {
     ExitCode::from(10)
 }

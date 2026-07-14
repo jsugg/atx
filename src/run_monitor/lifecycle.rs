@@ -123,18 +123,12 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
             )
             .map_err(|error| MonitorError::Store(error.to_string()))?;
 
-        let outcome = if capture_failed {
-            RunOutcome::Failure("output capture failed".to_owned())
-        } else {
-            match status {
-                Ok(status) => match (status.code(), status.signal()) {
-                    (Some(code), _) => RunOutcome::Exit(code),
-                    (None, Some(signal)) => RunOutcome::Signal(signal),
-                    (None, None) => RunOutcome::Interrupted("unknown child status".to_owned()),
-                },
-                Err(error) => RunOutcome::Interrupted(format!("child wait failed: {error}")),
-            }
-        };
+        let cancellation_requested = self
+            .store
+            .load_run(running.id())
+            .map_err(|error| MonitorError::Store(error.to_string()))?
+            .is_some_and(|run| run.state() == RunState::CancelRequested);
+        let outcome = completion_outcome(status, capture_failed, cancellation_requested);
         self.store
             .record_run_terminal(
                 running.id(),
@@ -155,6 +149,28 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
                 RunOutcome::Failure(message),
             )
             .map_err(|error| MonitorError::Store(error.to_string()))
+    }
+}
+
+fn completion_outcome(
+    status: std::io::Result<std::process::ExitStatus>,
+    capture_failed: bool,
+    cancellation_requested: bool,
+) -> RunOutcome {
+    if capture_failed {
+        return RunOutcome::Failure("output capture failed".to_owned());
+    }
+    match status {
+        Ok(status) => match (status.code(), status.signal()) {
+            (Some(0), _) => RunOutcome::Exit(0),
+            _ if cancellation_requested => {
+                RunOutcome::Cancelled("cancel request stopped command".to_owned())
+            }
+            (Some(code), _) => RunOutcome::Exit(code),
+            (None, Some(signal)) => RunOutcome::Signal(signal),
+            (None, None) => RunOutcome::Interrupted("unknown child status".to_owned()),
+        },
+        Err(error) => RunOutcome::Interrupted(format!("child wait failed: {error}")),
     }
 }
 
