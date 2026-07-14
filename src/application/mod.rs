@@ -27,3 +27,8 @@ pub(crate) use reconcile::{
     RecoveryAction, RecoveryPlan, RecoveryRecord, RecoveryStore, RecoveryStoreError,
     StartupReconciliationError, reconcile_startup,
 };
+#[allow(unused_imports)]
+pub(crate) use submit::{
+    SubmissionOutcome, SubmissionStore, SubmissionStoreError, SupervisorAckError,
+    SupervisorAcknowledger, submit_job,
+};

@@ -88,6 +88,11 @@ impl Job {
         &self.execution
     }
 
+    pub(crate) fn set_metadata(&mut self, name: Option<Name>, description: Option<Description>) {
+        self.name = name;
+        self.description = description;
+    }
+
     pub(crate) fn snapshot(&self) -> JobSnapshot {
         JobSnapshot {
             id: self.id,

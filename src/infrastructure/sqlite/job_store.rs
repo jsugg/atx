@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::{Database, StoreError, map_read_error, map_write_error};
+use crate::application::{SubmissionStore, SubmissionStoreError};
 use crate::domain::{
     Description, ExecutionSpec, Job, JobId, JobSnapshot, JobState, MissedPolicy, Name, Revision,
     Schedule, TransitionActor, UtcTimestamp,
@@ -175,6 +176,13 @@ impl JobStore {
             .map_err(map_write_error)?;
         transaction.commit().map_err(map_write_error)?;
         Ok(job)
+    }
+}
+
+impl SubmissionStore for JobStore {
+    fn create_job(&mut self, job: &Job) -> Result<(), SubmissionStoreError> {
+        self.create(job)
+            .map_err(|error| SubmissionStoreError(error.to_string()))
     }
 }
 

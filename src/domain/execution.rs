@@ -193,6 +193,14 @@ impl ExecutionSpec {
         self.shell_path.as_deref()
     }
 
+    pub(crate) fn set_shell_path(&mut self, shell_path: PathBuf) -> Result<(), ExecutionError> {
+        if self.mode != ExecutionMode::Shell || !shell_path.is_absolute() {
+            return Err(ExecutionError::InvalidShellPath);
+        }
+        self.shell_path = Some(shell_path);
+        Ok(())
+    }
+
     pub(crate) fn to_persistence_json(&self) -> Result<String, ExecutionStorageError> {
         let environment = self
             .environment
@@ -267,6 +275,8 @@ pub(crate) enum ExecutionError {
     SerializedSizeExceeded,
     #[error("working directory must be absolute")]
     WorkingDirectoryNotAbsolute,
+    #[error("shell path must be absolute and is only valid in shell mode")]
+    InvalidShellPath,
     #[error("invalid environment variable name")]
     InvalidEnvironmentKey,
 }

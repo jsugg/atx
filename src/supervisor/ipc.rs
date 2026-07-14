@@ -9,18 +9,81 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::ProcessIdentitySnapshot;
+use crate::application::{SupervisorAckError, SupervisorAcknowledger};
+use crate::domain::{JobId, ProcessIdentitySnapshot, Revision};
 use crate::infrastructure::paths::ensure_private_dir;
 use crate::infrastructure::process::{IdentityStatus, NativeProcessInspector};
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum IpcMessage {
-    Wake { protocol: u16 },
-    Ack { protocol: u16 },
-    Shutdown { protocol: u16 },
+    Wake {
+        protocol: u16,
+        job_id: JobId,
+        revision: Revision,
+    },
+    Ack {
+        protocol: u16,
+        job_id: JobId,
+        revision: Revision,
+    },
+    Shutdown {
+        protocol: u16,
+    },
+}
+
+pub(crate) struct SocketAcknowledger {
+    socket_path: PathBuf,
+    timeout: std::time::Duration,
+}
+
+impl SocketAcknowledger {
+    pub(crate) fn new(socket_path: PathBuf, timeout: std::time::Duration) -> Self {
+        Self {
+            socket_path,
+            timeout,
+        }
+    }
+
+    fn send(&self, job_id: JobId, revision: Revision) -> Result<(), IpcError> {
+        let metadata = fs::symlink_metadata(&self.socket_path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_socket()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(IpcError::SocketSubstitution);
+        }
+        let mut stream = UnixStream::connect(&self.socket_path)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        write_frame(
+            &mut stream,
+            &IpcMessage::Wake {
+                protocol: PROTOCOL_VERSION,
+                job_id,
+                revision,
+            },
+        )?;
+        match read_frame(&mut stream)? {
+            IpcMessage::Ack {
+                protocol: PROTOCOL_VERSION,
+                job_id: acknowledged_job,
+                revision: acknowledged_revision,
+            } if acknowledged_job == job_id && acknowledged_revision == revision => Ok(()),
+            _ => Err(IpcError::InvalidAcknowledgement),
+        }
+    }
+}
+
+impl SupervisorAcknowledger for SocketAcknowledger {
+    fn acknowledge(&self, job_id: JobId, revision: Revision) -> Result<(), SupervisorAckError> {
+        self.send(job_id, revision)
+            .map_err(|error| SupervisorAckError(error.to_string()))
+    }
 }
 
 pub(crate) fn write_frame(writer: &mut impl Write, message: &IpcMessage) -> Result<(), IpcError> {
@@ -171,6 +234,8 @@ pub(crate) enum IpcError {
     MalformedLock,
     #[error("IPC frame is empty or too large")]
     FrameTooLarge,
+    #[error("supervisor returned the wrong acknowledgement")]
+    InvalidAcknowledgement,
     #[error("runtime setup failed: {0}")]
     Runtime(String),
     #[error("IPC I/O failed: {0}")]
@@ -185,11 +250,14 @@ mod tests {
 
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
-    use super::{IpcMessage, RuntimeGuard, read_frame, write_frame};
-    use crate::application::ElapsedClock;
+    use super::{IpcMessage, RuntimeGuard, SocketAcknowledger, read_frame, write_frame};
+    use crate::application::{ElapsedClock, SupervisorAcknowledger};
+    use crate::domain::{JobId, Revision};
     use crate::infrastructure::process::NativeProcessInspector;
     use crate::infrastructure::time::NativeClock;
 
@@ -201,13 +269,60 @@ mod tests {
     #[test]
     fn framing_rejects_malformed_and_oversize_messages() {
         let mut bytes = Vec::new();
-        write_frame(&mut bytes, &IpcMessage::Wake { protocol: 1 }).expect("write");
+        let job_id = JobId::new();
+        let revision = Revision::new(1).expect("revision");
+        write_frame(
+            &mut bytes,
+            &IpcMessage::Wake {
+                protocol: 1,
+                job_id,
+                revision,
+            },
+        )
+        .expect("write");
         assert_eq!(
             read_frame(&mut bytes.as_slice()).expect("read"),
-            IpcMessage::Wake { protocol: 1 }
+            IpcMessage::Wake {
+                protocol: 1,
+                job_id,
+                revision,
+            }
         );
         assert!(read_frame(&mut [0, 1, 0, 1].as_slice()).is_err());
         assert!(read_frame(&mut [0, 0, 0, 2, b'{', b'}'].as_slice()).is_err());
+    }
+
+    #[test]
+    fn wake_requires_an_exact_revision_ack() {
+        let root = tempdir().expect("root");
+        let socket = root.path().join("ack.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("permissions");
+        let job_id = JobId::new();
+        let revision = Revision::new(2).expect("revision");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            assert_eq!(
+                read_frame(&mut stream).expect("wake"),
+                IpcMessage::Wake {
+                    protocol: 1,
+                    job_id,
+                    revision,
+                }
+            );
+            write_frame(
+                &mut stream,
+                &IpcMessage::Ack {
+                    protocol: 1,
+                    job_id,
+                    revision,
+                },
+            )
+            .expect("ack");
+        });
+        let client = SocketAcknowledger::new(socket, Duration::from_secs(1));
+        client.acknowledge(job_id, revision).expect("acknowledged");
+        server.join().expect("server");
     }
 
     #[test]

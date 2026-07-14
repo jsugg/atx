@@ -4,6 +4,7 @@ ATX is small enough that every runtime dependency should earn its place.
 
 Current choices:
 
+- `clap` owns the public option grammar and keeps help text in sync with it.
 - `serde` and `serde_json` keep persisted and command-line data formats typed.
 - `uuid` creates sortable UUIDv7 identifiers.
 - `jiff` handles checked date/time work and ships timezone data in the binary.

@@ -1,10 +1,50 @@
 //! Session runtime adapter.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use crate::domain::RunId;
 use crate::infrastructure::paths::{PathError, create_new_private_file, ensure_private_dir};
+
+pub(crate) fn start_session_supervisor(
+    state_directory: &Path,
+    runtime_directory: &Path,
+) -> Result<(), io::Error> {
+    ensure_private_dir(state_directory).map_err(io::Error::other)?;
+    ensure_private_dir(runtime_directory).map_err(io::Error::other)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(state_directory.join("supervisor.log"))?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("__supervisor")
+        .arg("--state-dir")
+        .arg(state_directory)
+        .arg("--runtime-dir")
+        .arg(runtime_directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    // SAFETY: `setsid` has no pointer preconditions and runs before other
+    // threads exist in the new child image.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().map(|_| ())
+}
 
 pub(crate) struct RunArtifacts {
     stdout_path: PathBuf,
