@@ -20,6 +20,16 @@ fn version_and_usage_have_stable_exit_codes() {
         .expect("run invalid command");
     assert_eq!(invalid.status.code(), Some(2));
     assert!(invalid.stdout.is_empty());
+
+    let invalid_json = atx()
+        .args(["--json", "30s", "true"])
+        .output()
+        .expect("run invalid JSON command");
+    assert_eq!(invalid_json.status.code(), Some(2));
+    let error: serde_json::Value =
+        serde_json::from_slice(&invalid_json.stderr).expect("JSON error");
+    assert_eq!(error["schema_version"], 1);
+    assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
 }
 
 #[test]
@@ -37,7 +47,9 @@ fn json_dry_run_is_machine_readable_and_leaves_no_state() {
     assert!(output.status.success(), "{output:?}");
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("valid JSON output");
-    assert_eq!(value["state"], "scheduled");
-    assert_eq!(value["supervised"], false);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["state"], "scheduled");
+    assert_eq!(value["data"]["supervised"], false);
     assert!(!state.exists());
 }

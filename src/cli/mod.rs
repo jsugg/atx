@@ -5,6 +5,7 @@ mod dispatch;
 mod exit;
 mod human;
 mod json;
+mod view;
 
 use std::ffi::OsString;
 use std::process::ExitCode;

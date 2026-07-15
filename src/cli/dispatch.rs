@@ -7,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use serde::Serialize;
-
 use super::args::{
     ColorArg, DstArg, GlobalArgs, ManagementCommand, MissedArg, ParsedCli, SchedulingArgs,
     parse_from,
 };
 use super::exit;
+use super::human::HumanRenderer;
+use super::view::{JobView, ProcessView, RunView, SubmissionView};
 use crate::application::{
     CancelRunResult, ElapsedClock, ManagementError, ManagementStore, SubmissionOutcome,
     SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
@@ -41,6 +41,11 @@ const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let json_requested = args
+        .iter()
+        .take_while(|value| value.as_os_str() != "--")
+        .any(|value| value == "--json");
     let parsed = match parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -49,7 +54,11 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             };
-            let _ = error.print();
+            if json_requested && error.use_stderr() {
+                print_error(true, "INVALID_ARGUMENT", &error.to_string());
+            } else {
+                let _ = error.print();
+            }
             return exit_code;
         }
     };
@@ -64,10 +73,7 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
     match command {
         ManagementCommand::Version => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"version": env!("CARGO_PKG_VERSION")})
-                );
+                print_json_success(&serde_json::json!({"version": env!("CARGO_PKG_VERSION")}));
             } else {
                 println!("atx {}", env!("CARGO_PKG_VERSION"));
             }
@@ -109,7 +115,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         ManagementCommand::Show { job } => {
             let job = resolve_job(&store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_value(&job, global);
+            render_job(&job, global);
         }
         ManagementCommand::History { job, limit } => {
             let job_id = job
@@ -136,7 +142,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .unwrap_or(config.cancel_grace());
             let cancelled = cancel_job(&mut store, job, grace)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_value(&cancelled, global);
+            render_job(&cancelled, global);
         }
         ManagementCommand::Remove {
             job,
@@ -151,7 +157,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             }
             let removed = remove_job(&mut store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_value(&removed, global);
+            render_job(&removed, global);
         }
         ManagementCommand::Run { job, yes } => {
             let clock = NativeClock;
@@ -167,7 +173,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             SessionAcknowledger::new(paths.state_dir().to_owned(), paths.runtime_dir().to_owned())
                 .acknowledge(rerun.id(), rerun.revision())
                 .map_err(|error| CliError::supervision(global.json, error))?;
-            render_value(&rerun, global);
+            render_job(&rerun, global);
         }
         ManagementCommand::Doctor | ManagementCommand::Service { .. } => {
             return Err(CliError::capability(
@@ -351,7 +357,7 @@ fn parse_job_state(value: &str) -> Result<JobState, &'static str> {
 fn run_schedule(args: &SchedulingArgs) -> ExitCode {
     match schedule(args) {
         Ok((outcome, json, quiet)) => {
-            render_submission(&outcome, json, quiet);
+            render_submission(&outcome, json, quiet, args.global.color);
             if matches!(outcome, SubmissionOutcome::CommittedUnsupervised { .. }) {
                 exit::supervision()
             } else {
@@ -709,47 +715,34 @@ const fn map_missed(value: MissedArg) -> MissedPolicy {
 }
 
 fn render_jobs(jobs: &[Job], global: &GlobalArgs) {
+    let now = UtcTimestamp::from_jiff(jiff::Timestamp::now());
+    let views = jobs
+        .iter()
+        .map(|job| JobView::from_job(job, now))
+        .collect::<Vec<_>>();
     if global.json {
-        if let Ok(value) = serde_json::to_string(jobs) {
-            println!("{value}");
-        }
+        print_json_success(&views);
     } else if !global.quiet {
-        for job in jobs {
-            println!("{}\t{:?}\t{}", job.id(), job.state(), job.next_due_utc());
-        }
+        println!("{}", HumanRenderer::new(global.color).jobs(&views));
     }
 }
 
 fn render_runs(runs: &[crate::domain::Run], global: &GlobalArgs) {
+    let views = runs.iter().map(RunView::from_run).collect::<Vec<_>>();
     if global.json {
-        if let Ok(value) = serde_json::to_string(runs) {
-            println!("{value}");
-        }
+        print_json_success(&views);
     } else if !global.quiet {
-        for run in runs {
-            println!("{}\t{}\t{:?}", run.id(), run.job_id(), run.state());
-        }
+        println!("{}", HumanRenderer::runs(&views));
     }
 }
 
-fn render_value<T: Serialize + std::fmt::Debug>(value: &T, global: &GlobalArgs) {
+fn render_job(job: &Job, global: &GlobalArgs) {
+    let view = JobView::from_job(job, UtcTimestamp::from_jiff(jiff::Timestamp::now()));
     if global.json {
-        if let Ok(value) = serde_json::to_string(value) {
-            println!("{value}");
-        }
+        print_json_success(&view);
     } else if !global.quiet {
-        println!("{value:#?}");
+        println!("{}", HumanRenderer::new(global.color).job(&view));
     }
-}
-
-#[derive(Serialize)]
-struct ProcessView {
-    job_id: String,
-    run_id: String,
-    role: &'static str,
-    pid: u32,
-    process_group_id: i32,
-    state: RunState,
 }
 
 fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<(), CliError> {
@@ -784,51 +777,19 @@ fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<
         }
     }
     if global.json {
-        if let Ok(value) = serde_json::to_string(&processes) {
-            println!("{value}");
-        }
+        print_json_success(&processes);
     } else if !global.quiet {
-        for process in processes {
-            println!(
-                "{}\t{}\t{}\t{}",
-                process.job_id, process.run_id, process.role, process.pid
-            );
-        }
+        println!("{}", HumanRenderer::processes(&processes));
     }
     Ok(())
 }
 
-#[derive(Serialize)]
-struct SubmissionView<'a> {
-    job_id: String,
-    state: crate::domain::JobState,
-    schedule: &'a Schedule,
-    next_due_utc: String,
-    runtime_tier: RuntimeTier,
-    supervised: bool,
-}
-
-fn render_submission(outcome: &SubmissionOutcome, json: bool, quiet: bool) {
-    let snapshot = outcome.job().snapshot();
-    let view = SubmissionView {
-        job_id: snapshot.id.to_string(),
-        state: snapshot.state,
-        schedule: &snapshot.schedule,
-        next_due_utc: snapshot.next_due_utc.to_string(),
-        runtime_tier: snapshot.runtime_tier,
-        supervised: outcome.is_supervised(),
-    };
+fn render_submission(outcome: &SubmissionOutcome, json: bool, quiet: bool, color: ColorArg) {
+    let view = SubmissionView::from_outcome(outcome);
     if json {
-        if let Ok(value) = serde_json::to_string(&view) {
-            println!("{value}");
-        }
+        print_json_success(&view);
     } else if !quiet {
-        let prefix = if outcome.is_dry_run() {
-            "Dry run:"
-        } else {
-            "Scheduled"
-        };
-        println!("{prefix} {} for {}", view.job_id, view.next_due_utc);
+        println!("{}", HumanRenderer::new(color).submission(&view));
     }
     if let SubmissionOutcome::CommittedUnsupervised { error, .. } = outcome {
         eprintln!("Job was saved, but {error}");
@@ -837,12 +798,24 @@ fn render_submission(outcome: &SubmissionOutcome, json: bool, quiet: bool) {
 
 fn print_error(json: bool, code: &str, message: &str) {
     if json {
-        eprintln!(
-            "{}",
-            serde_json::json!({"error": {"code": code, "message": message}})
-        );
+        let remediation = match code {
+            "JOB_NOT_FOUND" => Some("Run `atx list` to inspect job IDs."),
+            "STATE_CONFLICT" => Some("Run `atx show JOB` to inspect its current state."),
+            _ => None,
+        };
+        match super::json::error(code, message, remediation) {
+            Ok(value) => eprintln!("{value}"),
+            Err(error) => eprintln!("atx: could not serialize error output: {error}"),
+        }
     } else {
         eprintln!("atx: {message}");
+    }
+}
+
+fn print_json_success<T: serde::Serialize>(value: &T) {
+    match super::json::success(value) {
+        Ok(value) => println!("{value}"),
+        Err(error) => eprintln!("atx: could not serialize output: {error}"),
     }
 }
 
