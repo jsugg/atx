@@ -14,6 +14,8 @@ mod reconcile;
 mod remove;
 mod rerun;
 mod retain;
+#[allow(dead_code)]
+mod service;
 mod show;
 mod submit;
 
@@ -36,6 +38,11 @@ pub(crate) use reconcile::{
     CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveredDeadline,
     RecoveryAction, RecoveryPlan, RecoveryRecord, RecoveryStore, RecoveryStoreError,
     StartupReconciliationError, reconcile_startup,
+};
+#[allow(unused_imports)]
+pub(crate) use service::{
+    ServiceAvailability, ServiceChange, ServiceLifecycleError, ServiceManager, ServiceManagerError,
+    ServiceStatus, install_service, uninstall_service,
 };
 #[allow(unused_imports)]
 pub(crate) use submit::{
