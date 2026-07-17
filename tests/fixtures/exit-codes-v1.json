@@ -1,0 +1,12 @@
+{
+  "success": 0,
+  "negative_outcome": 1,
+  "usage": 2,
+  "not_found": 3,
+  "conflict": 4,
+  "capability": 5,
+  "storage": 10,
+  "supervision": 11,
+  "permission": 12,
+  "internal": 70
+}

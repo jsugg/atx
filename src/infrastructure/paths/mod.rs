@@ -120,7 +120,10 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), PathError> {
     validate_private_dir_for_uid(path, geteuid().as_raw())
 }
 
-fn validate_private_dir_for_uid(path: &Path, expected_uid: u32) -> Result<(), PathError> {
+pub(crate) fn validate_private_dir_for_uid(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<(), PathError> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(PathError::Insecure("path is not a real directory"));

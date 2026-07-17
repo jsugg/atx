@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -15,9 +16,10 @@ use super::exit;
 use super::human::HumanRenderer;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
 use crate::application::{
-    CancelRunResult, ElapsedClock, ManagementError, ManagementStore, SubmissionOutcome,
-    SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
-    cancel_claimed_run, list_jobs, list_runs, remove_job, rerun_job, resolve_job, submit_job,
+    CancelRunResult, DiagnosticStatus, DoctorReport, DoctorReportBuilder, ElapsedClock,
+    ManagementError, ManagementStore, SubmissionOutcome, SubmissionStore, SubmissionStoreError,
+    SupervisorAckError, SupervisorAcknowledger, WallClock, cancel_claimed_run, list_jobs,
+    list_runs, remove_job, rerun_job, resolve_job, submit_job,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
@@ -28,6 +30,7 @@ use crate::domain::{
 use crate::infrastructure::config::{ColorMode, Config, ConfigOverrides, Verbosity, load_config};
 use crate::infrastructure::paths::{
     PathEnvironment, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
+    validate_private_dir_for_uid,
 };
 use crate::infrastructure::process::{
     IdentityStatus as NativeIdentityStatus, NativeGroupCanceller, NativeProcessInspector,
@@ -89,6 +92,7 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
                 exit::supervision()
             }
         },
+        ManagementCommand::Doctor => run_doctor(global),
         _ => match manage(global, command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -96,6 +100,281 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
                 error.exit
             }
         },
+    }
+}
+
+fn run_doctor(global: &GlobalArgs) -> ExitCode {
+    match build_doctor_report(global) {
+        Ok(report) => {
+            if global.json {
+                print_json_success(&report);
+            } else if !global.quiet {
+                println!("{}", HumanRenderer::new(global.color).doctor(&report));
+            }
+            doctor_exit(&report)
+        }
+        Err(error) => {
+            print_error(error.json, error.code, &error.message);
+            error.exit
+        }
+    }
+}
+
+fn build_doctor_report(global: &GlobalArgs) -> Result<DoctorReport, CliError> {
+    let paths = platform_paths(global.state_dir.as_deref())
+        .map_err(|error| CliError::permission(global.json, error))?;
+    let uid = rustix::process::geteuid().as_raw();
+    let mut builder = DoctorReportBuilder::default();
+    check_private_directory(&mut builder, "state directory", paths.state_dir(), uid);
+    check_private_directory(&mut builder, "runtime directory", paths.runtime_dir(), uid);
+
+    let config = match load_effective_config(&paths, global, false) {
+        Ok(config) => {
+            builder.push(
+                "configuration",
+                DiagnosticStatus::Pass,
+                "configuration is valid",
+                None,
+            );
+            serde_json::to_value(config.redacted()).unwrap_or_else(|error| {
+                builder.push(
+                    "configuration output",
+                    DiagnosticStatus::Fail,
+                    error.to_string(),
+                    None,
+                );
+                serde_json::json!({})
+            })
+        }
+        Err(error) => {
+            builder.push(
+                "configuration",
+                DiagnosticStatus::Fail,
+                error,
+                Some("Fix or remove the invalid config file.".to_owned()),
+            );
+            serde_json::json!({})
+        }
+    };
+
+    let schema_version = check_database(&mut builder, paths.state_dir());
+    let clock = NativeClock;
+    let boot_identity = if let (Ok(_), Ok(_), Ok(identity)) =
+        (clock.now_utc(), clock.now_elapsed(), clock.boot_identity())
+    {
+        builder.push(
+            "clocks",
+            DiagnosticStatus::Pass,
+            "wall and suspend-aware elapsed clocks are available",
+            None,
+        );
+        Some(identity)
+    } else {
+        builder.push(
+            "clocks",
+            DiagnosticStatus::Fail,
+            "a required platform clock is unavailable",
+            Some("This platform cannot safely supervise elapsed deadlines.".to_owned()),
+        );
+        None
+    };
+    if let Some(identity) = boot_identity.as_deref() {
+        let inspector = NativeProcessInspector::new(identity.to_owned());
+        match inspector.inspect(std::process::id()) {
+            Ok(Some(_)) => builder.push(
+                "process identity",
+                DiagnosticStatus::Pass,
+                "PID start identity is available",
+                None,
+            ),
+            Ok(None) | Err(_) => builder.push(
+                "process identity",
+                DiagnosticStatus::Fail,
+                "current process identity could not be validated",
+                Some("Process-safe cancellation is unavailable.".to_owned()),
+            ),
+        }
+        check_supervisor(&mut builder, &paths, &inspector, uid);
+    }
+    builder.push(
+        "durable service",
+        DiagnosticStatus::Warning,
+        "durable service integration is not installed",
+        Some("Use session jobs, or install service integration when available.".to_owned()),
+    );
+    Ok(builder.finish(
+        crate::domain::bundled_tzdb_version().to_owned(),
+        schema_version,
+        false,
+        config,
+    ))
+}
+
+fn check_private_directory(builder: &mut DoctorReportBuilder, name: &str, path: &Path, uid: u32) {
+    if !path.exists() {
+        builder.push(
+            name,
+            DiagnosticStatus::Warning,
+            format!("{} does not exist yet", path.display()),
+            Some("It will be created on the first saved job.".to_owned()),
+        );
+        return;
+    }
+    match validate_private_dir_for_uid(path, uid) {
+        Ok(()) => builder.push(
+            name,
+            DiagnosticStatus::Pass,
+            format!("{} is private and owned by this user", path.display()),
+            None,
+        ),
+        Err(error) => builder.push(
+            name,
+            DiagnosticStatus::Fail,
+            error.to_string(),
+            Some(format!(
+                "Fix ownership and mode 0700 on {}.",
+                path.display()
+            )),
+        ),
+    }
+}
+
+fn check_database(builder: &mut DoctorReportBuilder, state_directory: &Path) -> Option<u32> {
+    let database_path = state_directory.join("atx.db");
+    if !database_path.exists() {
+        builder.push(
+            "SQLite",
+            DiagnosticStatus::Warning,
+            "state database does not exist yet",
+            None,
+        );
+        return None;
+    }
+    match Database::open(&database_path, Duration::from_secs(2))
+        .and_then(|database| database.schema_version())
+    {
+        Ok(version) => {
+            builder.push(
+                "SQLite",
+                DiagnosticStatus::Pass,
+                format!("database schema {version} is readable and writable"),
+                None,
+            );
+            Some(version)
+        }
+        Err(error) => {
+            builder.push(
+                "SQLite",
+                DiagnosticStatus::Fail,
+                error.to_string(),
+                Some("Keep the database for diagnosis; do not delete it.".to_owned()),
+            );
+            None
+        }
+    }
+}
+
+fn check_supervisor(
+    builder: &mut DoctorReportBuilder,
+    paths: &PlatformPaths,
+    inspector: &NativeProcessInspector,
+    uid: u32,
+) {
+    let lock = paths.runtime_dir().join("supervisor.lock");
+    let socket = paths.runtime_dir().join("supervisor.sock");
+    match (fs::symlink_metadata(&lock), fs::symlink_metadata(&socket)) {
+        (Err(lock_error), Err(socket_error))
+            if lock_error.kind() == std::io::ErrorKind::NotFound
+                && socket_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            builder.push(
+                "supervisor",
+                DiagnosticStatus::Pass,
+                "no session supervisor is needed right now",
+                None,
+            );
+        }
+        (Ok(lock_metadata), Ok(socket_metadata)) => {
+            check_live_supervisor(
+                builder,
+                &lock,
+                &lock_metadata,
+                &socket_metadata,
+                inspector,
+                uid,
+            );
+        }
+        _ => builder.push(
+            "supervisor",
+            DiagnosticStatus::Warning,
+            "runtime lock and socket do not agree",
+            Some("Run doctor again after the current supervisor exits.".to_owned()),
+        ),
+    }
+}
+
+fn check_live_supervisor(
+    builder: &mut DoctorReportBuilder,
+    lock: &Path,
+    lock_metadata: &fs::Metadata,
+    socket_metadata: &fs::Metadata,
+    inspector: &NativeProcessInspector,
+    uid: u32,
+) {
+    let secure = lock_metadata.is_file()
+        && !lock_metadata.file_type().is_symlink()
+        && lock_metadata.uid() == uid
+        && lock_metadata.permissions().mode() & 0o777 == 0o600
+        && socket_metadata.file_type().is_socket()
+        && socket_metadata.uid() == uid
+        && socket_metadata.permissions().mode() & 0o777 == 0o600;
+    if !secure {
+        builder.push(
+            "supervisor",
+            DiagnosticStatus::Fail,
+            "runtime lock or socket has unsafe ownership, mode, or type",
+            Some("Stop ATX processes and remove the unsafe runtime entries.".to_owned()),
+        );
+        return;
+    }
+    let status = fs::read(lock)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|identity| inspector.classify(&identity).ok());
+    match status {
+        Some(NativeIdentityStatus::Alive) => builder.push(
+            "supervisor",
+            DiagnosticStatus::Pass,
+            "session supervisor identity and socket agree",
+            None,
+        ),
+        Some(NativeIdentityStatus::Dead | NativeIdentityStatus::Reused) | None => builder.push(
+            "supervisor",
+            DiagnosticStatus::Warning,
+            "supervisor runtime entries are stale or unreadable",
+            Some("The next submission will replace stale entries safely.".to_owned()),
+        ),
+    }
+}
+
+fn doctor_exit(report: &DoctorReport) -> ExitCode {
+    if report.healthy {
+        return ExitCode::SUCCESS;
+    }
+    if report
+        .checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Fail && check.name == "SQLite")
+    {
+        exit::storage()
+    } else if report
+        .checks
+        .iter()
+        .any(|check| check.status == DiagnosticStatus::Fail && check.name == "supervisor")
+    {
+        exit::supervision()
+    } else {
+        exit::permission()
     }
 }
 
@@ -175,13 +454,15 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .map_err(|error| CliError::supervision(global.json, error))?;
             render_job(&rerun, global);
         }
-        ManagementCommand::Doctor | ManagementCommand::Service { .. } => {
+        ManagementCommand::Service { .. } => {
             return Err(CliError::capability(
                 global.json,
                 "this command is not wired yet",
             ));
         }
-        ManagementCommand::Version | ManagementCommand::Supervisor { .. } => {}
+        ManagementCommand::Version
+        | ManagementCommand::Doctor
+        | ManagementCommand::Supervisor { .. } => {}
     }
     Ok(())
 }
@@ -950,13 +1231,16 @@ mod tests {
 
     use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     use tempfile::tempdir;
 
-    use super::{build_job, read_env_file, schedule};
-    use crate::application::{ElapsedClock, WallClock};
+    use super::{build_doctor_report, build_job, check_live_supervisor, read_env_file, schedule};
+    use crate::application::{DiagnosticStatus, DoctorReportBuilder, ElapsedClock, WallClock};
     use crate::cli::args::{ParsedCli, parse_from};
     use crate::infrastructure::config::{ConfigOverrides, load_config};
+    use crate::infrastructure::process::NativeProcessInspector;
     use crate::infrastructure::time::NativeClock;
 
     #[test]
@@ -1032,5 +1316,76 @@ mod tests {
         let (outcome, _, _) = schedule(&args).expect("dry run");
         assert!(outcome.is_dry_run());
         assert!(!state.exists());
+    }
+
+    #[test]
+    fn doctor_reports_fresh_and_stale_runtime_fixtures() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let global = doctor_global(&state);
+        let fresh = build_doctor_report(&global).expect("fresh report");
+        assert!(fresh.healthy);
+        assert!(!fresh.durable_available);
+
+        fs::create_dir(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("state mode");
+        let runtime = state.join("runtime");
+        fs::create_dir(&runtime).expect("runtime");
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("runtime mode");
+        fs::write(runtime.join("supervisor.lock"), b"stale").expect("lock");
+        fs::set_permissions(
+            runtime.join("supervisor.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("lock mode");
+
+        let stale_report = build_doctor_report(&global).expect("stale report");
+        assert!(stale_report.healthy);
+        assert!(stale_report.checks.iter().any(|check| {
+            check.name == "supervisor" && check.status == DiagnosticStatus::Warning
+        }));
+    }
+
+    #[test]
+    fn doctor_fails_wrong_modes_and_runtime_ownership() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        fs::create_dir(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).expect("state mode");
+        let report = build_doctor_report(&doctor_global(&state)).expect("report");
+        assert!(!report.healthy);
+
+        let lock = root.path().join("lock");
+        fs::write(&lock, b"{}").expect("lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).expect("lock mode");
+        let socket = root.path().join("socket");
+        let _listener = UnixListener::bind(&socket).expect("socket");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("socket mode");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let mut builder = DoctorReportBuilder::default();
+        check_live_supervisor(
+            &mut builder,
+            &lock,
+            &fs::symlink_metadata(&lock).expect("lock metadata"),
+            &fs::symlink_metadata(&socket).expect("socket metadata"),
+            &inspector,
+            rustix::process::geteuid().as_raw() + 1,
+        );
+        let report = builder.finish("test".to_owned(), None, false, serde_json::json!({}));
+        assert!(!report.healthy);
+    }
+
+    fn doctor_global(state: &std::path::Path) -> crate::cli::args::GlobalArgs {
+        let ParsedCli::Management { global, .. } = parse_from([
+            OsString::from("atx"),
+            OsString::from("--state-dir"),
+            state.as_os_str().to_owned(),
+            OsString::from("doctor"),
+        ])
+        .expect("doctor args") else {
+            unreachable!("doctor");
+        };
+        global
     }
 }

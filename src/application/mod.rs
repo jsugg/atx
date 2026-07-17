@@ -4,6 +4,8 @@
 mod cancel;
 #[allow(dead_code)]
 mod clock;
+#[allow(dead_code)]
+mod doctor;
 mod history;
 #[allow(dead_code)]
 mod list;
@@ -22,6 +24,8 @@ pub(crate) use cancel::{
 };
 #[allow(unused_imports)]
 pub(crate) use clock::{ClockError, ElapsedClock, WallClock};
+#[allow(unused_imports)]
+pub(crate) use doctor::{DiagnosticCheck, DiagnosticStatus, DoctorReport, DoctorReportBuilder};
 #[allow(unused_imports)]
 pub(crate) use list::{
     MAX_MANAGEMENT_RESULTS, ManagementError, ManagementStore, ManagementStoreError, list_jobs,

@@ -12,8 +12,7 @@ It runs commands directly by default, keeps a local history in SQLite, and has
 no server or account. An optional per-user service can keep the scheduler
 running across supervisor crashes.
 
-ATX is still being built. The command examples above describe the target
-interface, not a published release.
+ATX is in local release testing and is not published yet.
 
 ## What it promises
 
@@ -42,14 +41,6 @@ The pinned Rust toolchain is installed automatically by `rustup`.
 ```console
 ./scripts/check.sh quick
 ./scripts/check.sh full
-```
-
-The scripts arrive with the crate foundation. Until then, run:
-
-```console
-cargo fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
 ```
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing behavior.

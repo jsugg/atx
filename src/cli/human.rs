@@ -4,6 +4,7 @@ use std::io::IsTerminal;
 
 use super::args::ColorArg;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
+use crate::application::{DiagnosticStatus, DoctorReport};
 use crate::domain::{JobState, Schedule};
 
 pub(crate) struct HumanRenderer {
@@ -94,6 +95,34 @@ impl HumanRenderer {
                 process.state
             )
         }));
+        lines.join("\n")
+    }
+
+    pub(crate) fn doctor(&self, report: &DoctorReport) -> String {
+        let mut lines = vec![if report.healthy {
+            "ATX is ready.".to_owned()
+        } else {
+            "ATX needs attention.".to_owned()
+        }];
+        lines.extend(report.checks.iter().map(|check| {
+            let marker = match check.status {
+                DiagnosticStatus::Pass => "ok",
+                DiagnosticStatus::Warning => "warn",
+                DiagnosticStatus::Fail => "fail",
+            };
+            let marker = if self.color {
+                let color = match check.status {
+                    DiagnosticStatus::Pass => 32,
+                    DiagnosticStatus::Warning => 33,
+                    DiagnosticStatus::Fail => 31,
+                };
+                format!("\x1b[{color}m{marker}\x1b[0m")
+            } else {
+                marker.to_owned()
+            };
+            format!("[{marker}] {}: {}", check.name, check.message)
+        }));
+        lines.push(format!("tzdb: {}", report.tzdb_version));
         lines.join("\n")
     }
 
