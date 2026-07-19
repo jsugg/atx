@@ -216,6 +216,8 @@ pub(crate) enum ManagementCommand {
         state_dir: PathBuf,
         #[arg(long)]
         runtime_dir: PathBuf,
+        #[arg(long)]
+        service_managed: bool,
     },
 }
 

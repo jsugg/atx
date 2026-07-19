@@ -25,6 +25,7 @@ const DEFAULT_MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) fn run_session_supervisor(
     state_directory: &Path,
     runtime_directory: &Path,
+    service_managed: bool,
 ) -> Result<(), DaemonError> {
     let database_path = state_directory.join("atx.db");
     let clock = NativeClock;
@@ -64,7 +65,7 @@ pub(crate) fn run_session_supervisor(
     run_loop(
         &receiver,
         &mut heap,
-        IDLE_TIMEOUT,
+        (!service_managed).then_some(IDLE_TIMEOUT),
         || match clock.now_elapsed() {
             Ok(now) => now,
             Err(error) => {

@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 
 use super::args::ColorArg;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
-use crate::application::{DiagnosticStatus, DoctorReport};
+use crate::application::{DiagnosticStatus, DoctorReport, ServiceChange, ServiceStatus};
 use crate::domain::{JobState, Schedule};
 
 pub(crate) struct HumanRenderer {
@@ -124,6 +124,33 @@ impl HumanRenderer {
         }));
         lines.push(format!("tzdb: {}", report.tzdb_version));
         lines.join("\n")
+    }
+
+    pub(crate) fn service_status(status: &ServiceStatus) -> String {
+        let files = status
+            .files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Manager: {}\nInstalled: {}\nRunning: {}\nFiles: {}\nGuarantee: {}\nStatus: {}",
+            status.manager,
+            status.installed,
+            status.running,
+            if files.is_empty() { "-" } else { &files },
+            status.guarantee,
+            status.detail
+        )
+    }
+
+    pub(crate) fn service_change(change: &ServiceChange) -> String {
+        let action = if change.changed {
+            "Service changed."
+        } else {
+            "No change needed."
+        };
+        format!("{action}\n{}", Self::service_status(&change.status))
     }
 
     fn state(&self, state: JobState) -> String {

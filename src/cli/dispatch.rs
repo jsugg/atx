@@ -10,16 +10,17 @@ use std::time::Duration;
 
 use super::args::{
     ColorArg, DstArg, GlobalArgs, ManagementCommand, MissedArg, ParsedCli, SchedulingArgs,
-    parse_from,
+    ServiceAction, parse_from,
 };
 use super::exit;
 use super::human::HumanRenderer;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
 use crate::application::{
     CancelRunResult, DiagnosticStatus, DoctorReport, DoctorReportBuilder, ElapsedClock,
-    ManagementError, ManagementStore, SubmissionOutcome, SubmissionStore, SubmissionStoreError,
-    SupervisorAckError, SupervisorAcknowledger, WallClock, cancel_claimed_run, list_jobs,
-    list_runs, remove_job, rerun_job, resolve_job, submit_job,
+    ManagementError, ManagementStore, ServiceManager, SubmissionOutcome, SubmissionStore,
+    SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
+    cancel_claimed_run, install_service, list_jobs, list_runs, remove_job, rerun_job, resolve_job,
+    submit_job, uninstall_service,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
@@ -36,6 +37,7 @@ use crate::infrastructure::process::{
     IdentityStatus as NativeIdentityStatus, NativeGroupCanceller, NativeProcessInspector,
 };
 use crate::infrastructure::runtime::start_session_supervisor;
+use crate::infrastructure::service::NativeServiceManager;
 use crate::infrastructure::sqlite::{Database, JobStore};
 use crate::infrastructure::time::NativeClock;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
@@ -85,7 +87,8 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
         ManagementCommand::Supervisor {
             state_dir,
             runtime_dir,
-        } => match run_session_supervisor(state_dir, runtime_dir) {
+            service_managed,
+        } => match run_session_supervisor(state_dir, runtime_dir, *service_managed) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("atx supervisor: {error}");
@@ -93,6 +96,7 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
             }
         },
         ManagementCommand::Doctor => run_doctor(global),
+        ManagementCommand::Service { action } => run_service(global, *action),
         _ => match manage(global, command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -101,6 +105,79 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
             }
         },
     }
+}
+
+fn run_service(global: &GlobalArgs, action: ServiceAction) -> ExitCode {
+    match service_operation(global, action) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            print_error(error.json, error.code, &error.message);
+            error.exit
+        }
+    }
+}
+
+fn service_operation(global: &GlobalArgs, action: ServiceAction) -> Result<(), CliError> {
+    let paths = platform_paths(global.state_dir.as_deref())
+        .map_err(|error| CliError::permission(global.json, error))?;
+    if action == ServiceAction::Install {
+        ensure_private_dir(paths.state_dir())
+            .map_err(|error| CliError::permission(global.json, error))?;
+        ensure_private_dir(paths.runtime_dir())
+            .map_err(|error| CliError::permission(global.json, error))?;
+    }
+    let mut manager = native_service_manager(&paths, global.json)?;
+    match action {
+        ServiceAction::Status => {
+            let status = manager
+                .status()
+                .map_err(|error| CliError::capability(global.json, error))?;
+            if global.json {
+                print_json_success(&status);
+            } else if !global.quiet {
+                println!("{}", HumanRenderer::service_status(&status));
+            }
+        }
+        ServiceAction::Install => {
+            let change = install_service(&mut manager)
+                .map_err(|error| CliError::capability(global.json, error))?;
+            if global.json {
+                print_json_success(&change);
+            } else if !global.quiet {
+                println!("{}", HumanRenderer::service_change(&change));
+            }
+        }
+        ServiceAction::Uninstall => {
+            let change = uninstall_service(&mut manager)
+                .map_err(|error| CliError::capability(global.json, error))?;
+            if global.json {
+                print_json_success(&change);
+            } else if !global.quiet {
+                println!("{}", HumanRenderer::service_change(&change));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn native_service_manager(
+    paths: &PlatformPaths,
+    json: bool,
+) -> Result<NativeServiceManager, CliError> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| CliError::capability(json, "HOME is unavailable or not absolute"))?;
+    let executable =
+        fs::canonicalize(std::env::current_exe().map_err(|error| CliError::internal(json, error))?)
+            .map_err(|error| CliError::capability(json, error))?;
+    Ok(NativeServiceManager::detect(
+        executable,
+        paths.state_dir().to_owned(),
+        paths.runtime_dir().to_owned(),
+        &home,
+        rustix::process::geteuid().as_raw(),
+    ))
 }
 
 fn run_doctor(global: &GlobalArgs) -> ExitCode {
@@ -196,18 +273,53 @@ fn build_doctor_report(global: &GlobalArgs) -> Result<DoctorReport, CliError> {
         }
         check_supervisor(&mut builder, &paths, &inspector, uid);
     }
-    builder.push(
-        "durable service",
-        DiagnosticStatus::Warning,
-        "durable service integration is not installed",
-        Some("Use session jobs, or install service integration when available.".to_owned()),
-    );
+    let durable_available = check_durable_service(&mut builder, &paths, global.json);
     Ok(builder.finish(
         crate::domain::bundled_tzdb_version().to_owned(),
         schema_version,
-        false,
+        durable_available,
         config,
     ))
+}
+
+fn check_durable_service(
+    builder: &mut DoctorReportBuilder,
+    paths: &PlatformPaths,
+    json: bool,
+) -> bool {
+    match native_service_manager(paths, json).and_then(|manager| {
+        manager
+            .status()
+            .map_err(|error| CliError::capability(json, error))
+    }) {
+        Ok(status) if status.installed && status.running => {
+            builder.push(
+                "durable service",
+                DiagnosticStatus::Pass,
+                status.detail,
+                None,
+            );
+            true
+        }
+        Ok(status) => {
+            builder.push(
+                "durable service",
+                DiagnosticStatus::Warning,
+                status.detail,
+                Some("Run `atx service install` to enable durable jobs.".to_owned()),
+            );
+            false
+        }
+        Err(error) => {
+            builder.push(
+                "durable service",
+                DiagnosticStatus::Warning,
+                error.message,
+                Some("Session jobs remain available.".to_owned()),
+            );
+            false
+        }
+    }
 }
 
 fn check_private_directory(builder: &mut DoctorReportBuilder, name: &str, path: &Path, uid: u32) {
@@ -454,13 +566,8 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .map_err(|error| CliError::supervision(global.json, error))?;
             render_job(&rerun, global);
         }
-        ManagementCommand::Service { .. } => {
-            return Err(CliError::capability(
-                global.json,
-                "this command is not wired yet",
-            ));
-        }
-        ManagementCommand::Version
+        ManagementCommand::Service { .. }
+        | ManagementCommand::Version
         | ManagementCommand::Doctor
         | ManagementCommand::Supervisor { .. } => {}
     }
@@ -673,10 +780,15 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         .map_err(|error| CliError::usage(json, error))?;
 
     if job.snapshot().runtime_tier == RuntimeTier::Durable {
-        return Err(CliError::capability(
-            json,
-            "durable runtime is not available on this installation",
-        ));
+        let status = native_service_manager(&paths, json)?
+            .status()
+            .map_err(|error| CliError::capability(json, error))?;
+        if !status.installed || !status.running {
+            return Err(CliError::capability(
+                json,
+                "durable service is not installed and running",
+            ));
+        }
     }
 
     if args.options.dry_run {

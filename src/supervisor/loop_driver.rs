@@ -27,7 +27,7 @@ pub(crate) enum SupervisorEvent {
 pub(crate) fn run_loop<Now, Due>(
     receiver: &Receiver<SupervisorEvent>,
     heap: &mut DeadlineHeap,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     mut now: Now,
     mut on_due: Due,
 ) where
@@ -42,7 +42,11 @@ pub(crate) fn run_loop<Now, Due>(
         }
         let empty = heap.is_empty();
         let wait = wait_until(now(), heap.next_deadline(), idle_timeout);
-        match receiver.recv_timeout(wait) {
+        let event = match wait {
+            Some(wait) => receiver.recv_timeout(wait),
+            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match event {
             Ok(SupervisorEvent::Schedule { job_id, deadline }) => heap.upsert(job_id, deadline),
             Ok(SupervisorEvent::Cancel(job_id) | SupervisorEvent::RunFinished(job_id)) => {
                 heap.remove(job_id);
@@ -57,13 +61,14 @@ pub(crate) fn run_loop<Now, Due>(
 pub(crate) fn wait_until(
     now: ElapsedInstant,
     deadline: Option<ElapsedInstant>,
-    idle_timeout: Duration,
-) -> Duration {
+    idle_timeout: Option<Duration>,
+) -> Option<Duration> {
     let Some(deadline) = deadline else {
         return idle_timeout;
     };
     let nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
-    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).min(idle_timeout)
+    let deadline_wait = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+    Some(idle_timeout.map_or(deadline_wait, |idle| deadline_wait.min(idle)))
 }
 
 /// Maps a persisted wall-clock schedule onto the current elapsed clock.
@@ -105,15 +110,15 @@ mod tests {
     #[test]
     fn earlier_deadlines_shorten_blocking_wait_without_idle_spin() {
         let now = ElapsedInstant::from_nanos(1_000);
-        let idle = Duration::from_secs(60);
+        let idle = Some(Duration::from_secs(60));
         assert_eq!(wait_until(now, None, idle), idle);
         assert_eq!(
             wait_until(now, Some(ElapsedInstant::from_nanos(2_000)), idle),
-            Duration::from_micros(1)
+            Some(Duration::from_micros(1))
         );
         assert_eq!(
             wait_until(now, Some(ElapsedInstant::from_nanos(999)), idle),
-            Duration::ZERO
+            Some(Duration::ZERO)
         );
     }
 
@@ -163,7 +168,7 @@ mod tests {
         run_loop(
             &receiver,
             &mut heap,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             || ElapsedInstant::from_nanos(u128::from(clock.load(Ordering::Acquire))),
             |batch| {
                 due.extend(batch);
@@ -191,7 +196,7 @@ mod tests {
         run_loop(
             &receiver,
             &mut heap,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             || ElapsedInstant::from_nanos(1),
             |batch| {
                 batches.push(batch);
@@ -214,7 +219,7 @@ mod tests {
         run_loop(
             &receiver,
             &mut heap,
-            Duration::from_millis(5),
+            Some(Duration::from_millis(5)),
             || {
                 clock_reads.fetch_add(1, Ordering::Relaxed);
                 ElapsedInstant::from_nanos(0)
@@ -223,5 +228,26 @@ mod tests {
         );
 
         assert_eq!(clock_reads.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn service_managed_empty_loop_waits_for_shutdown() {
+        let (sender, receiver) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            sender
+                .send(SupervisorEvent::Shutdown)
+                .expect("loop is listening");
+        });
+        let mut heap = DeadlineHeap::default();
+
+        run_loop(
+            &receiver,
+            &mut heap,
+            None,
+            || ElapsedInstant::from_nanos(0),
+            |_| panic!("empty heap cannot produce work"),
+        );
+        shutdown.join().expect("shutdown thread");
     }
 }

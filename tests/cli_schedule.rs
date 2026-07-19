@@ -90,6 +90,48 @@ fn doctor_json_reports_capabilities_without_creating_state() {
 }
 
 #[test]
+fn durable_submission_never_falls_back_to_session_mode() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let output = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--durable", "30s", "--", "true"])
+        .output()
+        .expect("run durable submission");
+
+    assert_eq!(output.status.code(), Some(5));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("valid JSON error");
+    assert_eq!(value["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert!(!state.exists());
+}
+
+#[test]
+fn service_status_reports_exact_artifact_without_creating_state() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let output = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["service", "status"])
+        .output()
+        .expect("run service status");
+
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON status");
+    assert!(
+        value["data"]["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    );
+    assert!(!state.exists());
+}
+
+#[test]
 fn relative_job_survives_submitter_terminal_closure() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
