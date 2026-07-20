@@ -73,10 +73,18 @@ pub(crate) fn run_session_supervisor(
                 elapsed_now
             }
         },
-        |jobs| {
-            if let Err(error) = execute_due_jobs(&execution_database, &execution_state, &jobs) {
-                eprintln!("atx supervisor: {error}");
+        |jobs| match execute_due_jobs(&execution_database, &execution_state, &jobs) {
+            Ok(deadlines) => {
+                for (job_id, deadline) in deadlines {
+                    if sender
+                        .send(SupervisorEvent::Schedule { job_id, deadline })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
+            Err(error) => eprintln!("atx supervisor: {error}"),
         },
     );
 
@@ -147,9 +155,10 @@ fn execute_due_jobs(
     database_path: &Path,
     state_directory: &Path,
     jobs: &[crate::domain::JobId],
-) -> Result<(), DaemonError> {
+) -> Result<Vec<(crate::domain::JobId, crate::domain::ElapsedInstant)>, DaemonError> {
     let clock = NativeClock;
     let boot_identity = clock.boot_identity()?;
+    let mut recurring_deadlines = Vec::new();
     for &job_id in jobs {
         let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
         let Some(mut job) = store.load(job_id)? else {
@@ -213,6 +222,19 @@ fn execute_due_jobs(
             },
             Err(_) => (JobState::Interrupted, "run monitor failed"),
         };
+        if matches!(
+            job.schedule(),
+            crate::domain::Schedule::RecurringInterval { .. }
+        ) && target != JobState::Cancelled
+        {
+            let now = clock.now_utc()?;
+            let recurring = store.advance_recurring_job(job.id(), job.revision(), now)?;
+            let deadline =
+                reconcile_wall_schedule(now, clock.now_elapsed()?, recurring.next_due_utc())
+                    .map_err(|error| DaemonError::Recovery(error.to_string()))?;
+            recurring_deadlines.push((recurring.id(), deadline));
+            continue;
+        }
         store.transition_job(
             job.id(),
             job.revision(),
@@ -223,7 +245,7 @@ fn execute_due_jobs(
             clock.now_utc()?,
         )?;
     }
-    Ok(())
+    Ok(recurring_deadlines)
 }
 
 fn request_ipc_shutdown(runtime_directory: &Path) {

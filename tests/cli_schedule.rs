@@ -178,6 +178,47 @@ fn absolute_utc_job_runs_end_to_end() {
     wait_for_file(&marker);
 }
 
+#[test]
+fn fixed_rate_job_runs_more_than_once_and_can_be_cancelled() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let marker = root.path().join("recurring");
+    let script = format!("printf 'x\\n' >>'{}'", marker.display());
+    let output = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--every", "1s", "--", "/bin/sh", "-c"])
+        .arg(script)
+        .output()
+        .expect("submit recurring job");
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("submission JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let occurrences =
+            fs::read_to_string(&marker).map_or(0, |contents| contents.lines().count());
+        if occurrences >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recurring job ran {occurrences} times"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let cancelled = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["cancel", job])
+        .output()
+        .expect("cancel recurring job");
+    assert!(cancelled.status.success(), "{cancelled:?}");
+}
+
 fn wait_for_file(path: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {

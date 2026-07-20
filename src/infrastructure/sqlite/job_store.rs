@@ -180,6 +180,63 @@ impl JobStore {
         transaction.commit().map_err(map_write_error)?;
         Ok(job)
     }
+
+    pub(crate) fn advance_recurring_job(
+        &mut self,
+        id: JobId,
+        expected_revision: Revision,
+        now: UtcTimestamp,
+    ) -> Result<Job, StoreError> {
+        let transaction = self
+            .database
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_write_error)?;
+        let mut job = load_job(&transaction, id)?.ok_or(StoreError::NotFound)?;
+        if job.revision() != expected_revision {
+            return Err(StoreError::Conflict);
+        }
+        let transition = job
+            .advance_recurring(TransitionActor::Monitor, "next fixed-rate occurrence", now)
+            .map_err(|error| StoreError::Domain(error.to_string()))?;
+        let changed = transaction
+            .execute(
+                "UPDATE jobs
+                 SET revision = ?1, state = ?2, updated_at_utc = ?3, next_due_utc = ?4
+                 WHERE id = ?5 AND revision = ?6",
+                params![
+                    to_sql_u64(job.revision().get())?,
+                    encode_enum(job.state())?,
+                    now.to_string(),
+                    job.next_due_utc().to_string(),
+                    id.to_string(),
+                    to_sql_u64(expected_revision.get())?,
+                ],
+            )
+            .map_err(map_write_error)?;
+        if changed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        transaction
+            .execute(
+                "INSERT INTO transitions(
+                    job_id, run_id, from_state, to_state, occurred_at_utc,
+                    actor, reason, revision
+                 ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id.to_string(),
+                    encode_enum(transition.from())?,
+                    encode_enum(transition.to())?,
+                    now.to_string(),
+                    encode_enum(transition.actor())?,
+                    transition.reason(),
+                    to_sql_u64(job.revision().get())?,
+                ],
+            )
+            .map_err(map_write_error)?;
+        transaction.commit().map_err(map_write_error)?;
+        Ok(job)
+    }
 }
 
 impl SubmissionStore for JobStore {

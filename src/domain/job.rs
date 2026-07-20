@@ -6,6 +6,7 @@ use thiserror::Error;
 use super::execution::ExecutionSpec;
 use super::id::JobId;
 use super::primitives::{Description, Name, PrimitiveError, Revision, UtcTimestamp};
+use super::recurrence::{DeadlineError, next_fixed_rate_utc};
 use super::schedule::{MissedPolicy, RuntimeTier, Schedule, ScheduleError};
 use super::state::JobState;
 use super::transition::{Transition, TransitionActor, TransitionError, job_transition};
@@ -155,6 +156,26 @@ impl Job {
         self.updated_at_utc = now;
         Ok(transition)
     }
+
+    pub(crate) fn advance_recurring(
+        &mut self,
+        actor: TransitionActor,
+        reason: &str,
+        now: UtcTimestamp,
+    ) -> Result<Transition<JobState>, JobError> {
+        let Schedule::RecurringInterval {
+            interval,
+            persisted_anchor_utc,
+        } = &self.schedule
+        else {
+            return Err(JobError::NotRecurring);
+        };
+        let next_due = next_fixed_rate_utc(*persisted_anchor_utc, now, *interval)
+            .map_err(JobError::Deadline)?;
+        let transition = self.transition(JobState::Waiting, true, actor, reason, now)?;
+        self.next_due_utc = next_due;
+        Ok(transition)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +204,10 @@ pub(crate) enum JobError {
     Schedule(ScheduleError),
     #[error(transparent)]
     Transition(TransitionError),
+    #[error(transparent)]
+    Deadline(DeadlineError),
+    #[error("job schedule is not recurring")]
+    NotRecurring,
     #[error("stored job snapshot violates domain invariants")]
     CorruptSnapshot,
     #[error("job update time cannot move backward")]
@@ -197,6 +222,7 @@ mod tests {
     use crate::domain::execution::{Environment, ExecutionMode, ExecutionSpec};
     use crate::domain::primitives::UtcTimestamp;
     use crate::domain::schedule::{DurationSeconds, MissedPolicy, RuntimeTier, Schedule};
+    use crate::domain::{JobState, TransitionActor};
 
     #[test]
     fn new_job_starts_scheduled_at_revision_one() {
@@ -252,6 +278,48 @@ mod tests {
                 501,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn recurring_completion_returns_to_waiting_on_its_anchor() {
+        let now = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let schedule = Schedule::RecurringInterval {
+            interval: DurationSeconds::new(5).expect("interval"),
+            persisted_anchor_utc: UtcTimestamp::from_second(105).expect("anchor"),
+        };
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("execution");
+        let mut job = Job::new(
+            now,
+            schedule,
+            MissedPolicy::Skip,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job");
+        for state in [JobState::Waiting, JobState::Starting, JobState::Running] {
+            job.transition(state, true, TransitionActor::Supervisor, "prepare", now)
+                .expect("transition");
+        }
+
+        job.advance_recurring(
+            TransitionActor::Monitor,
+            "next occurrence",
+            UtcTimestamp::from_second(112).expect("completion"),
+        )
+        .expect("advance");
+
+        assert_eq!(job.state(), JobState::Waiting);
+        assert_eq!(
+            job.next_due_utc(),
+            UtcTimestamp::from_second(115).expect("next")
         );
     }
 }
