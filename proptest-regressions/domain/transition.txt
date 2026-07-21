@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dc2fa85fe19317adb58a29a7b18487a677061c8a2413444d520258d0b8a7eadd # shrinks to targets = [CancelRequested, Succeeded]
+cc df84c20a25b08a304efaf0a8437e172691c85583f72bea28510f473d58e9eef0 # shrinks to targets = [CancelRequested, Succeeded, Waiting]

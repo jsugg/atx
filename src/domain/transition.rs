@@ -337,5 +337,64 @@ mod tests {
                 run_transition(from, to, TransitionActor::Recovery, "generated").is_err()
             );
         }
+
+        #[test]
+        fn generated_job_sequences_never_leave_terminal_state(
+            targets in prop::collection::vec(
+                prop::sample::select(JobState::ALL.to_vec()),
+                0..64,
+            ),
+        ) {
+            let mut current = JobState::Scheduled;
+            for target in targets {
+                let previous = current;
+                let was_terminal = current.is_terminal();
+                if job_transition(current, target, false, TransitionActor::Supervisor, "generated")
+                    .is_ok()
+                {
+                    current = target;
+                }
+                if was_terminal {
+                    prop_assert_eq!(current, previous);
+                    prop_assert!(current.is_terminal());
+                }
+            }
+        }
+
+        #[test]
+        fn generated_recurring_sequences_only_reenter_through_waiting(
+            targets in prop::collection::vec(
+                prop::sample::select(JobState::ALL.to_vec()),
+                0..64,
+            ),
+        ) {
+            let mut current = JobState::Scheduled;
+            for target in targets {
+                let previous = current;
+                if job_transition(current, target, true, TransitionActor::Monitor, "generated")
+                    .is_ok()
+                {
+                    current = target;
+                }
+                // Recurring jobs may only leave a state via the one-shot edge
+                // or the recurring advance back to Waiting; every other move
+                // must also be legal without recurrence.
+                if current != previous
+                    && current != JobState::Waiting
+                {
+                    prop_assert!(
+                        job_transition(
+                            previous,
+                            current,
+                            false,
+                            TransitionActor::Monitor,
+                            "generated",
+                        )
+                        .is_ok(),
+                        "{previous:?} -> {current:?} only legal because recurring"
+                    );
+                }
+            }
+        }
     }
 }

@@ -6,34 +6,15 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::frame::{self, FrameError, PROTOCOL_VERSION};
+
+pub(crate) use super::frame::IpcMessage;
 use crate::application::{SupervisorAckError, SupervisorAcknowledger};
 use crate::domain::{JobId, ProcessIdentitySnapshot, Revision};
 use crate::infrastructure::paths::ensure_private_dir;
 use crate::infrastructure::process::{IdentityStatus, NativeProcessInspector};
-
-const MAX_FRAME_BYTES: usize = 64 * 1024;
-const PROTOCOL_VERSION: u16 = 1;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum IpcMessage {
-    Wake {
-        protocol: u16,
-        job_id: JobId,
-        revision: Revision,
-    },
-    Ack {
-        protocol: u16,
-        job_id: JobId,
-        revision: Revision,
-    },
-    Shutdown {
-        protocol: u16,
-    },
-}
 
 pub(crate) struct SocketAcknowledger {
     socket_path: PathBuf,
@@ -87,28 +68,11 @@ impl SupervisorAcknowledger for SocketAcknowledger {
 }
 
 pub(crate) fn write_frame(writer: &mut impl Write, message: &IpcMessage) -> Result<(), IpcError> {
-    let body = serde_json::to_vec(message)?;
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(IpcError::FrameTooLarge);
-    }
-    let length = u32::try_from(body.len()).map_err(|_| IpcError::FrameTooLarge)?;
-    writer.write_all(&length.to_be_bytes())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
+    frame::write_frame(writer, message).map_err(IpcError::from)
 }
 
 pub(crate) fn read_frame(reader: &mut impl Read) -> Result<IpcMessage, IpcError> {
-    let mut length = [0_u8; 4];
-    reader.read_exact(&mut length)?;
-    let length =
-        usize::try_from(u32::from_be_bytes(length)).map_err(|_| IpcError::FrameTooLarge)?;
-    if length == 0 || length > MAX_FRAME_BYTES {
-        return Err(IpcError::FrameTooLarge);
-    }
-    let mut body = vec![0_u8; length];
-    reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(IpcError::from)
+    frame::read_frame(reader).map_err(IpcError::from)
 }
 
 pub(crate) struct RuntimeGuard {
@@ -242,6 +206,8 @@ pub(crate) enum IpcError {
     Io(#[from] io::Error),
     #[error("IPC JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Frame(#[from] FrameError),
 }
 
 #[cfg(test)]

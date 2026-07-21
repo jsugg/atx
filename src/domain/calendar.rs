@@ -312,4 +312,53 @@ mod tests {
             .is_err()
         );
     }
+
+    proptest::proptest! {
+        /// Every accepted resolution must map back to the exact wall clock
+        /// that was asked for, in the selected zone. DST policies may reject
+        /// ambiguous or skipped times, but an accepted instant may never land
+        /// on a different civil time than the input.
+        #[test]
+        fn accepted_resolutions_round_trip_to_requested_wall_clock(
+            day in 1u8..=28,
+            month in 1u8..=12,
+            hour in 0u8..=23,
+            minute in proptest::prelude::prop::sample::select(vec![0u8, 15, 30, 45]),
+            policy in proptest::prelude::prop::sample::select(vec![
+                DstResolution::Reject,
+                DstResolution::Earlier,
+                DstResolution::Later,
+            ]),
+            zone in proptest::prelude::prop::sample::select(vec![
+                "UTC",
+                "America/New_York",
+                "Europe/Berlin",
+                "Australia/Lord_Howe",
+            ]),
+        ) {
+            use proptest::prelude::*;
+            use std::str::FromStr;
+
+            let now = UtcTimestamp::from_str("2026-01-01T00:00:00Z").expect("valid timestamp");
+            let input = format!("2026-{month:02}-{day:02}T{hour:02}:{minute:02}");
+            let Ok(resolution) = resolve_calendar(
+                &input,
+                &TimeZoneSelection::Named(zone.to_owned()),
+                policy,
+                false,
+                now,
+            ) else {
+                // Rejections are legal for gaps and, under Reject, folds.
+                return Ok(());
+            };
+
+            let time_zone = jiff::tz::TimeZone::get(zone).expect("bundled zone");
+            let instant = jiff::Timestamp::from_str(&resolution.resolved_utc().to_string())
+                .expect("valid resolved timestamp");
+            let civil = instant.to_zoned(time_zone).datetime();
+            let expected = format!("2026-{month:02}-{day:02}T{hour:02}:{minute:02}:00");
+            let detail = format!("{zone} resolved {instant} for input {input}");
+            prop_assert_eq!(civil.to_string(), expected, "{}", detail);
+        }
+    }
 }

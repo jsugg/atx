@@ -12,7 +12,9 @@ cargo-fuzz = true
 jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 libfuzzer-sys = "0.4.13"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["serde", "v7"] }
 
 [[bin]]
 name = "duration"
@@ -24,6 +26,27 @@ bench = false
 [[bin]]
 name = "calendar"
 path = "fuzz_targets/calendar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "env_file"
+path = "fuzz_targets/env_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "execution_persistence"
+path = "fuzz_targets/execution_persistence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frame"
+path = "fuzz_targets/ipc_frame.rs"
 test = false
 doc = false
 bench = false

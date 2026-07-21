@@ -412,4 +412,30 @@ mod tests {
         assert_eq!(values[0].0, "PATH");
         assert_eq!(values[0].1.expose(), "/bin");
     }
+
+    proptest::proptest! {
+        /// Stored arguments must survive the persistence round trip byte for
+        /// byte, including shell metacharacters that direct mode must never
+        /// interpret.
+        #[test]
+        fn persistence_json_round_trips_arguments(
+            argv in proptest::prelude::prop::collection::vec("[^\0]{1,64}", 1..8),
+        ) {
+            let spec = ExecutionSpec::new(
+                ExecutionMode::Direct,
+                argv.clone(),
+                "/tmp".to_owned(),
+                Environment::empty(),
+            )
+            .expect("valid generated execution");
+
+            let stored = spec.to_persistence_json().expect("serializable spec");
+            let parsed =
+                ExecutionSpec::from_persistence_json(&stored).expect("stored spec reloads");
+
+            assert_eq!(parsed.mode(), spec.mode());
+            assert_eq!(parsed.argv(), spec.argv());
+            assert_eq!(parsed.working_directory(), spec.working_directory());
+        }
+    }
 }

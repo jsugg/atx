@@ -2,6 +2,7 @@
 
 #[allow(dead_code)]
 mod daemon;
+mod frame;
 #[allow(dead_code)]
 mod heap;
 #[allow(dead_code)]
