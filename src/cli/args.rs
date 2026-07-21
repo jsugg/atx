@@ -219,6 +219,17 @@ pub(crate) enum ManagementCommand {
         #[arg(long)]
         service_managed: bool,
     },
+    #[command(name = "__monitor", hide = true)]
+    Monitor {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        runtime_dir: PathBuf,
+        #[arg(long)]
+        job: String,
+        #[arg(long)]
+        run: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
@@ -303,6 +314,7 @@ fn is_management_name(value: &std::ffi::OsStr) -> bool {
                 | "version"
                 | "help"
                 | "__supervisor"
+                | "__monitor"
         )
     )
 }

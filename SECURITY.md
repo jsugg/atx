@@ -2,9 +2,9 @@
 
 ## Reporting a problem
 
-Please email `juanpedrosugg@gmail.com` with a short reproduction and the
-affected version. Do not open a public issue for a vulnerability that could put
-someone's commands, environment, or local files at risk.
+Please email `juanpedrosugg+github [at] gmail [dot] com` with a short reproduction
+and the affected version. Do not open a public issue for a vulnerability that could
+put someone's commands, environment, or local files at risk.
 
 There is no guaranteed response window yet; this is a one-person side-project.
 I will acknowledge a useful report as soon as I can and keep the reporter

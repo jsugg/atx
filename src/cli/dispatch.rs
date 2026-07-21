@@ -40,6 +40,7 @@ use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::service::NativeServiceManager;
 use crate::infrastructure::sqlite::{Database, JobStore};
 use crate::infrastructure::time::NativeClock;
+use crate::run_monitor::run_monitor_process;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
 
 const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
@@ -92,6 +93,18 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("atx supervisor: {error}");
+                exit::supervision()
+            }
+        },
+        ManagementCommand::Monitor {
+            state_dir,
+            runtime_dir,
+            job,
+            run,
+        } => match run_monitor_process(state_dir, runtime_dir, job, run) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("atx monitor: {error}");
                 exit::supervision()
             }
         },
@@ -569,7 +582,8 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         ManagementCommand::Service { .. }
         | ManagementCommand::Version
         | ManagementCommand::Doctor
-        | ManagementCommand::Supervisor { .. } => {}
+        | ManagementCommand::Supervisor { .. }
+        | ManagementCommand::Monitor { .. } => {}
     }
     Ok(())
 }

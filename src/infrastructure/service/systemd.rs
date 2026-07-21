@@ -235,7 +235,7 @@ fn render_unit(
     Ok(format!(
         "[Unit]\nDescription=ATX per-user command scheduler\n\n\
          [Service]\nType=simple\nExecStart={arguments}\nRestart=on-failure\nRestartSec=2s\n\
-         NoNewPrivileges=true\nPrivateTmp=true\n\n\
+         KillMode=process\nNoNewPrivileges=true\nPrivateTmp=true\n\n\
          [Install]\nWantedBy=default.target\n"
     ))
 }

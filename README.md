@@ -3,9 +3,10 @@
 ATX schedules commands for later without making you write a cron entry.
 
 ```console
-atx 30s -- notify-send "tea is ready"
+atx 30s -- notify-send "coffee is ready"
 atx 2m30s -- make check
 atx 15:00 -- ./backup-home
+atx 5h -- tmux send-keys -t coding-agent "continue" C-m
 ```
 
 It runs commands directly by default, keeps a local history in SQLite, and has

@@ -1,7 +1,11 @@
 //! Detached session supervisor.
 
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -11,16 +15,14 @@ use super::ipc::{IpcMessage, RuntimeGuard, read_frame, write_frame};
 use super::loop_driver::{SupervisorEvent, reconcile_wall_schedule, run_loop};
 use super::recovery::rebuild_deadline_heap;
 use crate::application::{ElapsedClock, WallClock, reconcile_startup};
-use crate::domain::{JobState, RunState, TransitionActor};
-use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
+use crate::domain::{JobState, RunOutcome, TransitionActor};
+use crate::infrastructure::process::NativeProcessInspector;
 use crate::infrastructure::sqlite::{Database, JobStore, RetentionPolicy, StartupStore};
 use crate::infrastructure::time::NativeClock;
-use crate::run_monitor::RunMonitor;
 
 const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 
 pub(crate) fn run_session_supervisor(
     state_directory: &Path,
@@ -73,18 +75,15 @@ pub(crate) fn run_session_supervisor(
                 elapsed_now
             }
         },
-        |jobs| match execute_due_jobs(&execution_database, &execution_state, &jobs) {
-            Ok(deadlines) => {
-                for (job_id, deadline) in deadlines {
-                    if sender
-                        .send(SupervisorEvent::Schedule { job_id, deadline })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+        |jobs| {
+            if let Err(error) = execute_due_jobs(
+                &execution_database,
+                &execution_state,
+                runtime_directory,
+                &jobs,
+            ) {
+                eprintln!("atx supervisor: {error}");
             }
-            Err(error) => eprintln!("atx supervisor: {error}"),
         },
     );
 
@@ -154,11 +153,10 @@ fn load_deadline(
 fn execute_due_jobs(
     database_path: &Path,
     state_directory: &Path,
+    runtime_directory: &Path,
     jobs: &[crate::domain::JobId],
-) -> Result<Vec<(crate::domain::JobId, crate::domain::ElapsedInstant)>, DaemonError> {
+) -> Result<(), DaemonError> {
     let clock = NativeClock;
-    let boot_identity = clock.boot_identity()?;
-    let mut recurring_deadlines = Vec::new();
     for &job_id in jobs {
         let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
         let Some(mut job) = store.load(job_id)? else {
@@ -198,54 +196,68 @@ fn execute_due_jobs(
             "run monitor claimed command",
             now,
         )?;
-        let inspector = NativeProcessInspector::new(boot_identity.clone());
-        let runner = NativeProcessRunner::new(inspector.clone());
-        let completed = RunMonitor::new(
-            &mut store,
-            runner,
-            inspector,
-            clock,
-            state_directory,
-            DEFAULT_MAX_LOG_BYTES,
-        )
-        .execute(&run, job.execution());
-        let (target, reason) = match completed {
-            Ok(run) => match run.state() {
-                RunState::Succeeded => (JobState::Succeeded, "command exited successfully"),
-                RunState::Cancelled => (JobState::Cancelled, "command was cancelled"),
-                RunState::Failed => (JobState::Failed, "command failed"),
-                RunState::Interrupted => (JobState::Interrupted, "command outcome is unknown"),
-                _ => (
-                    JobState::Interrupted,
-                    "run monitor returned a nonterminal state",
-                ),
-            },
-            Err(_) => (JobState::Interrupted, "run monitor failed"),
-        };
-        if matches!(
-            job.schedule(),
-            crate::domain::Schedule::RecurringInterval { .. }
-        ) && target != JobState::Cancelled
+        if let Err(error) =
+            spawn_run_monitor(state_directory, runtime_directory, job.id(), run.id())
         {
-            let now = clock.now_utc()?;
-            let recurring = store.advance_recurring_job(job.id(), job.revision(), now)?;
-            let deadline =
-                reconcile_wall_schedule(now, clock.now_elapsed()?, recurring.next_due_utc())
-                    .map_err(|error| DaemonError::Recovery(error.to_string()))?;
-            recurring_deadlines.push((recurring.id(), deadline));
-            continue;
+            let finished = clock.now_utc()?;
+            store.record_run_terminal(
+                run.id(),
+                run.claim_token(),
+                finished,
+                RunOutcome::Failure(format!("monitor spawn failed: {error}")),
+            )?;
+            store.transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Failed,
+                false,
+                TransitionActor::Supervisor,
+                "run monitor could not start",
+                finished,
+            )?;
         }
-        store.transition_job(
-            job.id(),
-            job.revision(),
-            target,
-            false,
-            TransitionActor::Monitor,
-            reason,
-            clock.now_utc()?,
-        )?;
     }
-    Ok(recurring_deadlines)
+    Ok(())
+}
+
+fn spawn_run_monitor(
+    state_directory: &Path,
+    runtime_directory: &Path,
+    job_id: crate::domain::JobId,
+    run_id: crate::domain::RunId,
+) -> Result<(), std::io::Error> {
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(state_directory.join("supervisor.log"))?;
+    let stderr = log.try_clone()?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("__monitor")
+        .arg("--state-dir")
+        .arg(state_directory)
+        .arg("--runtime-dir")
+        .arg(runtime_directory)
+        .arg("--job")
+        .arg(job_id.to_string())
+        .arg("--run")
+        .arg(run_id.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    // SAFETY: `setsid` has no pointer preconditions and runs in the child just
+    // before exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn().map(|_| ())
 }
 
 fn request_ipc_shutdown(runtime_directory: &Path) {

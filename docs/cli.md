@@ -78,8 +78,8 @@ Successful output has `schema_version`, `ok: true`, and `data`. Errors use the
 same envelope with `ok: false` and an error code. Existing version 1 fields and
 their meanings stay compatible; later releases may add fields.
 
-`--quiet` hides successful human output. `--color auto|always|never` controls
-color. Data goes to stdout and diagnostics go to stderr.
+`--quiet` hides successful human output. `--color` accepts `auto`, `always`, or
+`never` and controls color. Data goes to stdout and diagnostics go to stderr.
 
 ## Exit codes
 
