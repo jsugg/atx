@@ -32,10 +32,16 @@ pub(crate) fn start_session_supervisor(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
-    // SAFETY: `setsid` has no pointer preconditions and runs before other
-    // threads exist in the new child image.
+    // SAFETY: `setsid` and `close` have no pointer preconditions and run
+    // before other threads exist in the new child image.
     unsafe {
         command.pre_exec(|| {
+            // Detached supervisors must not hold the parent's pipes open, or
+            // callers reading the CLI's output block forever. Stdio is wired
+            // before pre_exec runs, so fds 0-2 are already final here.
+            for fd in 3..=libc::getdtablesize() {
+                libc::close(fd);
+            }
             if libc::setsid() == -1 {
                 Err(io::Error::last_os_error())
             } else {

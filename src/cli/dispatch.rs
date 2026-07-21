@@ -38,7 +38,7 @@ use crate::infrastructure::process::{
 };
 use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::service::NativeServiceManager;
-use crate::infrastructure::sqlite::{Database, JobStore};
+use crate::infrastructure::sqlite::{Database, JobStore, StoreError};
 use crate::infrastructure::time::NativeClock;
 use crate::run_monitor::run_monitor_process;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
@@ -611,7 +611,9 @@ fn cancel_job(
     grace: DurationSeconds,
 ) -> Result<Job, ManagementError> {
     let job = resolve_job(store, prefix)?;
-    if job.state() == JobState::Cancelled {
+    if matches!(job.state(), JobState::Cancelled | JobState::CancelRequested) {
+        // Already cancelled or another canceller is mid-flight; either way
+        // the request is satisfied.
         return Ok(job);
     }
     if job.state().is_terminal() {
@@ -624,17 +626,69 @@ fn cancel_job(
     let active = store
         .latest_active_run(job.id())
         .map_err(ManagementError::from)?;
-    let requested = store
-        .transition_job(
-            job.id(),
-            job.revision(),
-            JobState::CancelRequested,
-            false,
-            TransitionActor::Cli,
-            "cancel requested",
-            now,
-        )
-        .map_err(management_store_error)?;
+    // A concurrent cancel may win the revision race; re-reading turns that
+    // into the same idempotent outcome instead of a storage error.
+    let requested = match store.transition_job(
+        job.id(),
+        job.revision(),
+        JobState::CancelRequested,
+        false,
+        TransitionActor::Cli,
+        "cancel requested",
+        now,
+    ) {
+        Ok(requested) => requested,
+        Err(StoreError::Conflict) => {
+            // The monitor may have advanced a recurring job back to Waiting
+            // between our read and write; retry against the fresh revision.
+            let mut current = store
+                .load(job.id())
+                .map_err(management_store_error)?
+                .ok_or(ManagementError::NotFound)?;
+            let mut requested = None;
+            for _ in 0..8 {
+                if matches!(
+                    current.state(),
+                    JobState::CancelRequested | JobState::Cancelled
+                ) {
+                    return Ok(current);
+                }
+                if current.state().is_terminal() {
+                    break;
+                }
+                match store.transition_job(
+                    current.id(),
+                    current.revision(),
+                    JobState::CancelRequested,
+                    false,
+                    TransitionActor::Cli,
+                    "cancel requested",
+                    now,
+                ) {
+                    Ok(pending) => {
+                        requested = Some(pending);
+                        break;
+                    }
+                    Err(StoreError::Conflict) => {
+                        current = store
+                            .load(current.id())
+                            .map_err(management_store_error)?
+                            .ok_or(ManagementError::NotFound)?;
+                    }
+                    Err(error) => return Err(management_store_error(error)),
+                }
+            }
+            match requested {
+                Some(pending) => pending,
+                None => {
+                    return Err(ManagementError::StateConflict(
+                        "job changed state during cancellation",
+                    ));
+                }
+            }
+        }
+        Err(error) => return Err(management_store_error(error)),
+    };
 
     let Some(run) = active else {
         return store
@@ -723,17 +777,36 @@ fn finish_job_cancellation(
     if current.state().is_terminal() {
         return Ok(current);
     }
-    store
-        .transition_job(
-            current.id(),
-            current.revision(),
-            target,
-            false,
-            TransitionActor::Cli,
-            "cancellation finished",
-            clock.now_utc().map_err(management_store_error)?,
-        )
-        .map_err(management_store_error)
+    // A concurrent canceller may finish the transition first, or the run may
+    // have completed naturally and the job moved on (a recurring job returns
+    // to Waiting); either way the terminal outcome the caller wanted already
+    // happened or no longer applies.
+    let finished = match store.transition_job(
+        current.id(),
+        current.revision(),
+        target,
+        false,
+        TransitionActor::Cli,
+        "cancellation finished",
+        clock.now_utc().map_err(management_store_error)?,
+    ) {
+        Ok(finished) => Ok(finished),
+        Err(StoreError::Domain(_) | StoreError::Conflict) => {
+            let final_state = store
+                .load(current.id())
+                .map_err(management_store_error)?
+                .ok_or(ManagementError::NotFound)?;
+            if final_state.state().is_terminal() || matches!(final_state.state(), JobState::Waiting)
+            {
+                return Ok(final_state);
+            }
+            Err(ManagementError::StateConflict(
+                "job changed state during cancellation",
+            ))
+        }
+        Err(error) => Err(management_store_error(error)),
+    };
+    finished.map_err(management_store_error)
 }
 
 fn management_store_error(error: impl std::fmt::Display) -> ManagementError {
