@@ -356,10 +356,10 @@ pub(super) mod tests {
     use tempfile::tempdir;
 
     use super::super::{Database, StoreError};
-    use super::JobStore;
+    use super::{JobStore, MAX_PAGE_SIZE};
     use crate::domain::{
-        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobState, MissedPolicy,
-        RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
+        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
+        MissedPolicy, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
 
     pub(crate) fn sample_job(now: i64, due: i64) -> Job {
@@ -529,5 +529,81 @@ pub(super) mod tests {
             .connection_mut()
             .execute_batch("ROLLBACK")
             .expect("release lock");
+    }
+
+    fn waiting_job(now: i64) -> Job {
+        let mut job = sample_job(now, now + 30);
+        job.transition(
+            JobState::Waiting,
+            false,
+            TransitionActor::Supervisor,
+            "budget seed",
+            UtcTimestamp::from_second(now).expect("valid timestamp"),
+        )
+        .expect("waiting");
+        job
+    }
+
+    fn percentile(samples: &mut [Duration], fraction: u32) -> Duration {
+        samples.sort_unstable();
+        // fraction is per-mille: 950 means the 95th percentile.
+        let index = fraction as usize * samples.len() / 1000;
+        samples[index.min(samples.len() - 1)]
+    }
+
+    #[test]
+    fn ten_thousand_jobs_meet_submission_and_list_budgets() {
+        // Release-profile budgets: fail loudly on O(n^2) submission or an
+        // unbounded listing scan at the supported 10k scale.
+        const JOB_COUNT: usize = 10_000;
+        const SUBMIT_P95_BUDGET: Duration = Duration::from_millis(5);
+        const LIST_PAGE_BUDGET: Duration = Duration::from_millis(50);
+
+        use crate::application::ManagementStore as _;
+
+        let (_root, mut store) = store();
+        let mut samples = Vec::with_capacity(JOB_COUNT);
+        for index in 0..JOB_COUNT {
+            let job = waiting_job(index as i64);
+            let start = Instant::now();
+            store.create(&job).expect("insert");
+            samples.push(start.elapsed());
+        }
+        let submit_p95 = percentile(&mut samples, 950);
+        println!("submission p95: {submit_p95:?}");
+        assert!(
+            submit_p95 <= SUBMIT_P95_BUDGET,
+            "submission p95 {submit_p95:?} exceeds {SUBMIT_P95_BUDGET:?}"
+        );
+
+        // Full listing walks MAX_PAGE_SIZE pages; each page must stay flat.
+        let mut listed = 0_usize;
+        let mut page_samples = Vec::new();
+        let mut after: Option<JobId> = None;
+        while listed < JOB_COUNT {
+            let start = Instant::now();
+            let jobs = store.list_jobs(None, after, MAX_PAGE_SIZE).expect("page");
+            assert_eq!(jobs.len(), MAX_PAGE_SIZE, "short page at {listed}");
+            after = jobs.last().map(Job::id);
+            listed += jobs.len();
+            page_samples.push(start.elapsed());
+        }
+        let page_p95 = percentile(&mut page_samples, 950);
+        println!("listing p95 per 100-job page: {page_p95:?}");
+        assert!(
+            page_p95 <= LIST_PAGE_BUDGET,
+            "listing p95-per-page {page_p95:?} exceeds {LIST_PAGE_BUDGET:?}"
+        );
+
+        let start = Instant::now();
+        let waiting = store
+            .list_jobs(Some(JobState::Waiting), None, MAX_PAGE_SIZE)
+            .expect("waiting");
+        let filtered_elapsed = start.elapsed();
+        assert_eq!(waiting.len(), MAX_PAGE_SIZE);
+        assert!(
+            filtered_elapsed <= LIST_PAGE_BUDGET,
+            "filtered first page took {filtered_elapsed:?}, budget {LIST_PAGE_BUDGET:?}"
+        );
     }
 }
