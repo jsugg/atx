@@ -46,6 +46,39 @@ fn version_and_usage_have_stable_exit_codes() {
 }
 
 #[test]
+fn shell_submission_warns_unless_quiet() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+
+    // Interactive submission warns about shell interpretation.
+    let warned = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--dry-run", "--shell", "30s", "--", "echo hi; rm -rf /"])
+        .output()
+        .expect("run shell dry-run");
+    assert!(warned.status.success(), "{warned:?}");
+    let stderr = String::from_utf8_lossy(&warned.stderr);
+    assert!(
+        stderr.contains("Warning: --shell"),
+        "expected shell warning, got: {stderr}"
+    );
+
+    // --quiet suppresses the warning.
+    let quiet = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--quiet", "--dry-run", "--shell", "30s", "--", "echo hi"])
+        .output()
+        .expect("run quiet shell dry-run");
+    assert!(quiet.status.success(), "{quiet:?}");
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).is_empty(),
+        "quiet mode must not warn"
+    );
+}
+
+#[test]
 fn json_dry_run_is_machine_readable_and_leaves_no_state() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");

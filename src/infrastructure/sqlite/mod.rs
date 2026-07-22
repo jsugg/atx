@@ -37,13 +37,22 @@ pub(crate) struct Database {
 impl Database {
     pub(crate) fn open(path: &Path, busy_timeout: Duration) -> Result<Self, StoreError> {
         let path = canonical_database_path(path)?;
-        prepare_database_file(&path)?;
+        let created = prepare_database_file(&path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_FULL_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
         configure_connection(&connection, busy_timeout)?;
+        // A pre-existing file without a schema is truncation or corruption,
+        // never a fresh install: refuse instead of silently rebuilding.
+        if !created
+            && connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0
+        {
+            return Err(StoreError::Corrupt(
+                "existing database file carries no schema".to_owned(),
+            ));
+        }
         apply_migrations(&mut connection, MIGRATIONS, CURRENT_SCHEMA_VERSION)?;
         let database = Self { connection };
         database.verify_pragmas(busy_timeout)?;
@@ -116,7 +125,7 @@ pub(crate) struct ConnectionPragmas {
     pub(crate) busy_timeout_ms: u64,
 }
 
-fn prepare_database_file(path: &Path) -> Result<(), StoreError> {
+fn prepare_database_file(path: &Path) -> Result<bool, StoreError> {
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -125,6 +134,7 @@ fn prepare_database_file(path: &Path) -> Result<(), StoreError> {
     {
         Ok(file) => {
             file.sync_all()?;
+            Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path)?;
@@ -135,10 +145,10 @@ fn prepare_database_file(path: &Path) -> Result<(), StoreError> {
             {
                 return Err(StoreError::InsecureDatabaseFile);
             }
+            Ok(false)
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Result<(), StoreError> {
@@ -247,6 +257,7 @@ mod tests {
     use std::time::Duration;
 
     use rusqlite::Connection;
+    use rustix::fs::OpenOptionsExt as _;
     use tempfile::tempdir;
 
     use super::{CURRENT_SCHEMA_VERSION, Database, apply_migrations};
@@ -310,6 +321,41 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn truncated_preexisting_database_is_rejected_not_rebuilt() {
+        let root = tempdir().expect("temp root");
+
+        // A zero-byte pre-existing file passes the ownership/mode checks but
+        // carries no schema: open must refuse instead of reinitializing.
+        let path = root.path().join("atx.db");
+        std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create empty owner-only file");
+        let first = Database::open(&path, Duration::from_secs(5))
+            .err()
+            .expect("some error");
+        assert!(
+            matches!(first, super::StoreError::Corrupt(_)),
+            "expected Corrupt, got {first:?}"
+        );
+
+        // A database that was properly initialized stays openable.
+        Database::open(&root.path().join("fresh.db"), Duration::from_secs(5))
+            .expect("initialize database");
+        Database::open(&root.path().join("fresh.db"), Duration::from_secs(5))
+            .expect("reopen initialized database");
+
+        // A file wiped after initialization is corruption, not a fresh start.
+        std::fs::write(&path, []).expect("truncate");
+        assert!(matches!(
+            Database::open(&path, Duration::from_secs(5)),
+            Err(super::StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

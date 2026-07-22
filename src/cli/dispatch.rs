@@ -856,6 +856,13 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         .map_err(|error| CliError::permission(json, error))?;
     let config = load_effective_config(&paths, &args.global, args.options.durable)
         .map_err(|error| CliError::usage(json, error))?;
+    if args.options.shell && !quiet {
+        eprintln!(
+            "Warning: --shell runs the command string through {}; \
+             shell metacharacters are interpreted.",
+            config.default_shell().display()
+        );
+    }
     let clock = NativeClock;
     let wall_now = clock
         .now_utc()
