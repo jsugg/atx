@@ -8,7 +8,7 @@ Put the time first, then a literal `--`, then the command:
 atx 30s -- notify-send "tea is ready"
 atx 2m30s -- make check
 atx --utc 23:00 -- ./backup-home
-atx --tz America/Sao_Paulo "2026-08-03 20:30" -- ./report
+atx --tz America/Sao_Paulo "2099-01-01 09:00" -- ./report
 ```
 
 ATX passes everything after `--` straight to the program. It does not join or
@@ -109,6 +109,13 @@ atx service status
 atx service uninstall
 ```
 
-Session jobs survive closing the terminal, but not necessarily logout or
-reboot. `--durable` never quietly falls back to session mode. See
+`service install` registers a per-user supervisor with launchd (macOS) or
+systemd (Linux). It points at the current binary and state directory, so run
+it again after moving either. `service status` lists the installed files and
+whether the supervisor is running; `service uninstall` removes them. ATX only
+touches its own service file and refuses to modify one it did not write.
+
+Durable submissions (`--durable`) require this integration to be installed;
+they never quietly fall back to session mode. Session jobs survive closing
+the terminal, but not necessarily logout or reboot. See
 [reliability](reliability.md) and [platform support](platform-support.md).
