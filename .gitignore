@@ -6,3 +6,4 @@ fuzz/corpus/
 fuzz/coverage/
 .local/
 mutants.out/
+.DS_Store
