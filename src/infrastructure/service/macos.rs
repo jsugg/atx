@@ -97,11 +97,17 @@ impl<R: CommandRunner> LaunchdService<R> {
             .run("/bin/launchctl", args)
             .map_err(ServiceManagerError::new)
     }
+
+    fn available(&self) -> bool {
+        self.runner
+            .run("/bin/launchctl", &["print-disabled", "probe"])
+            .is_ok()
+    }
 }
 
 impl<R: CommandRunner> ServiceManager for LaunchdService<R> {
     fn status(&self) -> Result<ServiceStatus, ServiceManagerError> {
-        let available = Path::new("/bin/launchctl").is_file();
+        let available = self.available();
         let installed = self.installed()?;
         let target = self.service_target();
         let running = available
@@ -269,9 +275,9 @@ impl CommandRunner for NativeCommandRunner {
     }
 }
 
-// NOTE: status() probes /bin/launchctl on the host, so these tests only hold
-// where launchd tooling exists; the adapter itself compiles everywhere.
-#[cfg(all(test, target_os = "macos"))]
+// NOTE: availability is decided by the injectable runner, so these tests hold
+// everywhere; the adapter itself compiles on every platform.
+#[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
 
@@ -315,8 +321,11 @@ mod tests {
         assert_eq!(
             calls.borrow().as_slice(),
             [
+                // availability probes from the status() calls around install
+                "print-disabled probe",
                 &format!("bootstrap gui/501 {}", agent.display()),
                 "kickstart -k gui/501/io.github.jsugg.atx",
+                "print-disabled probe",
                 "print gui/501/io.github.jsugg.atx",
             ]
         );
@@ -336,6 +345,35 @@ mod tests {
             FakeRunner::default(),
         );
         assert!(service.status().is_err());
+    }
+
+    #[test]
+    fn status_reports_unavailable_when_launchctl_probe_fails() {
+        let root = tempdir().expect("root");
+        let service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            FailingRunner,
+        );
+        let status = service.status().expect("status");
+        assert_eq!(
+            status.availability,
+            crate::application::ServiceAvailability::Unavailable
+        );
+        assert!(!status.installed);
+        assert!(!status.running);
+        assert_eq!(status.detail, "launchctl is unavailable");
+    }
+
+    struct FailingRunner;
+
+    impl CommandRunner for FailingRunner {
+        fn run(&self, _program: &str, _args: &[&str]) -> Result<std::process::Output, String> {
+            Err("No such file or directory".to_owned())
+        }
     }
 
     #[derive(Clone, Default)]
