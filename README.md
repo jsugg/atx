@@ -27,13 +27,16 @@ Session jobs are not guaranteed to survive logout or reboot. Durable mode uses
 `launchd` on macOS or a systemd user service on Linux and must be installed
 explicitly.
 
-See [reliability](docs/reliability.md) for the less-short version.
+See
+[reliability](https://github.com/jsugg/atx/blob/main/docs/reliability.md)
+for the less-short version.
 
 ## Platforms
 
 The release target is macOS 13+ and Linux 5.4+. Static musl builds are intended
 for BusyBox systems. Current details live in
-[platform support](docs/platform-support.md).
+[platform
+support](https://github.com/jsugg/atx/blob/main/docs/platform-support.md).
 
 ## Hacking on it
 
@@ -44,8 +47,10 @@ The pinned Rust toolchain is installed automatically by `rustup`.
 ./scripts/check.sh full
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing behavior.
+Read
+[CONTRIBUTING.md](https://github.com/jsugg/atx/blob/main/CONTRIBUTING.md)
+before changing behavior.
 
 ## License
 
-MIT. See [LICENSE-MIT](LICENSE-MIT).
+MIT. See [LICENSE-MIT](https://github.com/jsugg/atx/blob/main/LICENSE-MIT).

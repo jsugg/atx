@@ -24,7 +24,8 @@ Recurring jobs skip old occurrences and continue at the next anchored time.
 ATX targets laptop-class hardware with up to 10,000 waiting jobs. The
 supervisor keeps deadlines in a binary heap, so scheduling work stays
 O(log n) per job; due jobs are handed to execution in batches. Job storage
-is indexed on `(state, next_due_utc)`, and listings page 100 jobs at a time,
+is indexed on `(state, next_due_utc)` and on `(hidden, id)` so listing
+pages walk the primary key directly, and listings page 100 jobs at a time,
 so no supported path scans the whole table repeatedly.
 
 Enforced budgets (release build, `ten_thousand_jobs_meet_submission_and_list_budgets`):
@@ -37,4 +38,3 @@ Enforced budgets (release build, `ten_thousand_jobs_meet_submission_and_list_bud
 
 The budget test runs as part of `cargo test --release`; it fails loudly if
 a change regresses these paths to quadratic behavior.
-

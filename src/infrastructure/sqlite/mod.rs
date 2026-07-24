@@ -23,10 +23,14 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::process::geteuid;
 use thiserror::Error;
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../../../migrations/0001_initial.sql")),
     (2, include_str!("../../../migrations/0002_hidden_jobs.sql")),
+    (
+        3,
+        include_str!("../../../migrations/0003_hidden_id_index.sql"),
+    ),
 ];
 const MAX_BUSY_TIMEOUT_MS: u128 = 2_147_483_647;
 

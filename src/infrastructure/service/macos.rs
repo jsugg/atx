@@ -269,7 +269,9 @@ impl CommandRunner for NativeCommandRunner {
     }
 }
 
-#[cfg(test)]
+// NOTE: status() probes /bin/launchctl on the host, so these tests only hold
+// where launchd tooling exists; the adapter itself compiles everywhere.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     #![allow(clippy::expect_used)]
 
