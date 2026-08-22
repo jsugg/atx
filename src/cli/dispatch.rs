@@ -84,7 +84,7 @@ fn generate_completions(shell: crate::cli::args::CompletionShell) {
         crate::cli::args::CompletionShell::Fish => Shell::Fish,
         crate::cli::args::CompletionShell::PowerShell => Shell::PowerShell,
     };
-    // NOTE: RawCli is the derive root; its Command impl carries every subcommand.
+    // RawCli is the derive root; its Command impl carries every subcommand.
     let mut cmd = <crate::cli::args::RawCli as clap::CommandFactory>::command();
     generate(shell, &mut cmd, "atx", &mut stdout());
 }
@@ -107,7 +107,7 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
     let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
     cmd.build();
-    // NOTE: mandoc rejects an empty or non-date TH date, so stamp a real date;
+    // mandoc rejects an empty or non-date TH date, so stamp a real date;
     // SOURCE_DATE_EPOCH keeps distro reproducible builds deterministic.
     let date = std::env::var("SOURCE_DATE_EPOCH")
         .ok()
@@ -128,7 +128,7 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
         let path = out_dir.join(format!("{name}-{}.1", sub.get_name()));
         render(
             &clap_mangen::Man::new(sub.clone())
-                .title(name.to_string())
+                .title(name.clone())
                 .date(&date),
             &path,
         )?;
@@ -659,8 +659,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         | ManagementCommand::Doctor => {}
         #[cfg(feature = "man")]
         ManagementCommand::Man { .. } => {}
-        | ManagementCommand::Supervisor { .. }
-        | ManagementCommand::Monitor { .. } => {}
+        ManagementCommand::Supervisor { .. } | ManagementCommand::Monitor { .. } => {}
     }
     Ok(())
 }

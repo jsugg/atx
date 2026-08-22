@@ -27,6 +27,10 @@ Session jobs are not guaranteed to survive logout or reboot. Durable mode uses
 `launchd` on macOS or a systemd user service on Linux and must be installed
 explicitly.
 
+Shell completion scripts (`atx completions --shell <bash, zsh, fish,
+power-shell>`) and roff man pages (`cargo xtask dist-man`) are generated
+from the same CLI metadata as `--help`.
+
 See
 [reliability](https://github.com/jsugg/atx/blob/main/docs/reliability.md)
 for the less-short version.

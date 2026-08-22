@@ -490,10 +490,16 @@ mod manual_tests {
     fn long_help_includes_manual_sections() {
         let mut cmd = RawCli::command();
         let rendered = cmd.render_long_help().to_string();
-        assert!(rendered.contains("EXAMPLES:"), "missing EXAMPLES in:\n{rendered}");
+        assert!(
+            rendered.contains("EXAMPLES:"),
+            "missing EXAMPLES in:\n{rendered}"
+        );
         assert!(rendered.contains("EXIT STATUS:"));
         assert!(rendered.contains("FILES:"));
-        assert_eq!(cmd.get_after_long_help().map(|s| s.to_string()), Some(CLI_MANUAL.to_owned()));
+        assert_eq!(
+            cmd.get_after_long_help().map(ToString::to_string),
+            Some(CLI_MANUAL.to_owned())
+        );
     }
 }
 

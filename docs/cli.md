@@ -119,3 +119,33 @@ Durable submissions (`--durable`) require this integration to be installed;
 they never quietly fall back to session mode. Session jobs survive closing
 the terminal, but not necessarily logout or reboot. See
 [reliability](reliability.md) and [platform support](platform-support.md).
+
+## Shell completion
+
+`atx completions --shell SHELL` prints a completion script for `bash`, `zsh`,
+`fish`, or `power-shell`. Load it from your shell's startup file:
+
+```console
+# bash
+atx completions --shell bash > ~/.local/share/bash-completion/completions/atx
+
+# zsh
+atx completions --shell zsh > "${fpath[1]}/_atx"
+
+# fish
+atx completions --shell fish > ~/.config/fish/completions/atx.fish
+```
+
+PowerShell users add the script's content to their profile:
+`atx completions --shell power-shell >> $PROFILE`.
+
+## Man pages
+
+The full manual ships as roff pages generated from the same source as the
+`atx --help` output. Packagers render them with:
+
+```console
+cargo xtask dist-man   # writes dist/man/*.1
+```
+
+Set `SOURCE_DATE_EPOCH` to make the page dates reproducible.

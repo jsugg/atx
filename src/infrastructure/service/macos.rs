@@ -275,7 +275,7 @@ impl CommandRunner for NativeCommandRunner {
     }
 }
 
-// NOTE: availability is decided by the injectable runner, so these tests hold
+// Availability is decided by the injectable runner, so these tests hold
 // everywhere; the adapter itself compiles on every platform.
 #[cfg(test)]
 mod tests {
