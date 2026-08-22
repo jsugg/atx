@@ -81,6 +81,29 @@ their meanings stay compatible; later releases may add fields.
 `--quiet` hides successful human output. `--color` accepts `auto`, `always`, or
 `never` and controls color. Data goes to stdout and diagnostics go to stderr.
 
+## Configuration
+
+ATX reads an optional TOML file at `<state-dir>/config.toml`
+(`~/Library/Application Support/atx/config.toml` on macOS,
+`~/.local/state/atx/config.toml` on Linux by default). Values are layered:
+file, then environment, then command-line flags win.
+
+```toml
+default_timezone = "America/Sao_Paulo" # calendar input without --tz/--utc; default: local
+default_runtime = "session"            # "session" or "durable"; default: session
+default_shell = "/bin/sh"              # absolute path used by --shell
+cancel_grace = "10s"                   # default for cancel --grace
+history_days = 30                      # completed-run retention
+terminal_job_days = 30                 # hidden-job retention
+max_log_bytes_per_stream = 10485760    # per-stream capture cap
+color = "auto"                         # auto | always | never
+verbosity = "normal"                   # quiet | normal | verbose
+```
+
+Shown values are the defaults; omit a key to keep it. Unknown keys and invalid
+values are errors, never ignored. Each key also has an `ATX_` uppercase
+environment equivalent, e.g. `ATX_HISTORY_DAYS`.
+
 ## Exit codes
 
 | Code | Meaning |

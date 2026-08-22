@@ -20,5 +20,6 @@ CLI / supervisor / monitor -> application -> domain
 The domain does not know about SQLite, files, signals, sockets, or a platform
 clock. Adapters implement those edges.
 
-More detail, including startup transactions and recovery, will be added as
-those pieces land.
+Startup reconciliation and recovery run in one transaction: the supervisor
+inspects surviving processes against their recorded boot and start identities,
+then applies each job's missed policy before serving new work.

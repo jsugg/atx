@@ -1,6 +1,7 @@
-# ADR 0003: SQLite schema and migrations
+# ADR-0003: SQLite Schema and Migrations
 
-Status: accepted
+- Status: Accepted
+- Date: 2026-07-30
 
 ## Context
 

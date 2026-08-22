@@ -5,9 +5,7 @@ large cleanup mixed with a feature.
 
 ## Before coding
 
-1. Read the relevant contract in `.local/atx-spec.md`.
-2. Check the matching task in `.local/plan.md`.
-3. Start with a test that fails for the reason you expect.
+Start with a test that fails for the reason you expect.
 
 Use Red-Green-Refactor: make one behavior fail, make it pass with the smallest
 correct change, then clean it up. Bug fixes need a regression test.
@@ -32,8 +30,8 @@ fix(process): reject a reused pid
 docs(reliability): explain missed jobs
 ```
 
-Keep tests, code, docs, and the matching journal entry in the same commit.
-Never hide a failed or skipped check in the journal.
+Keep tests, code, and docs in the same commit. Never hide a failed or skipped
+check.
 
 ## Code
 
