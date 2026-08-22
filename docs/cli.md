@@ -53,6 +53,8 @@ atx show JOB
 atx ps
 atx history
 atx history JOB --limit 20
+atx output RUN
+atx output JOB
 atx cancel JOB
 atx cancel JOB --grace 3s
 atx rm JOB
@@ -64,6 +66,12 @@ atx run JOB --yes
 `JOB` may be a complete ID or any unique prefix. Removing a job hides it but
 keeps its run history. `run --yes` is required when the last outcome was
 interrupted because ATX cannot know whether that command took effect.
+
+`atx output RUN` prints the stdout and stderr captured for one run, labeling
+any stream shortened at the capture cap (10 MiB by default). A job ID resolves
+to its most recent run; a stream truncated in JSON is marked with
+`stdout_truncated`/`stderr_truncated`. Captured logs also live on disk under
+the state directory at `runs/<run-id>/stdout.log` and `stderr.log`.
 
 ## Output
 

@@ -262,3 +262,103 @@ fn wait_for_file(path: &std::path::Path) {
     }
     assert!(path.exists(), "{} was not created", path.display());
 }
+
+#[test]
+fn output_prints_captured_streams_after_a_run() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/sh", "-c"])
+        .arg("printf 'on stdout'; printf 'on stderr' >&2")
+        .output()
+        .expect("submit job");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let value: serde_json::Value = serde_json::from_slice(&submitted.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+    // Second job so a single-character prefix is guaranteed ambiguous:
+    // UUIDv7 first chars encode ~36h of timestamp, identical within a test.
+    let second = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/true"])
+        .output()
+        .expect("submit second job");
+    assert!(second.status.success(), "{second:?}");
+    wait_for_history(&state, job);
+    wait_for_history(
+        &state,
+        serde_json::from_slice::<serde_json::Value>(&second.stdout)
+            .expect("second JSON")["data"]["job_id"]
+            .as_str()
+            .expect("second job ID"),
+    );
+
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read output by job ID");
+    assert!(shown.status.success(), "{shown:?}");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(text.contains("on stdout"), "stdout missing: {text:?}");
+    assert!(text.contains("on stderr"), "stderr missing: {text:?}");
+
+    let encoded = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--json", "output", job])
+        .output()
+        .expect("read JSON output");
+    assert!(encoded.status.success(), "{encoded:?}");
+    let value: serde_json::Value = serde_json::from_slice(&encoded.stdout).expect("JSON envelope");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["data"]["stdout_truncated"], false);
+
+    let unknown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--json", "output", "zzzzzzzzzzzzzzzzzzzzzzzzzz"])
+        .output()
+        .expect("read unknown run");
+    assert_eq!(unknown.status.code(), Some(3));
+    let error: serde_json::Value = serde_json::from_slice(&unknown.stderr).expect("JSON error");
+    assert_eq!(error["error"]["code"], "JOB_NOT_FOUND");
+
+    let ambiguous = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["output", "0"])
+        .output()
+        .expect("read ambiguous run");
+    assert_eq!(ambiguous.status.code(), Some(3));
+}
+
+fn wait_for_history(state: &std::path::Path, job: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let done = match atx()
+            .arg("--state-dir")
+            .arg(state)
+            .args(["history", job, "--limit", "1"])
+            .output()
+        {
+            Ok(runs) => {
+                let text = String::from_utf8_lossy(&runs.stdout);
+                text.contains(job) || !text.contains("RUN\t")
+            }
+            Err(_) => false,
+        };
+        if done {
+            return;
+        }
+        assert!(Instant::now() < deadline, "run never completed for {job}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -5,8 +5,10 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::job_store::{JOB_COLUMNS, decode_job_row, load_job};
 use super::run_store::{RUN_COLUMNS, decode_run_row};
 use super::{JobStore, StoreError, map_read_error, map_write_error};
-use crate::application::{ManagementStore, ManagementStoreError};
-use crate::domain::{Job, JobId, JobState, Revision, Run, UtcTimestamp};
+use crate::application::{
+    ManagementStore, ManagementStoreError, RunOutputStore, RunOutputStoreError,
+};
+use crate::domain::{Job, JobId, JobState, Revision, Run, RunId, UtcTimestamp};
 
 impl ManagementStore for JobStore {
     fn list_jobs(
@@ -268,4 +270,85 @@ const fn encode_job_state(state: JobState) -> &'static str {
 
 fn management_error(error: &StoreError) -> ManagementStoreError {
     ManagementStoreError(error.to_string())
+}
+
+impl RunOutputStore for JobStore {
+    fn find_runs_by_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Run>, RunOutputStoreError> {
+        let prefix = prefix.to_ascii_lowercase();
+        let prefix_len = i64::try_from(prefix.len())
+            .map_err(|_| output_store_error("prefix length overflow"))?;
+        let limit =
+            i64::try_from(limit).map_err(|_| output_store_error("result limit overflow"))?;
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE substr(id, 1, ?1) = ?2
+             ORDER BY id
+             LIMIT ?3"
+        );
+        let mut statement = self
+            .database
+            .connection()
+            .prepare(&sql)
+            .map_err(|error| output_store_error(&map_read_error(error).to_string()))?;
+        let rows = statement
+            .query_map(params![prefix_len, prefix, limit], decode_run_row)
+            .map_err(|error| output_store_error(&map_read_error(error).to_string()))?;
+        rows.map(|row| row.map_err(|error| output_store_error(&map_read_error(error).to_string())))
+            .collect()
+    }
+
+    fn latest_run(&self, job_id: JobId) -> Result<Option<Run>, RunOutputStoreError> {
+        let sql = format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE job_id = ?1
+             ORDER BY sequence DESC
+             LIMIT 1"
+        );
+        self.database
+            .connection()
+            .query_row(&sql, [job_id.to_string()], decode_run_row)
+            .optional()
+            .map_err(|error| output_store_error(&map_read_error(error).to_string()))
+    }
+
+    fn find_jobs_by_prefix(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Job>, RunOutputStoreError> {
+        find_jobs_by_prefix(self, prefix, limit)
+            .map_err(|error| output_store_error(&error.to_string()))
+    }
+
+    fn stdout_truncated(&self, run_id: RunId) -> Result<bool, RunOutputStoreError> {
+        read_truncation_flag(self, run_id, "stdout_truncated")
+    }
+
+    fn stderr_truncated(&self, run_id: RunId) -> Result<bool, RunOutputStoreError> {
+        read_truncation_flag(self, run_id, "stderr_truncated")
+    }
+}
+
+fn read_truncation_flag(
+    store: &JobStore,
+    run_id: RunId,
+    column: &str,
+) -> Result<bool, RunOutputStoreError> {
+    // NOTE: column comes only from the two literal call sites above.
+    let sql = format!("SELECT {column} FROM runs WHERE id = ?1");
+    store
+        .database
+        .connection()
+        .query_row(&sql, [run_id.to_string()], |row| row.get(0))
+        .optional()
+        .map_err(|error| output_store_error(&map_read_error(error).to_string()))
+        .and_then(|flag| flag.ok_or_else(|| output_store_error("run row vanished")))
+}
+
+fn output_store_error(message: &str) -> RunOutputStoreError {
+    RunOutputStoreError(message.to_owned())
 }

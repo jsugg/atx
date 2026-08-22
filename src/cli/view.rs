@@ -147,6 +147,35 @@ pub(crate) struct ProcessView {
     pub(crate) state: RunState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct RunOutputView {
+    pub(crate) run_id: String,
+    pub(crate) job_id: String,
+    pub(crate) state: RunState,
+    pub(crate) outcome: Option<RunOutcome>,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+    /// Lossy UTF-8 of the captured stream; JSON consumers get text, raw
+    /// bytes remain on disk under the logged paths.
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+impl RunOutputView {
+    pub(crate) fn from_output(output: &crate::application::RunOutput) -> Self {
+        Self {
+            run_id: output.run_id.to_string(),
+            job_id: output.job_id.to_string(),
+            state: output.state,
+            outcome: output.outcome.clone(),
+            stdout_truncated: output.stdout.truncated,
+            stderr_truncated: output.stderr.truncated,
+            stdout: String::from_utf8_lossy(&output.stdout.content).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr.content).into_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]

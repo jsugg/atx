@@ -203,6 +203,8 @@ pub(crate) enum ManagementCommand {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Print captured output of one run.
+    Output { run: String },
     /// Check local configuration and state.
     Doctor,
     /// Manage durable service integration.
@@ -375,6 +377,7 @@ fn is_management_name(value: &std::ffi::OsStr) -> bool {
                 | "run"
                 | "ps"
                 | "history"
+                | "output"
                 | "doctor"
                 | "service"
                 | "version"

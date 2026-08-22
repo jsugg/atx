@@ -4,7 +4,7 @@ use std::io::IsTerminal;
 
 use super::args::ColorArg;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
-use crate::application::{DiagnosticStatus, DoctorReport, ServiceChange, ServiceStatus};
+use crate::application::{DiagnosticStatus, DoctorReport, RunOutput, ServiceChange, ServiceStatus};
 use crate::domain::{JobState, Schedule};
 
 pub(crate) struct HumanRenderer {
@@ -96,6 +96,30 @@ impl HumanRenderer {
             )
         }));
         lines.join("\n")
+    }
+
+    pub(crate) fn run_output(output: &RunOutput) -> String {
+        let snapshot_header = format!(
+            "Run: {}\nJob: {}\nState: {:?}\nOutcome: {}",
+            output.run_id,
+            output.job_id,
+            output.state,
+            output
+                .outcome
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |outcome| format!("{outcome:?}"))
+        );
+        let mut sections = vec![snapshot_header];
+        for (label, stream) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            let marker = if stream.truncated {
+                " (truncated at capture cap)"
+            } else {
+                ""
+            };
+            sections.push(format!("--- {label}{marker} ---"));
+            sections.push(String::from_utf8_lossy(&stream.content).into_owned());
+        }
+        sections.join("\n")
     }
 
     pub(crate) fn doctor(&self, report: &DoctorReport) -> String {

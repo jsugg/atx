@@ -14,13 +14,13 @@ use super::args::{
 };
 use super::exit;
 use super::human::HumanRenderer;
-use super::view::{JobView, ProcessView, RunView, SubmissionView};
+use super::view::{JobView, ProcessView, RunOutputView, RunView, SubmissionView};
 use crate::application::{
     CancelRunResult, DiagnosticStatus, DoctorReport, DoctorReportBuilder, ElapsedClock,
-    ManagementError, ManagementStore, ServiceManager, SubmissionOutcome, SubmissionStore,
-    SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
-    cancel_claimed_run, install_service, list_jobs, list_runs, remove_job, rerun_job, resolve_job,
-    submit_job, uninstall_service,
+    ManagementError, ManagementStore, RunOutput, RunOutputError, ServiceManager, SubmissionOutcome,
+    SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
+    cancel_claimed_run, install_service, list_jobs, list_runs, read_run_output, remove_job,
+    rerun_job, resolve_job, submit_job, uninstall_service,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
@@ -604,6 +604,11 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             let runs = list_runs(&store, job_id, *limit)
                 .map_err(|error| management_cli_error(global.json, error))?;
             render_runs(&runs, global);
+        }
+        ManagementCommand::Output { run } => {
+            let output = read_run_output(&store, paths.state_dir(), run)
+                .map_err(|error| output_cli_error(global.json, error))?;
+            render_run_output(&output, global);
         }
         ManagementCommand::Ps => {
             let runs = store
@@ -1299,6 +1304,14 @@ fn render_runs(runs: &[crate::domain::Run], global: &GlobalArgs) {
     }
 }
 
+fn render_run_output(output: &RunOutput, global: &GlobalArgs) {
+    if global.json {
+        print_json_success(&RunOutputView::from_output(output));
+    } else if !global.quiet {
+        print!("{}", HumanRenderer::run_output(output));
+    }
+}
+
 fn render_job(job: &Job, global: &GlobalArgs) {
     let view = JobView::from_job(job, UtcTimestamp::from_jiff(jiff::Timestamp::now()));
     if global.json {
@@ -1392,6 +1405,18 @@ fn management_cli_error(json: bool, error: ManagementError) -> CliError {
         }
         ManagementError::InvalidLimit => CliError::usage(json, error),
         ManagementError::Store(_) => CliError::storage(json, error),
+    }
+}
+
+fn output_cli_error(json: bool, error: RunOutputError) -> CliError {
+    match error {
+        RunOutputError::NotFound
+        | RunOutputError::Ambiguous
+        | RunOutputError::InvalidPrefix
+        | RunOutputError::NoRuns
+        | RunOutputError::NotCaptured
+        | RunOutputError::MissingLogs => CliError::not_found(json, error),
+        RunOutputError::Read(_) | RunOutputError::Store(_) => CliError::storage(json, error),
     }
 }
 
