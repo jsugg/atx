@@ -10,11 +10,13 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
     name = "atx",
     version,
     about = "Run commands later without keeping a terminal open",
+    long_about = None,
+    after_long_help = CLI_MANUAL,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     subcommand_precedence_over_arg = true
 )]
-struct RawCli {
+pub(crate) struct RawCli {
     #[command(flatten)]
     global: GlobalArgs,
 
@@ -210,6 +212,19 @@ pub(crate) enum ManagementCommand {
     },
     /// Print version information.
     Version,
+    /// Emit shell completion scripts.
+    Completions {
+        /// Target shell for the generated script.
+        #[arg(long, value_enum)]
+        shell: CompletionShell,
+    },
+    /// Write roff man pages into a directory. (internal)
+    #[cfg(feature = "man")]
+    #[command(name = "__man", hide = true)]
+    Man {
+        /// Destination directory for the generated pages.
+        out_dir: PathBuf,
+    },
     #[command(name = "__supervisor", hide = true)]
     Supervisor {
         #[arg(long)]
@@ -237,6 +252,14 @@ pub(crate) enum ServiceAction {
     Install,
     Status,
     Uninstall,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
 }
 
 pub(crate) fn parse_from(
@@ -270,6 +293,49 @@ pub(crate) fn parse_from(
         argv: raw.argv,
     }))
 }
+
+const CLI_MANUAL: &str = "\
+EXAMPLES:
+  atx 30s -- notify-send \"tea is ready\"
+      Run a command after 30 seconds.
+
+  atx --utc 23:00 -- ./backup-home
+      Run tonight at 23:00 UTC. Calendar times roll over to tomorrow
+      when they already passed; --no-rollover turns that into an error.
+
+  atx --tz America/Sao_Paulo \"2099-01-01 09:00\" -- ./report
+      Schedule in an explicit IANA timezone.
+
+  atx --every 5m -- /usr/bin/cleanup
+      Repeat on a fixed-rate interval.
+
+  atx --shell 10m -- 'printf \"done\\n\" >>\"$HOME/notes\"'
+      Opt in to /bin/sh only when pipes or redirects are needed.
+
+EXIT STATUS:
+  0    success
+  1    operation finished with a negative job outcome
+  2    invalid command line
+  3    missing or ambiguous job ID
+  4    job state conflict
+  5    requested platform feature unavailable
+  10   state database failure
+  11   process or supervisor failure
+  12   ownership or permission failure
+  70   unexpected internal failure
+
+FILES:
+  macOS:        ~/Library/Application Support/atx/atx.db (state)
+                $TMPDIR/atx-<uid> (runtime)
+  Linux:        $XDG_STATE_HOME/atx/atx.db, else ~/.local/state/atx/atx.db
+                $XDG_RUNTIME_DIR/atx, else $TMPDIR/atx-<uid>
+  launchd:      ~/Library/LaunchAgents/io.github.jsugg.atx.plist
+  systemd:      ~/.config/systemd/user/atx.service
+  Environment values are stored for execution but never displayed.
+
+SEE ALSO:
+  Full guide and JSON schema: https://github.com/jsugg/atx
+";
 
 fn normalize_management_order(args: &mut Vec<OsString>) {
     if args.len() < 3 || args.get(1).is_some_and(|value| is_management_name(value)) {
@@ -312,9 +378,11 @@ fn is_management_name(value: &std::ffi::OsStr) -> bool {
                 | "doctor"
                 | "service"
                 | "version"
+                | "completions"
                 | "help"
                 | "__supervisor"
                 | "__monitor"
+                | "__man"
         )
     )
 }
@@ -410,5 +478,57 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod manual_tests {
+    use super::{CLI_MANUAL, RawCli};
+    use clap::CommandFactory;
+
+    #[test]
+    fn long_help_includes_manual_sections() {
+        let mut cmd = RawCli::command();
+        let rendered = cmd.render_long_help().to_string();
+        assert!(rendered.contains("EXAMPLES:"), "missing EXAMPLES in:\n{rendered}");
+        assert!(rendered.contains("EXIT STATUS:"));
+        assert!(rendered.contains("FILES:"));
+        assert_eq!(cmd.get_after_long_help().map(|s| s.to_string()), Some(CLI_MANUAL.to_owned()));
+    }
+}
+
+#[cfg(test)]
+mod completions_tests {
+    #![allow(clippy::expect_used)]
+    use super::{CompletionShell, RawCli};
+    use clap::CommandFactory;
+    use clap_complete::{Shell, generate};
+
+    fn render(shell: Shell) -> String {
+        let mut cmd = RawCli::command();
+        let mut buf = Vec::new();
+        generate(shell, &mut cmd, "atx", &mut buf);
+        String::from_utf8(buf).expect("completion script is UTF-8")
+    }
+
+    #[test]
+    fn completion_scripts_are_stable_per_shell() {
+        for (shell, marker) in [
+            (CompletionShell::Bash, "_atx() {"),
+            (CompletionShell::Zsh, "#compdef atx"),
+            (CompletionShell::Fish, "__fish_atx_global_optspecs"),
+            (CompletionShell::PowerShell, "Register-ArgumentCompleter"),
+        ] {
+            let script = render(match shell {
+                CompletionShell::Bash => Shell::Bash,
+                CompletionShell::Zsh => Shell::Zsh,
+                CompletionShell::Fish => Shell::Fish,
+                CompletionShell::PowerShell => Shell::PowerShell,
+            });
+            assert!(script.contains(marker), "{shell:?} missing `{marker}`");
+            // Fish emits flags as `-l state-dir`, so match the bare flag name.
+            assert!(script.contains("state-dir"), "{shell:?} missing state-dir");
+            assert!(script.contains("completions") || script.contains("Completions"));
+        }
     }
 }

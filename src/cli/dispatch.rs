@@ -74,6 +74,68 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
+fn generate_completions(shell: crate::cli::args::CompletionShell) {
+    use clap_complete::{Shell, generate};
+    use std::io::stdout;
+
+    let shell = match shell {
+        crate::cli::args::CompletionShell::Bash => Shell::Bash,
+        crate::cli::args::CompletionShell::Zsh => Shell::Zsh,
+        crate::cli::args::CompletionShell::Fish => Shell::Fish,
+        crate::cli::args::CompletionShell::PowerShell => Shell::PowerShell,
+    };
+    // NOTE: RawCli is the derive root; its Command impl carries every subcommand.
+    let mut cmd = <crate::cli::args::RawCli as clap::CommandFactory>::command();
+    generate(shell, &mut cmd, "atx", &mut stdout());
+}
+
+/// Write `atx.1` plus one page per subcommand as roff into `out_dir`.
+#[cfg(feature = "man")]
+fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
+    use clap::CommandFactory;
+    use std::io::Write;
+
+    fn render(man: &clap_mangen::Man, path: &std::path::Path) -> Result<(), String> {
+        let file = std::fs::File::create(path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        man.render(&mut writer)
+            .map_err(|error| format!("render {}: {error}", path.display()))?;
+        writer.flush().map_err(|error| format!("flush: {error}"))
+    }
+
+    std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
+    let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
+    cmd.build();
+    // NOTE: mandoc rejects an empty or non-date TH date, so stamp a real date;
+    // SOURCE_DATE_EPOCH keeps distro reproducible builds deterministic.
+    let date = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|epoch| epoch.parse::<i64>().ok())
+        .and_then(|epoch| jiff::Timestamp::from_second(epoch).ok())
+        .unwrap_or_else(jiff::Timestamp::now)
+        .strftime("%Y-%m-%d")
+        .to_string();
+    let name = cmd.get_name().to_owned();
+    render(
+        &clap_mangen::Man::new(cmd.clone()).date(&date),
+        &out_dir.join(format!("{name}.1")),
+    )?;
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        let path = out_dir.join(format!("{name}-{}.1", sub.get_name()));
+        render(
+            &clap_mangen::Man::new(sub.clone())
+                .title(name.to_string())
+                .date(&date),
+            &path,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode {
     let json = global.json;
     match command {
@@ -85,6 +147,18 @@ fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode 
             }
             ExitCode::SUCCESS
         }
+        ManagementCommand::Completions { shell } => {
+            generate_completions(*shell);
+            ExitCode::SUCCESS
+        }
+        #[cfg(feature = "man")]
+        ManagementCommand::Man { out_dir } => match export_man_pages(out_dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("atx __man: {error}");
+                exit::internal()
+            }
+        },
         ManagementCommand::Supervisor {
             state_dir,
             runtime_dir,
@@ -581,7 +655,10 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         }
         ManagementCommand::Service { .. }
         | ManagementCommand::Version
-        | ManagementCommand::Doctor
+        | ManagementCommand::Completions { .. }
+        | ManagementCommand::Doctor => {}
+        #[cfg(feature = "man")]
+        ManagementCommand::Man { .. } => {}
         | ManagementCommand::Supervisor { .. }
         | ManagementCommand::Monitor { .. } => {}
     }
