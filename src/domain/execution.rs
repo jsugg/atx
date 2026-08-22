@@ -125,6 +125,7 @@ pub(crate) struct ExecutionSpec {
     stdout: OutputPolicy,
     stderr: OutputPolicy,
     shell_path: Option<PathBuf>,
+    notify_tty: Option<PathBuf>,
 }
 
 impl ExecutionSpec {
@@ -170,6 +171,7 @@ impl ExecutionSpec {
             stdout: OutputPolicy::BoundedFile,
             stderr: OutputPolicy::BoundedFile,
             shell_path: (mode == ExecutionMode::Shell).then(|| PathBuf::from("/bin/sh")),
+            notify_tty: None,
         })
     }
 
@@ -191,6 +193,32 @@ impl ExecutionSpec {
 
     pub(crate) fn shell_path(&self) -> Option<&Path> {
         self.shell_path.as_deref()
+    }
+
+    /// Device path the submitting terminal asked output to be echoed to.
+    pub(crate) fn notify_tty(&self) -> Option<&Path> {
+        self.notify_tty.as_deref()
+    }
+
+    /// Record a terminal device path for fire-and-forget output echo.
+    ///
+    /// The path is stored, not validated against the filesystem: by fire time
+    /// (possibly days later) any tty may legitimately have vanished.
+    pub(crate) fn set_notify_tty(&mut self, notify_tty: PathBuf) -> Result<(), ExecutionError> {
+        if notify_tty.as_os_str().is_empty()
+            || notify_tty.as_os_str().as_encoded_bytes().contains(&0)
+        {
+            return Err(ExecutionError::InvalidNotifyTty);
+        }
+        let serialized_size = self.argv.iter().map(String::len).sum::<usize>()
+            + self.environment.serialized_size()
+            + self.working_directory.as_os_str().len()
+            + notify_tty.as_os_str().len();
+        if serialized_size > MAX_SERIALIZED_BYTES {
+            return Err(ExecutionError::SerializedSizeExceeded);
+        }
+        self.notify_tty = Some(notify_tty);
+        Ok(())
     }
 
     pub(crate) fn set_shell_path(&mut self, shell_path: PathBuf) -> Result<(), ExecutionError> {
@@ -216,6 +244,7 @@ impl ExecutionSpec {
             stdout: self.stdout,
             stderr: self.stderr,
             shell_path: self.shell_path.clone(),
+            notify_tty: self.notify_tty.clone(),
         })
         .map_err(|error| ExecutionStorageError::Json(error.to_string()))
     }
@@ -245,6 +274,13 @@ impl ExecutionSpec {
             }
             _ => return Err(ExecutionStorageError::InvalidShell),
         }
+        if let Some(notify_tty) = stored.notify_tty {
+            // Legacy rows never carry the field; a present field must still
+            // satisfy the same invariants submit-time validation applied.
+            execution
+                .set_notify_tty(notify_tty)
+                .map_err(|_| ExecutionStorageError::InvalidNotifyTty)?;
+        }
         Ok(execution)
     }
 }
@@ -259,6 +295,8 @@ struct PersistedExecutionSpec {
     stdout: OutputPolicy,
     stderr: OutputPolicy,
     shell_path: Option<PathBuf>,
+    #[serde(default)]
+    notify_tty: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -279,6 +317,8 @@ pub(crate) enum ExecutionError {
     InvalidShellPath,
     #[error("invalid environment variable name")]
     InvalidEnvironmentKey,
+    #[error("terminal device path cannot be empty or contain NUL")]
+    InvalidNotifyTty,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -291,11 +331,15 @@ pub(crate) enum ExecutionStorageError {
     InvalidPolicy,
     #[error("stored shell path does not match execution mode")]
     InvalidShell,
+    #[error("stored terminal device path is invalid")]
+    InvalidNotifyTty,
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
+
+    use std::path::PathBuf;
 
     use super::{Environment, ExecutionMode, ExecutionSpec};
 
@@ -347,6 +391,63 @@ mod tests {
                 .expect("serializable")
                 .contains("swordfish")
         );
+    }
+
+    #[test]
+    fn notify_tty_roundtrips_and_rejects_bad_paths() {
+        let mut spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid execution");
+        assert!(spec.notify_tty().is_none());
+
+        spec.set_notify_tty(PathBuf::from("/dev/ttys001"))
+            .expect("valid tty path");
+        let persisted = spec.to_persistence_json().expect("persist");
+        let restored = ExecutionSpec::from_persistence_json(&persisted).expect("restore");
+        assert_eq!(
+            restored.notify_tty(),
+            Some(std::path::Path::new("/dev/ttys001"))
+        );
+
+        assert!(spec.set_notify_tty(PathBuf::new()).is_err());
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&serde_json::json!({
+                    "mode": "direct",
+                    "argv": ["true"],
+                    "working_directory": "/tmp",
+                    "environment": {},
+                    "stdin": "null",
+                    "stdout": "bounded_file",
+                    "stderr": "bounded_file",
+                    "notify_tty": ""
+                }))
+                .expect("json")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_persistence_json_without_notify_tty_loads() {
+        let legacy = serde_json::json!({
+            "mode": "direct",
+            "argv": ["true"],
+            "working_directory": "/tmp",
+            "environment": {},
+            "stdin": "null",
+            "stdout": "bounded_file",
+            "stderr": "bounded_file",
+            "shell_path": null
+        });
+        let restored =
+            ExecutionSpec::from_persistence_json(&serde_json::to_string(&legacy).expect("json"))
+                .expect("legacy row loads");
+        assert!(restored.notify_tty().is_none());
     }
 
     #[test]

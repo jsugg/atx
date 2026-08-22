@@ -340,6 +340,23 @@ fn output_prints_captured_streams_after_a_run() {
     assert_eq!(ambiguous.status.code(), Some(3));
 }
 
+#[test]
+fn tty_flag_rejects_pipe_stdout_before_creating_state() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+
+    // Test harness pipes stdout: not a terminal, usage error, no state.
+    let piped = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--tty", "1s", "--", "/bin/true"])
+        .output()
+        .expect("submit with --tty under pipe");
+    assert_eq!(piped.status.code(), Some(2), "{piped:?}");
+    assert!(!state.exists());
+}
+
+/// Wait until `atx history <job>` shows at least one terminal run.
 fn wait_for_history(state: &std::path::Path, job: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {

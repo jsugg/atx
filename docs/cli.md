@@ -38,7 +38,15 @@ Useful scheduling options:
 --missed hold|run-latest|skip
 --durable                 require installed service integration
 --every DURATION          fixed-rate recurring job
+--tty                     echo captured output to the submitting terminal
+                          when the run finishes
 ```
+
+`--tty` records the terminal device of your stdout at submit time. When the
+run finishes, the monitor appends the captured stdout and stderr there as a
+best-effort fire-and-forget write: if the terminal is closed or gone by then,
+the run outcome is unaffected and the output stays available via `atx
+output JOB`.
 
 By default ATX keeps a small safe environment rather than copying every
 variable from the terminal. Environment values are stored for execution but

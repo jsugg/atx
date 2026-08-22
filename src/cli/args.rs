@@ -120,6 +120,10 @@ pub(crate) struct ScheduleOptions {
     /// Repeat on a fixed-rate interval.
     #[arg(long, value_name = "DURATION")]
     pub(crate) every: Option<String>,
+
+    /// Echo captured output to this terminal when the run finishes.
+    #[arg(long)]
+    pub(crate) tty: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]

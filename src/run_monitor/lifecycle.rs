@@ -106,13 +106,14 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
         let status = child.wait();
         let finished_at_utc = self.clock.now_utc()?;
 
-        let (stdout_truncated, stderr_truncated, capture_failed) = match captured {
+        let (stdout_truncated, stderr_truncated, capture_failed, echo) = match captured {
             Ok(captured) => (
                 captured.stdout.summary().truncated(),
                 captured.stderr.summary().truncated(),
                 captured.stdout.error().is_some() || captured.stderr.error().is_some(),
+                Some(captured),
             ),
-            Err(_) => (false, false, true),
+            Err(_) => (false, false, true, None),
         };
         self.store
             .record_log_truncation(
@@ -129,14 +130,24 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
             .map_err(|error| MonitorError::Store(error.to_string()))?
             .is_some_and(|run| run.state() == RunState::CancelRequested);
         let outcome = completion_outcome(status, capture_failed, cancellation_requested);
-        self.store
-            .record_run_terminal(
-                running.id(),
-                running.claim_token(),
-                finished_at_utc,
-                outcome,
-            )
-            .map_err(|error| MonitorError::Store(error.to_string()))
+        let terminal = self.store.record_run_terminal(
+            running.id(),
+            running.claim_token(),
+            finished_at_utc,
+            outcome.clone(),
+        );
+        // Fire-and-forget echo to the submitting terminal: purely additive,
+        // never affects the recorded outcome. Any failure (terminal closed,
+        // rebooted, revoked) is silently skipped by design.
+        if let (Some(echo), Some(tty)) = (echo, execution.notify_tty()) {
+            echo_tty(
+                tty,
+                &self.state_directory.join(&stdout_path),
+                &self.state_directory.join(&stderr_path),
+                echo.stderr.summary().truncated() || echo.stdout.summary().truncated(),
+            );
+        }
+        terminal.map_err(|error| MonitorError::Store(error.to_string()))
     }
 
     fn fail_run(&mut self, run: &Run, message: String) -> Result<Run, MonitorError> {
@@ -150,6 +161,31 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
             )
             .map_err(|error| MonitorError::Store(error.to_string()))
     }
+}
+
+/// Best-effort append of captured log files to a terminal device.
+fn echo_tty(tty: &Path, stdout_log: &Path, stderr_log: &Path, truncated: bool) {
+    use std::io::Write;
+    let (Ok(stdout), Ok(stderr)) = (
+        std::fs::read(stdout_log),
+        std::fs::OpenOptions::new().append(true).open(tty),
+    ) else {
+        return;
+    };
+    let mut file = stderr;
+    if truncated {
+        let _ = writeln!(file, "[atx: output truncated at capture cap]");
+    }
+    let _ = writeln!(file);
+    if !stdout.is_empty() {
+        let _ = file.write_all(&stdout);
+    }
+    if let Ok(stderr) = std::fs::read(stderr_log) {
+        if !stderr.is_empty() {
+            let _ = file.write_all(&stderr);
+        }
+    }
+    let _ = file.flush();
 }
 
 fn completion_outcome(
@@ -233,6 +269,71 @@ mod tests {
                 .expect("environment"),
         )
         .expect("execution")
+    }
+
+    #[test]
+    fn terminal_run_echoes_streams_to_notify_tty() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let tty = root.path().join("fake-tty");
+        fs::write(&tty, b"").expect("seed tty file");
+        let mut execution = execution(ExecutionMode::Shell, &["printf out; printf err >&2"]);
+        execution
+            .set_notify_tty(tty.clone())
+            .expect("notify tty path");
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+
+        assert_eq!(completed.state(), RunState::Succeeded);
+        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        assert!(echoed.contains("out"), "stdout missing: {echoed:?}");
+        assert!(echoed.contains("err"), "stderr missing: {echoed:?}");
+    }
+
+    #[test]
+    fn unwritable_notify_tty_leaves_outcome_untouched() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        // Path can never exist as a terminal: a directory cannot be appended.
+        let mut execution = execution(ExecutionMode::Shell, &["true"]);
+        execution
+            .set_notify_tty(root.path().join("no-such-dir/tty"))
+            .expect("notify tty path");
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+
+        assert_eq!(completed.state(), RunState::Succeeded);
+        assert_eq!(completed.outcome(), Some(&RunOutcome::Exit(0)));
     }
 
     #[test]

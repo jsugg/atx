@@ -1203,7 +1203,37 @@ fn build_execution(args: &SchedulingArgs, config: &Config) -> Result<ExecutionSp
             .set_shell_path(config.default_shell().to_owned())
             .map_err(|error| error.to_string())?;
     }
+    if args.options.tty {
+        let tty = resolve_submitting_tty()
+            .map_err(|error| format!("--tty requires stdout to be a terminal: {error}"))?;
+        execution
+            .set_notify_tty(tty)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(execution)
+}
+
+/// Resolve the device path of the submitter's own stdout terminal.
+fn resolve_submitting_tty() -> Result<PathBuf, String> {
+    use std::os::fd::AsFd;
+
+    let stdout = std::io::stdout();
+    // NOTE: /dev/stdout reflects fd 1's actual target even when stdout is
+    // redirected; the metadata check is what rejects pipes and files.
+    let metadata = fs::metadata("/dev/stdout").map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_char_device() {
+        return Err("stdout is not a character device".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        rustix::fs::getpath(stdout.as_fd())
+            .map(|path| PathBuf::from(path.to_string_lossy().into_owned()))
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::canonicalize("/proc/self/fd/1").map_err(|error| error.to_string())
+    }
 }
 
 fn build_environment(args: &SchedulingArgs) -> Result<Environment, String> {
