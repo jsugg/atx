@@ -9,13 +9,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: never
   FUZZ_RUNS: "20000"
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -36,3 +44,11 @@ jobs:
         run: cargo install --locked cargo-fuzz --version 0.13.2
       - name: Run ${{ matrix.target }}
         run: cargo fuzz run "${{ matrix.target }}" -- -runs="${FUZZ_RUNS}" -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts
+          retention-days: 14
+          if-no-files-found: ignore
