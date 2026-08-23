@@ -366,11 +366,19 @@ fn wait_for_history(state: &std::path::Path, job: &str) {
             .args(["history", job, "--limit", "1"])
             .output()
         {
-            Ok(runs) => {
+            Ok(runs) if runs.status.success() => {
+                // Only a row for this job in a terminal state counts; an
+                // empty or transiently failing listing must keep waiting.
                 let text = String::from_utf8_lossy(&runs.stdout);
-                text.contains(job) || !text.contains("RUN\t")
+                text.lines().any(|line| {
+                    line.contains(job)
+                        && matches!(
+                            line.split('\t').nth(2),
+                            Some("Succeeded" | "Failed" | "Cancelled" | "Interrupted")
+                        )
+                })
             }
-            Err(_) => false,
+            _ => false,
         };
         if done {
             return;
