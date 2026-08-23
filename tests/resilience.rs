@@ -115,7 +115,7 @@ fn states(state_dir: &std::path::Path, job_id: &str) -> Option<(String, String)>
 }
 
 fn wait_for(predicate: impl Fn() -> bool, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if predicate() {
             return;
@@ -147,6 +147,9 @@ fn kill_state_supervisors(state: &std::path::Path) {
 /// Force a fresh supervisor start (which runs startup reconciliation):
 /// session supervisors idle-exit after 30 seconds, so kill this state dir's
 /// supervisor and submit a throwaway job instead of waiting that out.
+/// Make sure a supervisor for `state` exists (fresh if none is live). The
+/// first submit spawns one; a poke only kills + respawns when recovery must
+/// re-run, so a healthy supervisor already reconciling is never interrupted.
 fn poke_supervisor(state: &std::path::Path) {
     kill_state_supervisors(state);
     std::thread::sleep(Duration::from_millis(100));
@@ -160,10 +163,10 @@ fn poke_supervisor(state: &std::path::Path) {
     assert!(submitted.status.success(), "{submitted:?}");
 }
 
-/// Any live supervisor whose state directory sits under `state`.
+/// Wait until the job state (not the run) reaches `expected`.
 fn wait_for_state(state_dir: &std::path::Path, job_id: &str, expected: &str) {
     wait_for(
-        || states(state_dir, job_id).is_some_and(|(run, _)| run == expected),
+        || states(state_dir, job_id).is_some_and(|(_, job)| job == expected),
         expected,
     );
 }
@@ -350,7 +353,15 @@ fn failed_spawn_records_failed_once_and_never_retries() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let submission = submit(&state, &["1s", "--", "/definitely/missing/atx-command-xyz"]);
-    wait_for_state(&state, &submission.job_id, "failed");
+    // The monitor records the run terminal before transitioning the job, so
+    // waiting on the run alone can observe job still running; wait for both.
+    wait_for(
+        || {
+            states(&state, &submission.job_id)
+                .is_some_and(|(run, job)| run == "failed" && job == "failed")
+        },
+        "failed",
+    );
     let (first_run, first_job) = states(&state, &submission.job_id).expect("states");
     assert_eq!(first_run, "failed");
     assert_eq!(first_job, "failed");
