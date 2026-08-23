@@ -89,9 +89,10 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      # No aarch64-apple-darwin here: macos-15 runners are arm64, so the
+      # native matrix job already builds and tests that triple directly.
       matrix:
         target:
-          - aarch64-apple-darwin
           - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl
     steps:
