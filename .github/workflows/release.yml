@@ -109,7 +109,12 @@ jobs:
             run=(qemu-aarch64-static)
           fi
           "${run[@]}" "$bin" --version | grep -qx "atx $(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
-          "${run[@]}" "$bin" doctor >/dev/null
+          # doctor checks real directory ownership/mode, so point it at a
+          # private scratch state dir with a writable runtime dir.
+          export HOME="$PWD/.smoke-home" XDG_RUNTIME_DIR="$PWD/.smoke-runtime"
+          mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
+          chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
+          "${run[@]}" "$bin" --state-dir "$HOME/state" doctor
       - name: Stage deterministic layout
         run: |
           install -m 0755 "target/${{ matrix.target }}/release/atx" atx
