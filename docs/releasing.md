@@ -36,6 +36,34 @@ You can rehearse without cutting a tag: run the workflow by hand from the
 Actions tab and give it the tag name you have in mind. It builds everything,
 attests it, verifies the attestations, but publishes nothing.
 
-Crate publishing to crates.io stays gated behind the separate approval above.
+## Publishing the crate
 
-The exact commands and rollback notes will be filled in before 1.0.
+Publishing to crates.io is wired but switched off. Every pull request
+rehearses the whole publish flow against a local registry mock with dummy
+credentials — upload, checksum, duplicate rejection, failure handling — so
+the machinery is exercised without anything ever reaching crates.io.
+
+The real publish job only runs when a GitHub release is published *and* the
+repository variable `CRATES_IO_PUBLISH_ENABLED` is set to `true`, inside
+the protected `crates-io` environment. It re-checks that the release tag,
+`Cargo.toml`, and `CHANGELOG.md` all agree, refuses to republish an
+existing version, then asks crates.io for a short-lived trusted-publishing
+credential (OIDC) instead of using a stored token. No crates.io token
+lives in this repository.
+
+Turning publishing on is an owner action, done once:
+
+1. Publish the first version manually (see below) — crates.io needs an
+   existing crate before its trusted publisher can be configured.
+2. On crates.io, configure the trusted publisher: repository `jsugg/atx`,
+   workflow `publish-crates-io.yml`, environment `crates-io`.
+3. Set the repository variable `CRATES_IO_PUBLISH_ENABLED=true`.
+4. The next tagged release publishes through OIDC automatically.
+
+Until step 3 happens, the real job stays skipped and requests no
+credential.
+
+Crate publishing to crates.io also stays gated behind the separate
+approval above.
+
+The exact rollback and yank notes will be filled in before 1.0.
