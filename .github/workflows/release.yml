@@ -173,8 +173,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh attestation verify dist/*.tar.gz -R "$GITHUB_REPOSITORY"
-          gh attestation verify dist/*.cdx.json -R "$GITHUB_REPOSITORY"
+          # gh takes a single artifact per invocation, so loop over the globs.
+          for f in dist/*.tar.gz dist/*.cdx.json; do
+            gh attestation verify "$f" -R "$GITHUB_REPOSITORY"
+          done
       - name: Publish draft release
         if: env.DRY_RUN == 'false'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
