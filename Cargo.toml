@@ -24,6 +24,9 @@ include = [
     "/LICENSE-MIT",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [[bin]]
 name = "atx"
 path = "src/main.rs"
