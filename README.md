@@ -17,7 +17,18 @@ It runs commands directly by default, keeps a local history in SQLite, and has
 no server or account. An optional per-user service can keep the scheduler
 running across supervisor crashes.
 
-ATX is in local release testing and is not published yet.
+## Install
+
+From crates.io (recommended; the binary is self-contained):
+
+```console
+cargo install atx
+```
+
+Prebuilt static musl binaries for Linux (`x86_64`, `aarch64`) and macOS
+builds are attached to each [release](https://github.com/jsugg/atx/releases).
+Download the archive for your platform, verify the SHA-256 checksum, and put
+the `atx` binary on your `PATH`.
 
 ## What it promises
 
