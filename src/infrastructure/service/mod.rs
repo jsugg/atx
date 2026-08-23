@@ -40,8 +40,7 @@ impl NativeServiceManager {
         #[cfg(target_os = "linux")]
         {
             let config_home = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".config"));
+                .map_or_else(|| home.join(".config"), PathBuf::from);
             Self::Systemd(SystemdUserService::new(
                 executable,
                 state_directory,
