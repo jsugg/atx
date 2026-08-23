@@ -94,11 +94,22 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> "$GITHUB_ENV"
       - name: Build release binary
         run: cargo build --release --all-features --locked --target ${{ matrix.target }}
+      # Cross-built arm64 binaries cannot exec on the x86_64 runner.
+      - name: Install qemu user emulation
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static" \
+            >> "$GITHUB_ENV"
       - name: Smoke test binary
         run: |
           bin="target/${{ matrix.target }}/release/atx"
-          "$bin" --version | grep -qx "atx $(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
-          "$bin" doctor >/dev/null
+          run=()
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            run=(qemu-aarch64-static)
+          fi
+          "${run[@]}" "$bin" --version | grep -qx "atx $(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
+          "${run[@]}" "$bin" doctor >/dev/null
       - name: Stage deterministic layout
         run: |
           install -m 0755 "target/${{ matrix.target }}/release/atx" atx
