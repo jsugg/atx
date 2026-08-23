@@ -703,72 +703,57 @@ fn cancel_job(
         ));
     }
     let clock = NativeClock;
-    let now = clock.now_utc().map_err(management_store_error)?;
+    let mut now = clock.now_utc().map_err(management_store_error)?;
     let active = store
         .latest_active_run(job.id())
         .map_err(ManagementError::from)?;
-    // A concurrent cancel may win the revision race; re-reading turns that
-    // into the same idempotent outcome instead of a storage error.
-    let requested = match store.transition_job(
-        job.id(),
-        job.revision(),
-        JobState::CancelRequested,
-        false,
-        TransitionActor::Cli,
-        "cancel requested",
-        now,
-    ) {
-        Ok(requested) => requested,
-        Err(StoreError::Conflict) => {
-            // The monitor may have advanced a recurring job back to Waiting
-            // between our read and write; retry against the fresh revision.
-            let mut current = store
-                .load(job.id())
-                .map_err(management_store_error)?
-                .ok_or(ManagementError::NotFound)?;
-            let mut requested = None;
-            for _ in 0..8 {
-                if matches!(
-                    current.state(),
-                    JobState::CancelRequested | JobState::Cancelled
-                ) {
-                    return Ok(current);
-                }
-                if current.state().is_terminal() {
-                    break;
-                }
-                match store.transition_job(
-                    current.id(),
-                    current.revision(),
-                    JobState::CancelRequested,
-                    false,
-                    TransitionActor::Cli,
-                    "cancel requested",
-                    now,
-                ) {
-                    Ok(pending) => {
-                        requested = Some(pending);
-                        break;
-                    }
-                    Err(StoreError::Conflict) => {
-                        current = store
-                            .load(current.id())
-                            .map_err(management_store_error)?
-                            .ok_or(ManagementError::NotFound)?;
-                    }
-                    Err(error) => return Err(management_store_error(error)),
-                }
-            }
-            match requested {
-                Some(pending) => pending,
-                None => {
-                    return Err(ManagementError::StateConflict(
-                        "job changed state during cancellation",
-                    ));
-                }
-            }
+    // A concurrent cancel may win the revision race, and the monitor may have
+    // advanced a recurring job (raising its update time past our snapshot's);
+    // re-reading with a fresh timestamp turns both races into the same
+    // idempotent outcome instead of a storage error.
+    let mut current = job;
+    let mut requested = None;
+    for _ in 0..8 {
+        if matches!(
+            current.state(),
+            JobState::CancelRequested | JobState::Cancelled
+        ) {
+            return Ok(current);
         }
-        Err(error) => return Err(management_store_error(error)),
+        if current.state().is_terminal() {
+            break;
+        }
+        now = clock.now_utc().map_err(management_store_error)?;
+        match store.transition_job(
+            current.id(),
+            current.revision(),
+            JobState::CancelRequested,
+            false,
+            TransitionActor::Cli,
+            "cancel requested",
+            now,
+        ) {
+            Ok(pending) => {
+                requested = Some(pending);
+                break;
+            }
+            Err(error @ (StoreError::Conflict | StoreError::Domain(_))) => {
+                // Conflict: another writer moved the revision. Domain: the
+                // fresh snapshot carries a later update time than our stale
+                // `now`. Both resolve by reloading and retrying.
+                let _ = error;
+                current = store
+                    .load(current.id())
+                    .map_err(management_store_error)?
+                    .ok_or(ManagementError::NotFound)?;
+            }
+            Err(error) => return Err(management_store_error(error)),
+        }
+    }
+    let Some(requested) = requested else {
+        return Err(ManagementError::StateConflict(
+            "job changed state during cancellation",
+        ));
     };
 
     let Some(run) = active else {
