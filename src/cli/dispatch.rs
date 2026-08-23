@@ -1215,9 +1215,6 @@ fn build_execution(args: &SchedulingArgs, config: &Config) -> Result<ExecutionSp
 
 /// Resolve the device path of the submitter's own stdout terminal.
 fn resolve_submitting_tty() -> Result<PathBuf, String> {
-    use std::os::fd::AsFd;
-
-    let stdout = std::io::stdout();
     // NOTE: /dev/stdout reflects fd 1's actual target even when stdout is
     // redirected; the metadata check is what rejects pipes and files.
     let metadata = fs::metadata("/dev/stdout").map_err(|error| error.to_string())?;
@@ -1226,6 +1223,9 @@ fn resolve_submitting_tty() -> Result<PathBuf, String> {
     }
     #[cfg(target_os = "macos")]
     {
+        use std::os::fd::AsFd;
+
+        let stdout = std::io::stdout();
         rustix::fs::getpath(stdout.as_fd())
             .map(|path| PathBuf::from(path.to_string_lossy().into_owned()))
             .map_err(|error| error.to_string())
