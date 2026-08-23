@@ -282,7 +282,17 @@ fn cancel_after_completion_stays_idempotent() {
         &["--every", "1s", "--", "/bin/sh", "-c", script.as_str()],
     );
 
-    wait_for(|| fs::metadata(&done).is_ok(), "first occurrence");
+    // The marker is written before sh exits, so the run may still be in
+    // flight; cancelling mid-run reports the run's real outcome instead.
+    // Wait until the occurrence fully lands and the job returns to Waiting
+    // so the cancel deterministically wins the race.
+    wait_for(
+        || {
+            fs::metadata(&done).is_ok()
+                && states(&state, &submission.job_id).is_some_and(|(_, job)| job == "waiting")
+        },
+        "first occurrence",
+    );
     let cancelled = atx()
         .arg("--json")
         .arg("--state-dir")
