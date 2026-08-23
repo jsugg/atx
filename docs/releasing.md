@@ -13,4 +13,19 @@ Never use `--allow-dirty` or `--no-verify` for a release. The full local check,
 package file-list check, unpacked-package build, and
 `cargo publish --dry-run --locked` must pass first.
 
+## Binary archives
+
+Tagging a commit with a `v*` tag runs the release workflow: it checks the tag
+against the crate version, builds macOS arm64 and Linux x86_64/aarch64 musl
+binaries, packs each into a reproducible `.tar.gz` (fixed mtime, root
+ownership, so rebuilding the same commit gives identical bytes), and attaches
+them plus a `SHA256SUMS` to a draft GitHub release. Publishing the draft is a
+manual click.
+
+You can rehearse without cutting a tag: run the workflow by hand from the
+Actions tab and give it the tag name you have in mind. It builds everything
+but publishes nothing.
+
+Crate publishing to crates.io stays gated behind the separate approval above.
+
 The exact commands and rollback notes will be filled in before 1.0.
