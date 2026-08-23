@@ -1,2 +1,10 @@
-.local/
 .serena/
+target/
+dist/
+*.profraw
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+.local/
+mutants.out/
+.DS_Store

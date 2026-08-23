@@ -1,0 +1,13 @@
+# Security-sensitive paths require owner review.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @jsugg
+
+.github/workflows/ @jsugg
+Cargo.toml @jsugg
+Cargo.lock @jsugg
+deny.toml @jsugg
+migrations/ @jsugg
+src/infrastructure/process/ @jsugg
+src/infrastructure/time/ @jsugg
+src/infrastructure/service/ @jsugg
