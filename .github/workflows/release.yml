@@ -66,7 +66,9 @@ jobs:
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - name: linux-aarch64-musl
-            os: ubuntu-24.04
+            # Native arm64 runner: qemu-user's /proc reports a zeroed process
+            # group, which breaks real binary smoke tests (process identity).
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,46 +77,20 @@ jobs:
           toolchain: 1.97.0
           targets: ${{ matrix.target }}
       - name: Install musl tools
-        if: endsWith(matrix.target, '-musl')
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # The glibc aarch64 cross-compiler emits LFS/fortify symbols (open64,
-      # __memcpy_chk, ...) that musl does not provide; link against the real
-      # musl toolchain instead. platform.yml only cargo-checks this triple,
-      # so it never sees the difference.
-      - name: Install musl cross toolchain
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          curl -fsSL --retry 3 -o /tmp/musl.tar.gz \
-            https://github.com/musl-cc/musl.cc/releases/download/v0.0.1/aarch64-linux-musl-cross.tgz
-          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/musl.tar.gz" | sha256sum -c -
-          sudo mkdir -p /opt/musl-cross && sudo tar -xzf /tmp/musl.tar.gz -C /opt/musl-cross --strip-components=1
-          echo "/opt/musl-cross/bin" >> "$GITHUB_PATH"
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" \
-            >> "$GITHUB_ENV"
-          echo "AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar" >> "$GITHUB_ENV"
       - name: Build release binary
         run: cargo build --release --all-features --locked --target ${{ matrix.target }}
-      # Cross-built arm64 binaries cannot exec on the x86_64 runner.
-      - name: Install qemu user emulation
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update && sudo apt-get install -y qemu-user-static
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64-static" \
-            >> "$GITHUB_ENV"
       - name: Smoke test binary
         run: |
           bin="target/${{ matrix.target }}/release/atx"
-          run=()
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            run=(qemu-aarch64-static)
-          fi
-          "${run[@]}" "$bin" --version | grep -qx "atx $(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
+          "$bin" --version | grep -qx "atx $(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
           # doctor checks real directory ownership/mode, so point it at a
           # private scratch state dir with a writable runtime dir.
           export HOME="$PWD/.smoke-home" XDG_RUNTIME_DIR="$PWD/.smoke-runtime"
           mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
           chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
-          "${run[@]}" "$bin" --state-dir "$HOME/state" doctor
+          "$bin" --state-dir "$HOME/state" doctor
       - name: Stage deterministic layout
         run: |
           install -m 0755 "target/${{ matrix.target }}/release/atx" atx
