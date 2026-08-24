@@ -3,11 +3,17 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdout, Command, Output, Stdio};
+use std::time::Duration;
 
 use thiserror::Error;
 
 use super::{NativeProcessInspector, ProcessError};
 use crate::domain::{ExecutionMode, ExecutionSpec, ProcessIdentitySnapshot};
+
+/// Identity-inspection attempts before a spawn is declared failed.
+const INSPECTION_ATTEMPTS: usize = 5;
+/// Delay between identity-inspection retries.
+const INSPECTION_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug)]
 pub(crate) struct NativeProcessRunner {
@@ -50,16 +56,29 @@ impl NativeProcessRunner {
             .process_group(0);
 
         let mut child = command.spawn()?;
-        let identity = match self.inspector.inspect(child.id()) {
-            Ok(Some(identity)) => identity,
-            Ok(None) => {
-                reap_failed_spawn(&mut child);
-                return Err(SpawnError::ExitedBeforeInspection);
+        // A fast-exiting command can finish before the one-shot identity
+        // inspection observes it; under load the inspection itself can also
+        // miss a live child. Both are races, not spawn failures, so retry
+        // briefly. The child stays unreaped meanwhile, and the inspector
+        // verifies the start token, so there is no PID-reuse risk.
+        let identity = 'identity: {
+            for attempts_left in (0..INSPECTION_ATTEMPTS).rev() {
+                match self.inspector.inspect(child.id()) {
+                    Ok(Some(identity)) => break 'identity identity,
+                    Ok(None) => {
+                        if child.try_wait()?.is_some() || attempts_left == 0 {
+                            reap_failed_spawn(&mut child);
+                            return Err(SpawnError::ExitedBeforeInspection);
+                        }
+                        std::thread::sleep(INSPECTION_RETRY_DELAY);
+                    }
+                    Err(error) => {
+                        reap_failed_spawn(&mut child);
+                        return Err(SpawnError::Inspection(error));
+                    }
+                }
             }
-            Err(error) => {
-                reap_failed_spawn(&mut child);
-                return Err(SpawnError::Inspection(error));
-            }
+            unreachable!("retry loop always breaks or returns");
         };
         if i32::try_from(identity.pid) != Ok(identity.process_group_id) {
             reap_failed_spawn(&mut child);
