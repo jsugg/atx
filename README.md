@@ -1,5 +1,8 @@
 # ATX
 
+[![quality gates](https://github.com/jsugg/atx/actions/workflows/ci.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/ci.yml)
+[![tests](https://github.com/jsugg/atx/actions/workflows/platform.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/platform.yml)
+[![security](https://github.com/jsugg/atx/actions/workflows/security.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/security.yml)
 [![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx)
 [![Documentation](https://docs.rs/atx/badge.svg)](https://docs.rs/atx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
