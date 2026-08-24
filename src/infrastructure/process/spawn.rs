@@ -11,7 +11,7 @@ use super::{NativeProcessInspector, ProcessError};
 use crate::domain::{ExecutionMode, ExecutionSpec, ProcessIdentitySnapshot};
 
 /// Identity-inspection attempts before a spawn is declared failed.
-const INSPECTION_ATTEMPTS: usize = 5;
+const INSPECTION_ATTEMPTS: usize = 20;
 /// Delay between identity-inspection retries.
 const INSPECTION_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -66,10 +66,14 @@ impl NativeProcessRunner {
                 match self.inspector.inspect(child.id()) {
                     Ok(Some(identity)) => break 'identity identity,
                     Ok(None) => {
-                        if child.try_wait()?.is_some() || attempts_left == 0 {
+                        if attempts_left == 0 {
                             reap_failed_spawn(&mut child);
                             return Err(SpawnError::ExitedBeforeInspection);
                         }
+                        // The child stays unreaped while retrying: a zombie
+                        // pins the PID, so there is no reuse risk, and on
+                        // some platforms an exited-but-unreaped child is
+                        // still inspectable.
                         std::thread::sleep(INSPECTION_RETRY_DELAY);
                     }
                     Err(error) => {
