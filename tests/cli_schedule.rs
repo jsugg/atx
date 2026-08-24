@@ -387,3 +387,196 @@ fn wait_for_history(state: &std::path::Path, job: &str) {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn env_sources_reach_the_run_environment() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+
+    // Inline --env KEY=VALUE.
+    let inline = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args([
+            "1s",
+            "--env",
+            "GAP_INLINE=inline-value",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf %s \"$GAP_INLINE\"",
+        ])
+        .output()
+        .expect("submit inline env job");
+    assert!(inline.status.success(), "{inline:?}");
+    let value: serde_json::Value = serde_json::from_slice(&inline.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+    wait_for_history(&state, job);
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read inline env output");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(text.contains("inline-value"), "stdout missing: {text:?}");
+
+    // --env-file KEY=VALUE lines.
+    let env_file = root.path().join("gap.env");
+    fs::write(&env_file, "GAP_FILE=file-value\n").expect("write env file");
+    let from_file = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--env-file"])
+        .arg(&env_file)
+        .args(["--", "/bin/sh", "-c", "printf %s \"$GAP_FILE\""])
+        .output()
+        .expect("submit env-file job");
+    assert!(from_file.status.success(), "{from_file:?}");
+    let value: serde_json::Value = serde_json::from_slice(&from_file.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("file job ID");
+    wait_for_history(&state, job);
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read env-file output");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(text.contains("file-value"), "stdout missing: {text:?}");
+}
+
+#[test]
+fn capture_env_controls_whole_environment_snapshot() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let probe = "/bin/sh -c 'printf %s \"$GAP_CAPTURE\"'";
+
+    // Default: sanitized environment must not leak the parent's extra var.
+    let sanitized = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .env("GAP_CAPTURE", "leaked")
+        .args(["1s", "--", "/bin/sh", "-c"])
+        .arg(probe)
+        .output()
+        .expect("submit sanitized job");
+    assert!(sanitized.status.success(), "{sanitized:?}");
+    let value: serde_json::Value = serde_json::from_slice(&sanitized.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+    wait_for_history(&state, job);
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read sanitized output");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(!text.contains("leaked"), "environment leaked: {text:?}");
+
+    // --capture-env snapshots the full parent environment for this run.
+    let captured = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .env("GAP_CAPTURE", "captured")
+        .args(["1s", "--capture-env", "--", "/bin/sh", "-c"])
+        .arg(probe)
+        .output()
+        .expect("submit captured job");
+    assert!(captured.status.success(), "{captured:?}");
+    let value: serde_json::Value = serde_json::from_slice(&captured.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+    wait_for_history(&state, job);
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read captured output");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(text.contains("captured"), "capture failed: {text:?}");
+}
+
+#[test]
+fn name_and_description_roundtrip_through_show() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args([
+            "--name",
+            "gap-named-job",
+            "--description",
+            "gap coverage description",
+            "1h",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("submit named job");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let value: serde_json::Value = serde_json::from_slice(&submitted.stdout).expect("JSON");
+    let job = value["data"]["job_id"].as_str().expect("job ID");
+
+    let shown = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["show", job])
+        .output()
+        .expect("show named job");
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("JSON");
+    assert_eq!(shown["data"]["name"], "gap-named-job");
+    assert_eq!(shown["data"]["description"], "gap coverage description");
+
+    let listed = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("list")
+        .output()
+        .expect("list jobs");
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("JSON");
+    assert!(
+        listed.to_string().contains("gap-named-job"),
+        "name missing from list: {listed}"
+    );
+}
+
+#[test]
+fn color_flag_toggles_ansi_markers() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+
+    let always = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--color", "always", "doctor"])
+        .output()
+        .expect("doctor always-color");
+    assert!(always.status.success(), "{always:?}");
+    let text = String::from_utf8(always.stdout).expect("UTF-8");
+    assert!(text.contains("\x1b["), "no ANSI codes with --color always");
+
+    let never = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--color", "never", "doctor"])
+        .output()
+        .expect("doctor never-color");
+    assert!(never.status.success(), "{never:?}");
+    let text = String::from_utf8(never.stdout).expect("UTF-8");
+    assert!(!text.contains("\x1b["), "ANSI codes with --color never");
+}

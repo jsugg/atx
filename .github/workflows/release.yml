@@ -65,9 +65,16 @@ jobs:
             # Native Intel runner, so the smoke test runs without Rosetta.
             os: macos-15-intel
             target: x86_64-apple-darwin
+          - name: linux-x86_64-gnu
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
           - name: linux-x86_64-musl
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+          # Native runners with matching glibc, so no cross toolchain needed.
+          - name: linux-aarch64-gnu
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - name: linux-aarch64-musl
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
@@ -150,7 +157,7 @@ jobs:
           TAG_REF: ${{ inputs.tag || github.ref_name }}
         run: |
           ref="$TAG_REF"
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl; do
             test -s "dist/atx-$ref-$target.tar.gz" || {
               echo "::error::missing archive for $target"; exit 1;
             }

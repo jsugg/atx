@@ -169,7 +169,7 @@ pub(crate) enum ParsedCli {
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub(crate) enum ManagementCommand {
     /// List saved jobs.
-    #[command(alias = "ls")]
+    #[command(alias = "ls", after_long_help = LIST_EXAMPLES)]
     List {
         #[arg(long)]
         state: Option<String>,
@@ -177,15 +177,17 @@ pub(crate) enum ManagementCommand {
         limit: usize,
     },
     /// Show one job.
+    #[command(after_long_help = SHOW_EXAMPLES)]
     Show { job: String },
     /// Cancel one job.
+    #[command(after_long_help = CANCEL_EXAMPLES)]
     Cancel {
         job: String,
         #[arg(long)]
         grace: Option<String>,
     },
     /// Remove one job.
-    #[command(name = "rm")]
+    #[command(name = "rm", after_long_help = RM_EXAMPLES)]
     Remove {
         job: String,
         #[arg(long)]
@@ -194,24 +196,30 @@ pub(crate) enum ManagementCommand {
         keep_history: bool,
     },
     /// Run a saved job again.
+    #[command(after_long_help = RUN_EXAMPLES)]
     Run {
         job: String,
         #[arg(long)]
         yes: bool,
     },
     /// List live ATX processes.
+    #[command(after_long_help = PS_EXAMPLES)]
     Ps,
     /// List completed runs.
+    #[command(after_long_help = HISTORY_EXAMPLES)]
     History {
         job: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// Print captured output of one run.
+    #[command(after_long_help = OUTPUT_EXAMPLES)]
     Output { run: String },
     /// Check local configuration and state.
+    #[command(after_long_help = DOCTOR_EXAMPLES)]
     Doctor,
     /// Manage durable service integration.
+    #[command(after_long_help = SERVICE_EXAMPLES)]
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -219,6 +227,7 @@ pub(crate) enum ManagementCommand {
     /// Print version information.
     Version,
     /// Emit shell completion scripts.
+    #[command(after_long_help = COMPLETIONS_EXAMPLES)]
     Completions {
         /// Target shell for the generated script.
         #[arg(long, value_enum)]
@@ -318,6 +327,20 @@ EXAMPLES:
   atx --shell 10m -- 'printf \"done\\n\" >>\"$HOME/notes\"'
       Opt in to /bin/sh only when pipes or redirects are needed.
 
+  atx --env-file ./secrets.env 1h -- ./deploy
+      Import KEY=VALUE lines from a file into the job environment.
+
+  atx --capture-env 1h -- ./deploy
+      Snapshot the whole submitting environment for this one run.
+
+  atx --durable --missed run-latest 9:00 -- ./morning-check
+      Survive reboots via launchd/systemd; runs missed while the machine
+      was off are recovered with the chosen policy.
+
+  atx --tty 30s -- ./long-build
+      Echo captured output back to the submitting terminal when the run
+      finishes, even though the submitter has exited.
+
 EXIT STATUS:
   0    success
   1    operation finished with a negative job outcome
@@ -341,6 +364,105 @@ FILES:
 
 SEE ALSO:
   Full guide and JSON schema: https://github.com/jsugg/atx
+";
+
+const LIST_EXAMPLES: &str = "\
+EXAMPLES:
+  atx list --limit 20
+      Show the twenty most recent jobs.
+
+  atx list --json
+      Machine-readable job list.
+";
+
+const SHOW_EXAMPLES: &str = "\
+EXAMPLES:
+  atx show <job>
+      Print schedule, state, and last outcome for one job. IDs may be
+      given as a unique prefix.
+
+  atx show <job> --json
+      Same data as a single JSON object.
+";
+
+const CANCEL_EXAMPLES: &str = "\
+EXAMPLES:
+  atx cancel <job>
+      Cancel a waiting or running job with the default grace period.
+
+  atx cancel <job> --grace 5s
+      Give the process five seconds to exit before signaling harder.
+";
+
+const RM_EXAMPLES: &str = "\
+EXAMPLES:
+  atx rm <job> --cancel
+      Remove a live job, cancelling it first (refuses otherwise).
+
+  atx rm <job> --keep-history
+      Remove the job but keep its completed-run history.
+";
+
+const RUN_EXAMPLES: &str = "\
+EXAMPLES:
+  atx run <job>
+      Run a saved job again right now; asks for confirmation when the
+      job is already waiting or running.
+
+  atx run <job> --yes
+      Skip the confirmation prompt.
+";
+
+const PS_EXAMPLES: &str = "\
+EXAMPLES:
+  atx ps
+      Show supervisor and monitor processes with their roles and PIDs.
+";
+
+const HISTORY_EXAMPLES: &str = "\
+EXAMPLES:
+  atx history <job> --limit 10
+      Last ten runs of one job, newest first.
+
+  atx history --json
+      All recent runs across jobs as JSON.
+";
+
+const OUTPUT_EXAMPLES: &str = "\
+EXAMPLES:
+  atx output <run>
+      Print captured stdout and stderr for one run; a job ID resolves to
+      its latest run, truncated streams are labeled.
+
+  atx output <run> --json
+      Streams plus truncation flags in one JSON envelope.
+";
+
+const DOCTOR_EXAMPLES: &str = "\
+EXAMPLES:
+  atx doctor
+      Verify state/runtime directory ownership, modes, service wiring,
+      and database health; prints what is wrong, never guesses.
+";
+
+const SERVICE_EXAMPLES: &str = "\
+EXAMPLES:
+  atx service install
+      Install and start the launchd/systemd user service for durable jobs.
+
+  atx service status
+      Report whether the durable service is wired up and running.
+
+  atx service uninstall
+      Remove the service definition and stop it.
+";
+
+const COMPLETIONS_EXAMPLES: &str = "\
+EXAMPLES:
+  atx completions --shell zsh > \"${fpath[1]}/_atx\"
+  atx completions --shell bash > ~/.local/share/bash-completion/completions/atx
+  atx completions --shell fish > ~/.config/fish/completions/atx.fish
+  atx completions --shell power-shell >> $PROFILE
 ";
 
 fn normalize_management_order(args: &mut Vec<OsString>) {
