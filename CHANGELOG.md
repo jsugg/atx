@@ -36,6 +36,14 @@ versioning.
 
 ### Fixed
 
+- The supervisor now stops cleanly when a service manager sends
+  `SIGTERM`/`SIGINT`: the runtime socket and lock are removed and the
+  process exits with status 0 instead of dying on the default signal
+  disposition. It also creates its state directory when the service
+  unit did not provide one.
+- Two supervisors or clients initializing the same new state
+  directory concurrently no longer race: the loser briefly waits for
+  the winner's schema transaction instead of reporting corruption.
 - `atx rm` now honors its documented history contract: removing a job
   deletes its completed-run history unless `--keep-history` is given;
   previously the flag was accepted but ignored.
