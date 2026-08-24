@@ -15,7 +15,6 @@ permissions:
   contents: read
 
 concurrency:
-  # Never cancel an in-flight real release; a second tag push waits instead.
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
@@ -34,11 +33,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        # Dry run: the tag input only names what would be released; build the
-        # dispatching ref itself (the tag usually does not exist yet).
       - name: Tag matches Cargo.toml version
+        env:
+          TAG_REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          ref="${{ inputs.tag || github.ref_name }}"
+          ref="$TAG_REF"
           case "$ref" in
             v*) tag="${ref#v}" ;;
             *) echo "::error::tag must start with 'v' (got '$ref')"; exit 1 ;;
@@ -62,12 +61,14 @@ jobs:
           - name: macos-aarch64
             os: macos-15
             target: aarch64-apple-darwin
+          - name: macos-x86_64
+            # Native Intel runner, so the smoke test runs without Rosetta.
+            os: macos-15-intel
+            target: x86_64-apple-darwin
           - name: linux-x86_64-musl
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - name: linux-aarch64-musl
-            # Native arm64 runner: qemu-user's /proc reports a zeroed process
-            # group, which breaks real binary smoke tests (process identity).
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
     steps:
@@ -79,9 +80,6 @@ jobs:
       - name: Install musl tools
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      # On the arm64 runner musl-gcc already targets aarch64; cc-rs only
-      # knows to look for the cross-prefixed names, so point it at the
-      # host tools explicitly (host binutils are aarch64 too).
       - name: Point cc-rs at the host musl wrappers
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
@@ -132,12 +130,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
-      # Attestations are written through the repo's attestation API; the
-      # id-token sign step needs OIDC.
       id-token: write
       attestations: write
     env:
-      # Real releases only on tag pushes; workflow_dispatch is a dry run.
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -151,9 +146,11 @@ jobs:
           sha256sum -- *.tar.gz > SHA256SUMS
           cat SHA256SUMS
       - name: Verify every expected archive and SBOM is present
+        env:
+          TAG_REF: ${{ inputs.tag || github.ref_name }}
         run: |
-          ref="${{ inputs.tag || github.ref_name }}"
-          for target in aarch64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          ref="$TAG_REF"
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             test -s "dist/atx-$ref-$target.tar.gz" || {
               echo "::error::missing archive for $target"; exit 1;
             }
@@ -167,8 +164,6 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.cdx.json
-      # Gate: the same verification a consumer would run must pass here,
-      # including on the dry-run rehearsal (attestations are repo-scoped).
       - name: Verify attestations
         env:
           GH_TOKEN: ${{ github.token }}
