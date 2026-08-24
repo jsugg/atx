@@ -53,14 +53,29 @@ jobs:
             os: macos-15
             target: aarch64-apple-darwin
             tests: full
+          # Native Intel runner, so x86_64-apple-darwin gets real coverage.
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            tests: full
           - name: linux-x86_64-glibc
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             tests: full
+          # Native arm64 runner, so both aarch64 triples run their tests
+          # instead of compile-only cross-checks.
+          - name: linux-aarch64-glibc
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            tests: full
+          - name: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            tests: full
           - name: linux-x86_64-musl
             os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
-            tests: smoke
+            tests: full
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
