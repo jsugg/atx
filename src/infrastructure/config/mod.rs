@@ -324,7 +324,7 @@ pub(crate) enum ConfigError {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{ConfigOverrides, RuntimeTier, load_config};
+    use super::{ColorMode, ConfigOverrides, RuntimeTier, Verbosity, load_config};
 
     fn env(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values
@@ -402,5 +402,177 @@ mod tests {
         assert!(!output.contains(unrelated_secret));
         assert!(output.contains("\"verbosity\":\"quiet\""));
         assert!(output.contains("\"max_log_bytes_per_stream\":10485760"));
+    }
+
+    #[test]
+    fn numeric_environment_variables_reject_unparseable_values() {
+        for (key, value) in [
+            ("ATX_HISTORY_DAYS", "not-a-number"),
+            ("ATX_TERMINAL_JOB_DAYS", "abc"),
+            ("ATX_MAX_LOG_BYTES_PER_STREAM", "huge"),
+        ] {
+            assert!(
+                load_config(None, &env(&[(key, value)]), ConfigOverrides::default()).is_err(),
+                "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn enum_environment_variables_reject_unknown_values() {
+        for (key, value) in [
+            ("ATX_DEFAULT_RUNTIME", "batch"),
+            ("ATX_COLOR", "sometimes"),
+            ("ATX_VERBOSITY", "loud"),
+        ] {
+            assert!(
+                load_config(None, &env(&[(key, value)]), ConfigOverrides::default()).is_err(),
+                "{key}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_enum_environment_variables_parse_into_their_variants() {
+        let config = load_config(
+            None,
+            &env(&[
+                ("ATX_DEFAULT_RUNTIME", "durable"),
+                ("ATX_COLOR", "always"),
+                ("ATX_VERBOSITY", "verbose"),
+            ]),
+            ConfigOverrides::default(),
+        )
+        .expect("valid enum environment");
+
+        assert_eq!(config.default_runtime(), RuntimeTier::Durable);
+        assert_eq!(config.color(), ColorMode::Always);
+        assert_eq!(config.verbosity(), Verbosity::Verbose);
+    }
+
+    #[test]
+    fn timezone_default_and_valid_named_zone_are_accepted() {
+        assert_eq!(
+            load_config(None, &[], ConfigOverrides::default())
+                .expect("default config")
+                .default_timezone(),
+            "local"
+        );
+
+        let config = load_config(
+            None,
+            &env(&[("ATX_DEFAULT_TIMEZONE", "UTC")]),
+            ConfigOverrides::default(),
+        )
+        .expect("valid named timezone");
+        assert_eq!(config.default_timezone(), "UTC");
+    }
+
+    #[test]
+    fn shell_default_and_absolute_path_are_accepted() {
+        assert_eq!(
+            load_config(None, &[], ConfigOverrides::default())
+                .expect("default config")
+                .default_shell(),
+            std::path::Path::new("/bin/sh")
+        );
+
+        let config = load_config(
+            None,
+            &env(&[("ATX_DEFAULT_SHELL", "/usr/bin/zsh")]),
+            ConfigOverrides::default(),
+        )
+        .expect("absolute shell path");
+        assert_eq!(config.default_shell(), std::path::Path::new("/usr/bin/zsh"));
+    }
+
+    #[test]
+    fn overrides_populate_every_configurable_field() {
+        let config = load_config(
+            None,
+            &[],
+            ConfigOverrides {
+                default_timezone: Some("UTC".to_owned()),
+                default_runtime: Some(RuntimeTier::Durable),
+                default_shell: Some(std::path::PathBuf::from("/bin/bash")),
+                cancel_grace: Some("5s".to_owned()),
+                history_days: Some(7),
+                terminal_job_days: Some(14),
+                max_log_bytes_per_stream: Some(1024),
+                color: Some(ColorMode::Never),
+                verbosity: Some(Verbosity::Quiet),
+            },
+        )
+        .expect("fully overridden config");
+
+        assert_eq!(config.default_timezone(), "UTC");
+        assert_eq!(config.default_runtime(), RuntimeTier::Durable);
+        assert_eq!(config.default_shell(), std::path::Path::new("/bin/bash"));
+        assert_eq!(config.cancel_grace().to_string(), "5s");
+        assert_eq!(config.history_days(), 7);
+        assert_eq!(config.terminal_job_days(), 14);
+        assert_eq!(config.max_log_bytes_per_stream(), 1024);
+        assert_eq!(config.color(), ColorMode::Never);
+        assert_eq!(config.verbosity(), Verbosity::Quiet);
+    }
+
+    #[test]
+    fn max_log_bytes_accepts_bounds_and_rejects_out_of_range() {
+        assert_eq!(
+            load_config(
+                None,
+                &env(&[("ATX_MAX_LOG_BYTES_PER_STREAM", "1")]),
+                ConfigOverrides::default(),
+            )
+            .expect("minimum accepted")
+            .max_log_bytes_per_stream(),
+            1
+        );
+        assert_eq!(
+            load_config(
+                None,
+                &env(&[("ATX_MAX_LOG_BYTES_PER_STREAM", "1073741824")]),
+                ConfigOverrides::default(),
+            )
+            .expect("maximum accepted")
+            .max_log_bytes_per_stream(),
+            1024 * 1024 * 1024
+        );
+        assert!(
+            load_config(
+                None,
+                &env(&[("ATX_MAX_LOG_BYTES_PER_STREAM", "1073741825")]),
+                ConfigOverrides::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn full_toml_document_parses_with_defaults_for_omitted_fields() {
+        let config = load_config(
+            Some(
+                "default_timezone = \"local\"\n\
+                 default_runtime = \"session\"\n\
+                 default_shell = \"/bin/sh\"\n\
+                 cancel_grace = \"10s\"\n\
+                 history_days = 30\n\
+                 terminal_job_days = 30\n\
+                 max_log_bytes_per_stream = 10485760\n\
+                 color = \"auto\"\n\
+                 verbosity = \"normal\"",
+            ),
+            &[],
+            ConfigOverrides::default(),
+        )
+        .expect("fully specified inline config");
+
+        assert_eq!(config.default_timezone(), "local");
+        assert_eq!(config.cancel_grace().to_string(), "10s");
+        assert_eq!(config.history_days(), 30);
+        assert_eq!(config.terminal_job_days(), 30);
+        assert_eq!(config.max_log_bytes_per_stream(), 10 * 1024 * 1024);
+        assert_eq!(config.color(), ColorMode::Auto);
+        assert_eq!(config.verbosity(), Verbosity::Normal);
     }
 }
