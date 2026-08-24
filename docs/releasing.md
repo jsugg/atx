@@ -66,4 +66,69 @@ credential.
 Crate publishing to crates.io also stays gated behind the separate
 approval above.
 
-The exact rollback and yank notes will be filled in before 1.0.
+## Release process, step by step
+
+1. Land changes on `main` (PRs only — the `protect-main` ruleset blocks
+   direct pushes).
+2. Move items from `## Unreleased` to a new `## [X.Y.Z] - YYYY-MM-DD`
+   section in `CHANGELOG.md`, and set `version = "X.Y.Z"` in `Cargo.toml`.
+3. Open that as a PR; once it is green and merged, tag the merge commit:
+   `git tag -a vX.Y.Z <commit> && git push origin vX.Y.Z` (sign the tag
+   too if you have a signing key set up).
+4. The release workflow builds, attests, and verifies everything, then
+   attaches it to a **draft** GitHub release. Review the artifacts,
+   checksums, and attestations, then publish the release.
+5. If crate publishing is switched on (`CRATES_IO_PUBLISH_ENABLED=true`),
+   publishing the release also triggers the crates.io job: it re-checks
+   tag/manifest/changelog agreement and refuses to republish.
+
+Before the first public version there is one extra bootstrap, done once:
+
+- Check `atx` is free on crates.io.
+- After the exact publish approval, run the first
+  `cargo publish --locked` by hand with a short-lived credential.
+- On crates.io, configure the trusted publisher (repository `jsugg/atx`,
+  workflow `publish-crates-io.yml`, environment `crates-io`), then revoke
+  the bootstrap credential.
+- Set the repository variable `CRATES_IO_PUBLISH_ENABLED=true`. From the
+  next tagged release on, publishing goes through OIDC with no stored
+  token.
+
+Repository protection worth knowing about: `main` is covered by the
+`protect-main` ruleset (PRs required, no force-push, no deletion), and
+the `release` and `crates-io` GitHub environments gate anything that
+touches published artifacts or the registry.
+
+## Rolling back
+
+Published binary releases are immutable: a tag points at a commit, and
+artifacts are checksummed and attested. There is no "fixing" a bad
+release — you cut a new one. If a release is broken:
+
+1. Yank nothing yet; first decide how bad it is (see criteria below).
+2. Fix forward: cut `vX.Y+1` with the fix, following the normal process.
+3. If the draft release has not been published yet, just fix and re-run;
+   drafts can be deleted freely.
+4. Point any announcements at the fixed release.
+
+A crate version on crates.io can be **yanked**, which stops new projects
+from picking it up without breaking existing lockfiles:
+`cargo yank --version X.Y.Z` (or undo with `--undo`). Yank when a version
+builds fine but is wrong — a logic bug, a regression, a bad dependency
+floor. Do not yank for a security problem alone; see below. Yank
+sparingly: `cargo update` will not pick a yanked version back after a
+project leaves it.
+
+If a release contains something genuinely dangerous (leaked secret,
+malicious code, data-loss bug):
+
+1. Yank the affected crate versions immediately.
+2. Replace leaked secrets everywhere they were used, not just where they
+   were published.
+3. Publish a fixed release and a changelog entry saying what happened.
+4. Delete the broken binary assets from the GitHub release and note the
+   reason on the release page, so nobody downloads them by accident.
+5. Write down what went wrong in the issue tracker while it is fresh.
+
+Tags are never moved or deleted once public; history stays honest even
+when releases do not.
