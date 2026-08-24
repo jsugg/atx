@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::fs;
 use std::process::{Command, Stdio};
@@ -356,6 +356,17 @@ fn tty_flag_rejects_pipe_stdout_before_creating_state() {
     assert!(!state.exists());
 }
 
+fn wait_for(predicate: impl Fn() -> bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for {what}");
+}
+
 /// Wait until `atx history <job>` shows at least one terminal run.
 fn wait_for_history(state: &std::path::Path, job: &str) {
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -579,4 +590,356 @@ fn color_flag_toggles_ansi_markers() {
     assert!(never.status.success(), "{never:?}");
     let text = String::from_utf8(never.stdout).expect("UTF-8");
     assert!(!text.contains("\x1b["), "ANSI codes with --color never");
+}
+
+#[test]
+fn rm_refuses_live_then_removes_terminal_jobs() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+
+    // Live (waiting) job: plain rm refuses with a state conflict; --cancel
+    // removes it.
+    let live = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1h", "--", "/bin/true"])
+        .output()
+        .expect("submit live job");
+    assert!(live.status.success(), "{live:?}");
+    let live_job = serde_json::from_slice::<serde_json::Value>(&live.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("live job ID")
+        .to_owned();
+
+    let refused = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["rm", &live_job])
+        .output()
+        .expect("rm live job");
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    let error: serde_json::Value = serde_json::from_slice(&refused.stderr).expect("JSON error");
+    assert_eq!(error["error"]["code"], "STATE_CONFLICT");
+
+    let removed = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["rm", &live_job, "--cancel"])
+        .output()
+        .expect("rm --cancel live job");
+    assert!(removed.status.success(), "{removed:?}");
+
+    let listed = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("list")
+        .output()
+        .expect("list after rm");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("JSON");
+    assert!(
+        !listed.to_string().contains(&live_job),
+        "removed job still listed: {listed}"
+    );
+
+    // Terminal job: removal drops history unless --keep-history.
+    for keep in [false, true] {
+        let done = atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["1s", "--", "/bin/true"])
+            .output()
+            .expect("submit terminal-candidate job");
+        assert!(done.status.success(), "{done:?}");
+        let job = serde_json::from_slice::<serde_json::Value>(&done.stdout).expect("JSON")["data"]
+            ["job_id"]
+            .as_str()
+            .expect("job ID")
+            .to_owned();
+        wait_for_history(&state, &job);
+
+        let mut args = vec!["rm", job.as_str()];
+        if keep {
+            args.push("--keep-history");
+        }
+        let removed = atx()
+            .arg("--state-dir")
+            .arg(&state)
+            .args(args)
+            .output()
+            .expect("rm terminal job");
+        assert!(removed.status.success(), "{removed:?}");
+
+        // The job record is gone either way, so per-job lookups fail; the
+        // global history listing is what shows whether runs were retained.
+        let history = atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("history")
+            .output()
+            .expect("global history after rm");
+        assert!(history.status.success(), "{history:?}");
+        let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("JSON");
+        let rows = history["data"]
+            .as_array()
+            .expect("history rows")
+            .iter()
+            .filter(|row| row["job_id"] == job.as_str())
+            .count();
+        if keep {
+            assert_eq!(rows, 1, "--keep-history must retain runs: {history}");
+        } else {
+            assert_eq!(rows, 0, "history must be dropped: {history}");
+        }
+    }
+}
+
+#[test]
+fn run_reruns_completed_job_and_appends_history() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/true"])
+        .output()
+        .expect("submit rerun candidate");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let job = serde_json::from_slice::<serde_json::Value>(&submitted.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_owned();
+    wait_for_history(&state, &job);
+
+    // A completed job reruns without confirmation.
+    let rerun = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["run", &job])
+        .output()
+        .expect("run completed job again");
+    assert!(rerun.status.success(), "{rerun:?}");
+
+    wait_for(
+        || {
+            let history = atx()
+                .arg("--json")
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["history", &job])
+                .output()
+                .expect("history count");
+            let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("JSON");
+            history["data"]
+                .as_array()
+                .is_some_and(|runs| runs.len() >= 2)
+        },
+        "second run to appear",
+    );
+}
+
+#[test]
+fn cancel_grace_escalates_to_kill_for_term_immune_process() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let marker = root.path().join("started");
+    // TERM is trapped away, so only the post-grace KILL can stop this run.
+    let script = format!("trap '' TERM; touch '{}'; sleep 30", marker.display());
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/sh", "-c"])
+        .arg(script)
+        .output()
+        .expect("submit term-immune job");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let job = serde_json::from_slice::<serde_json::Value>(&submitted.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_owned();
+
+    wait_for_file(&marker);
+    let cancelled = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["cancel", &job, "--grace", "2s"])
+        .output()
+        .expect("cancel term-immune job");
+    assert!(cancelled.status.success(), "{cancelled:?}");
+    wait_for_history(&state, &job);
+
+    let history = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["history", &job])
+        .output()
+        .expect("history of cancelled run");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("JSON");
+    assert_eq!(history["data"][0]["state"], "cancelled");
+}
+
+#[test]
+fn cwd_runs_child_in_requested_directory() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let workdir = root.path().join("workdir");
+    fs::create_dir(&workdir).expect("create workdir");
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--cwd"])
+        .arg(&workdir)
+        .args(["--", "/bin/pwd"])
+        .output()
+        .expect("submit cwd job");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let job = serde_json::from_slice::<serde_json::Value>(&submitted.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_owned();
+    wait_for_history(&state, &job);
+
+    let shown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("output")
+        .arg(job)
+        .output()
+        .expect("read pwd output");
+    let text = String::from_utf8(shown.stdout).expect("UTF-8");
+    assert!(
+        text.contains(
+            workdir
+                .canonicalize()
+                .expect("canonical workdir")
+                .to_str()
+                .expect("UTF-8 path")
+        ),
+        "child did not run in --cwd directory: {text:?}"
+    );
+}
+
+#[test]
+fn dst_policy_resolves_fold_and_reject_is_usage_error() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    // 2099-11-01 01:30 America/New_York is inside the fall-back fold: local
+    // 01:30 happens twice (EDT -04:00 then EST -05:00).
+    let due = |policy: &str| {
+        atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .args([
+                "--dry-run",
+                "--tz",
+                "America/New_York",
+                "--dst",
+                policy,
+                "2099-11-01 01:30",
+                "--",
+                "/bin/true",
+            ])
+            .output()
+            .expect("dry-run fold time")
+    };
+
+    let earlier = due("earlier");
+    assert!(earlier.status.success(), "{earlier:?}");
+    let earlier: serde_json::Value = serde_json::from_slice(&earlier.stdout).expect("JSON");
+    let later = due("later");
+    assert!(later.status.success(), "{later:?}");
+    let later: serde_json::Value = serde_json::from_slice(&later.stdout).expect("JSON");
+    assert_ne!(
+        earlier["data"]["next_due_utc"], later["data"]["next_due_utc"],
+        "fold policies must resolve to distinct instants"
+    );
+
+    let rejected = due("reject");
+    assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+    assert!(!state.exists());
+}
+
+#[test]
+fn completions_emit_scripts_for_every_shell() {
+    for shell in ["bash", "zsh", "fish", "power-shell"] {
+        let output = atx()
+            .args(["completions", "--shell", shell])
+            .output()
+            .expect("generate completions");
+        assert!(output.status.success(), "{shell}: {output:?}");
+        let script = String::from_utf8(output.stdout).expect("UTF-8 script");
+        assert!(
+            !script.is_empty(),
+            "{shell} completion script must not be empty"
+        );
+    }
+}
+
+#[test]
+fn ps_lists_monitor_and_command_roles_while_job_runs() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let marker = root.path().join("started");
+    let script = format!("touch '{}'; sleep 30", marker.display());
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/sh", "-c"])
+        .arg(script)
+        .output()
+        .expect("submit ps candidate");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let job = serde_json::from_slice::<serde_json::Value>(&submitted.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_owned();
+
+    wait_for_file(&marker);
+
+    let mut monitor_seen = false;
+    let mut command_seen = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(monitor_seen && command_seen) {
+        let listed = atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("ps")
+            .output()
+            .expect("run ps");
+        assert!(listed.status.success(), "{listed:?}");
+        let value: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("ps JSON");
+        for row in value["data"].as_array().into_iter().flatten() {
+            monitor_seen |= row["role"] == "monitor";
+            command_seen |= row["role"] == "command";
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ps missing roles (monitor={monitor_seen} command={command_seen})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let cancelled = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["cancel", &job])
+        .output()
+        .expect("cancel ps candidate");
+    assert!(cancelled.status.success(), "{cancelled:?}");
 }

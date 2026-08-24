@@ -416,7 +416,7 @@ EXAMPLES:
 const PS_EXAMPLES: &str = "\
 EXAMPLES:
   atx ps
-      Show supervisor and monitor processes with their roles and PIDs.
+      Show live monitor and command processes with their roles and PIDs.
 ";
 
 const HISTORY_EXAMPLES: &str = "\

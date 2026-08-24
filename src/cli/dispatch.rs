@@ -630,7 +630,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         ManagementCommand::Remove {
             job,
             cancel,
-            keep_history: _,
+            keep_history,
         } => {
             let current = resolve_job(&store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
@@ -638,7 +638,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 cancel_job(&mut store, job, config.cancel_grace())
                     .map_err(|error| management_cli_error(global.json, error))?;
             }
-            let removed = remove_job(&mut store, job)
+            let removed = remove_job(&mut store, job, *keep_history)
                 .map_err(|error| management_cli_error(global.json, error))?;
             render_job(&removed, global);
         }

@@ -36,6 +36,9 @@ versioning.
 
 ### Fixed
 
+- `atx rm` now honors its documented history contract: removing a job
+  deletes its completed-run history unless `--keep-history` is given;
+  previously the flag was accepted but ignored.
 - launchd availability probing no longer depends on the host
   environment during tests.
 

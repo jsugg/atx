@@ -411,6 +411,110 @@ fn recurring_survives_monitor_loss_between_occurrences() {
     assert!(cancelled.status.success(), "{cancelled:?}");
 }
 
+/// `--missed run-latest` on a job whose deadline passes while no supervisor
+/// lives: the next supervisor start re-arms the deadline immediately and the
+/// command executes exactly once, late.
+#[test]
+fn missed_run_latest_executes_once_after_recovery() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let marker = root.path().join("late");
+
+    let due = due_utc_from_now(3);
+    let output = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("--utc")
+        .arg(due)
+        .args(["--missed", "run-latest", "--", "/usr/bin/touch"])
+        .arg(&marker)
+        .output()
+        .expect("submit run-latest job");
+    assert!(output.status.success(), "{output:?}");
+    let job_id = serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("JSON")["data"]
+        ["job_id"]
+        .as_str()
+        .expect("job ID")
+        .to_owned();
+
+    // Supervisor dies before the deadline; deadline passes unwatched.
+    kill_state_supervisors(&state);
+    std::thread::sleep(Duration::from_millis(3_500));
+    assert!(!marker.exists(), "ran while no supervisor was alive");
+
+    poke_supervisor(&state);
+    wait_for(
+        || fs::metadata(&marker).is_ok(),
+        "late run-latest execution",
+    );
+
+    // Exactly one execution: the recovery re-arm is not a catch-up loop.
+    std::thread::sleep(Duration::from_secs(1));
+    let history = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["history", &job_id])
+        .output()
+        .expect("history");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+    assert_eq!(
+        history["data"].as_array().map(Vec::len),
+        Some(1),
+        "run-latest must execute once, not once per elapsed interval: {history}"
+    );
+}
+
+/// `--missed skip` on a recurring job that misses occurrences while no
+/// supervisor lives: recovery advances to the next anchor and never replays
+/// the missed occurrences as a burst.
+#[test]
+fn missed_skip_advances_recurring_without_catchup_burst() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let marker = root.path().join("skip");
+
+    let script = format!("printf 'x\\n' >>'{}'", marker.display());
+    let output = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--every", "1s", "--missed", "skip", "--", "/bin/sh", "-c"])
+        .arg(script)
+        .output()
+        .expect("submit skip-recurring job");
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let job_id = value["data"]["job_id"].as_str().expect("job ID").to_owned();
+
+    // Supervisor dies right after submission; at least three 1s occurrences
+    // pass with nothing running.
+    kill_state_supervisors(&state);
+    std::thread::sleep(Duration::from_millis(3_200));
+    assert_eq!(line_count(&marker), 0, "ran while no supervisor was alive");
+
+    poke_supervisor(&state);
+    count_lines_at_least(&marker, 1);
+
+    // No catch-up burst: within one interval of the first post-recovery run
+    // there may be at most the recovered occurrence plus one fresh tick.
+    std::thread::sleep(Duration::from_secs(1));
+    let occurrences = line_count(&marker);
+    assert!(
+        occurrences <= 2,
+        "skip replayed missed occurrences as a burst ({occurrences})"
+    );
+
+    let cancelled = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["cancel", &job_id])
+        .output()
+        .expect("cancel skip-recurring job");
+    assert!(cancelled.status.success(), "{cancelled:?}");
+}
+
 // --- helpers ---------------------------------------------------------------
 
 fn history_length(state_dir: &std::path::Path, job_id: &str) -> usize {

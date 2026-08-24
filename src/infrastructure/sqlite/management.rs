@@ -48,8 +48,10 @@ impl ManagementStore for JobStore {
         &mut self,
         job_id: JobId,
         expected_revision: Revision,
+        keep_history: bool,
     ) -> Result<Job, ManagementStoreError> {
-        hide_job(self, job_id, expected_revision).map_err(|error| management_error(&error))
+        hide_job(self, job_id, expected_revision, keep_history)
+            .map_err(|error| management_error(&error))
     }
 
     fn prepare_rerun(
@@ -165,11 +167,21 @@ fn hide_job(
     store: &mut JobStore,
     job_id: JobId,
     expected_revision: Revision,
+    keep_history: bool,
 ) -> Result<Job, StoreError> {
     let job = store.load(job_id)?.ok_or(StoreError::NotFound)?;
-    let changed = store
-        .database
-        .connection()
+    let connection = store.database.connection_mut();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_write_error)?;
+    // Default removal drops the completed-run history with the job;
+    // --keep-history hides only. Transitions stay as the audit trail.
+    if !keep_history {
+        transaction
+            .execute("DELETE FROM runs WHERE job_id = ?1", [job_id.to_string()])
+            .map_err(map_write_error)?;
+    }
+    let changed = transaction
         .execute(
             "UPDATE jobs SET hidden = 1
              WHERE id = ?1 AND revision = ?2 AND hidden = 0
@@ -178,8 +190,10 @@ fn hide_job(
         )
         .map_err(map_write_error)?;
     if changed == 1 {
+        transaction.commit().map_err(map_write_error)?;
         Ok(job)
     } else {
+        // Transaction drops without commit: the history delete rolls back.
         Err(StoreError::Conflict)
     }
 }
@@ -351,4 +365,70 @@ fn read_truncation_flag(
 
 fn output_store_error(message: &str) -> RunOutputStoreError {
     RunOutputStoreError(message.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::super::job_store::tests::sample_job;
+    use super::super::{Database, JobStore};
+    use super::{Job, hide_job};
+
+    fn run_row_count(store: &JobStore, job_id: String) -> i64 {
+        store
+            .database()
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM runs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .expect("run count")
+    }
+
+    /// Fixture: persisted job with one claimed run, forced into a terminal
+    /// state so `hide_job`'s state guard accepts it.
+    fn terminal_job_with_run(store: &mut JobStore, seed: i64) -> Job {
+        let job = sample_job(seed, seed + 30);
+        store.create(&job).expect("create job");
+        store
+            .claim_run(
+                job.id(),
+                crate::domain::UtcTimestamp::from_second(seed + 30).expect("scheduled"),
+                crate::domain::UtcTimestamp::from_second(seed + 1).expect("created"),
+            )
+            .expect("claim run");
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE jobs SET state = 'succeeded' WHERE id = ?1",
+                [job.id().to_string()],
+            )
+            .expect("force terminal");
+        job
+    }
+
+    #[test]
+    fn removal_drops_history_unless_kept() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        // Default removal hides the job and deletes its completed-run rows.
+        let job = terminal_job_with_run(&mut store, 1_000);
+        let hidden = hide_job(&mut store, job.id(), job.revision(), false).expect("hide");
+        assert_eq!(run_row_count(&store, hidden.id().to_string()), 0);
+
+        // --keep-history hides the job but keeps the run rows.
+        let job = terminal_job_with_run(&mut store, 2_000);
+        let hidden = hide_job(&mut store, job.id(), job.revision(), true).expect("hide");
+        assert_eq!(run_row_count(&store, hidden.id().to_string()), 1);
+    }
 }

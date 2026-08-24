@@ -34,6 +34,7 @@ pub(crate) trait ManagementStore {
         &mut self,
         job_id: JobId,
         expected_revision: Revision,
+        keep_history: bool,
     ) -> Result<Job, ManagementStoreError>;
 
     fn prepare_rerun(
@@ -87,6 +88,7 @@ pub(crate) fn resolve_job<Store: ManagementStore>(
 pub(crate) fn remove_job<Store: ManagementStore>(
     store: &mut Store,
     prefix: &str,
+    keep_history: bool,
 ) -> Result<Job, ManagementError> {
     let job = resolve_job(store, prefix)?;
     if !job.state().is_terminal() {
@@ -95,7 +97,7 @@ pub(crate) fn remove_job<Store: ManagementStore>(
         ));
     }
     store
-        .hide_job(job.id(), job.revision())
+        .hide_job(job.id(), job.revision(), keep_history)
         .map_err(ManagementError::from)
 }
 
@@ -235,6 +237,7 @@ mod tests {
             &mut self,
             job_id: JobId,
             _expected_revision: Revision,
+            _keep_history: bool,
         ) -> Result<Job, ManagementStoreError> {
             self.hidden = true;
             self.jobs
@@ -287,7 +290,7 @@ mod tests {
             rerun: false,
         };
         assert!(matches!(
-            remove_job(&mut active, "0"),
+            remove_job(&mut active, "0", false),
             Err(ManagementError::StateConflict(_))
         ));
         assert!(!active.hidden);
@@ -297,7 +300,7 @@ mod tests {
             hidden: false,
             rerun: false,
         };
-        assert!(remove_job(&mut done, "0").is_ok());
+        assert!(remove_job(&mut done, "0", true).is_ok());
         assert!(done.hidden);
     }
 
