@@ -330,3 +330,322 @@ pub(crate) enum DaemonError {
     #[error("IPC thread panicked")]
     IpcThreadPanicked,
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::panic)]
+
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::{
+        DaemonError, execute_due_jobs, load_deadline, request_ipc_shutdown, serve_ipc,
+        stop_signal_set,
+    };
+    use crate::domain::{
+        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
+        MissedPolicy, Revision, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
+    };
+    use crate::infrastructure::sqlite::{Database, JobStore};
+    use crate::supervisor::ipc::{IpcMessage, read_frame, write_frame};
+    use crate::supervisor::loop_driver::SupervisorEvent;
+
+    fn store_in(root: &std::path::Path) -> JobStore {
+        let database =
+            Database::open(&root.join("atx.db"), Duration::from_secs(2)).expect("open database");
+        JobStore::new(database)
+    }
+
+    fn scheduled_job(now_sec: i64, due_sec: i64) -> Job {
+        let now = UtcTimestamp::from_second(now_sec).expect("valid now");
+        let due = UtcTimestamp::from_second(due_sec).expect("valid due");
+        let schedule =
+            Schedule::one_shot_relative(DurationSeconds::new(30).expect("duration"), due);
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["/bin/true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::from_pairs([("ATX_TEST", "value")]).expect("environment"),
+        )
+        .expect("execution");
+        Job::new(
+            now,
+            schedule,
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job")
+    }
+
+    #[test]
+    fn stop_signal_set_contains_term_and_int() {
+        let set = stop_signal_set();
+        let set_ptr = std::ptr::addr_of!(set);
+        // SAFETY: sigismember takes only a stack pointer; `set` is a local.
+        unsafe {
+            assert_eq!(libc::sigismember(set_ptr, libc::SIGTERM), 1);
+            assert_eq!(libc::sigismember(set_ptr, libc::SIGINT), 1);
+        }
+    }
+
+    #[test]
+    fn load_deadline_returns_deadline_for_live_job() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let db_path = root.path().join("atx.db");
+        load_deadline(&db_path, job.id(), job.revision()).expect("deadline");
+    }
+
+    #[test]
+    fn load_deadline_reports_missing_job() {
+        let root = tempdir().expect("root");
+        let _store = store_in(root.path());
+        let db_path = root.path().join("atx.db");
+        let error = load_deadline(&db_path, JobId::new(), Revision::new(1).expect("revision"))
+            .expect_err("missing job");
+        assert!(matches!(error, DaemonError::MissingJob));
+    }
+
+    #[test]
+    fn load_deadline_reports_wrong_revision() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let db_path = root.path().join("atx.db");
+        let error = load_deadline(&db_path, job.id(), Revision::new(99).expect("revision"))
+            .expect_err("revision changed");
+        assert!(matches!(error, DaemonError::RevisionChanged));
+    }
+
+    #[test]
+    fn load_deadline_rejects_terminal_job() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let now = UtcTimestamp::from_second(1001).expect("now");
+        let terminal = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Missed,
+                false,
+                TransitionActor::Supervisor,
+                "terminal",
+                now,
+            )
+            .expect("mark terminal");
+        let db_path = root.path().join("atx.db");
+        let error =
+            load_deadline(&db_path, job.id(), terminal.revision()).expect_err("terminal job");
+        assert!(matches!(error, DaemonError::RevisionChanged));
+    }
+
+    #[test]
+    fn serve_ipc_acknowledges_wake_and_loads_deadline() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let socket = root.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("mode");
+        let db_path = root.path().join("atx.db");
+        let (sender, receiver) = mpsc::channel();
+        let thread_sender = sender.clone();
+        let db_clone = db_path.clone();
+        let server = std::thread::spawn(move || {
+            serve_ipc(&listener, &db_clone, &thread_sender);
+        });
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        write_frame(
+            &mut client,
+            &IpcMessage::Wake {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            },
+        )
+        .expect("write wake");
+        match receiver.recv().expect("event") {
+            SupervisorEvent::Schedule { job_id, .. } => assert_eq!(job_id, job.id()),
+            _ => panic!("unexpected event variant"),
+        }
+        let ack = read_frame(&mut client).expect("ack");
+        assert_eq!(
+            ack,
+            IpcMessage::Ack {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            }
+        );
+        drop(client);
+
+        let mut shutdown = UnixStream::connect(&socket).expect("connect shutdown");
+        write_frame(&mut shutdown, &IpcMessage::Shutdown { protocol: 1 }).expect("write shutdown");
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn serve_ipc_ignores_unexpected_frames_and_stops_on_shutdown() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let socket = root.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("mode");
+        let db_path = root.path().join("atx.db");
+        let (sender, receiver) = mpsc::channel();
+        let thread_sender = sender.clone();
+        let db_clone = db_path.clone();
+        let server = std::thread::spawn(move || {
+            serve_ipc(&listener, &db_clone, &thread_sender);
+        });
+
+        let mut wrong_protocol = UnixStream::connect(&socket).expect("connect 1");
+        write_frame(
+            &mut wrong_protocol,
+            &IpcMessage::Wake {
+                protocol: 2,
+                job_id: job.id(),
+                revision: job.revision(),
+            },
+        )
+        .expect("write wake proto 2");
+        drop(wrong_protocol);
+
+        let mut ack_frame = UnixStream::connect(&socket).expect("connect 2");
+        write_frame(
+            &mut ack_frame,
+            &IpcMessage::Ack {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            },
+        )
+        .expect("write ack");
+        drop(ack_frame);
+
+        let mut broken = UnixStream::connect(&socket).expect("connect 3");
+        broken
+            .write_all(&[0, 0, 0, 2, b'{', b'}'])
+            .expect("write malformed");
+        drop(broken);
+
+        let mut shutdown = UnixStream::connect(&socket).expect("connect 4");
+        write_frame(&mut shutdown, &IpcMessage::Shutdown { protocol: 1 }).expect("write shutdown");
+        drop(shutdown);
+
+        server.join().expect("join server");
+        assert!(
+            receiver.try_recv().is_err(),
+            "no events should have been emitted"
+        );
+    }
+
+    #[test]
+    fn serve_ipc_breaks_when_event_sink_is_gone() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let socket = root.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("mode");
+        let db_path = root.path().join("atx.db");
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let db_clone = db_path.clone();
+        let server = std::thread::spawn(move || {
+            serve_ipc(&listener, &db_clone, &sender);
+        });
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        write_frame(
+            &mut client,
+            &IpcMessage::Wake {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            },
+        )
+        .expect("write wake");
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn request_ipc_shutdown_writes_shutdown_frame_to_runtime_socket() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let socket = root.path().join("supervisor.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        request_ipc_shutdown(root.path());
+        let (mut stream, _) = listener.accept().expect("accept");
+        let message = read_frame(&mut stream).expect("read frame");
+        assert_eq!(message, IpcMessage::Shutdown { protocol: 1 });
+    }
+
+    #[test]
+    fn request_ipc_shutdown_is_a_noop_without_socket() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        request_ipc_shutdown(root.path());
+    }
+
+    #[test]
+    fn execute_due_jobs_skips_missing_and_terminal_jobs() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let runtime = root.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        let now = UtcTimestamp::from_second(1001).expect("now");
+        let terminal = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Missed,
+                false,
+                TransitionActor::Supervisor,
+                "terminal",
+                now,
+            )
+            .expect("mark terminal");
+        let db_path = root.path().join("atx.db");
+        let result = execute_due_jobs(
+            &db_path,
+            root.path(),
+            &runtime,
+            &[JobId::new(), terminal.id()],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn execute_due_jobs_handles_empty_schedule() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let runtime = root.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        let _store = store_in(root.path());
+        let db_path = root.path().join("atx.db");
+        let result = execute_due_jobs(&db_path, root.path(), &runtime, &[]);
+        assert!(result.is_ok());
+    }
+}
