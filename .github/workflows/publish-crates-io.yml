@@ -122,8 +122,10 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
       - name: Tag, manifest, and changelog versions agree
+        env:
+          TAG_REF: ${{ github.event.release.tag_name }}
         run: |
-          tag="${{ github.event.release.tag_name }}"
+          tag="$TAG_REF"
           case "$tag" in v*) tag="${tag#v}" ;; *) echo "::error::bad tag '$tag'"; exit 1 ;; esac
           manifest="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml)"
           test "$tag" = "$manifest" || { echo "::error::tag $tag != manifest $manifest"; exit 1; }
