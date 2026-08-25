@@ -379,7 +379,7 @@ mod tests {
     use super::super::{Database, JobStore};
     use super::{Job, hide_job};
     use crate::application::{ManagementStore as _, RunOutputStore as _};
-    use crate::domain::{JobId, JobState, ProcessIdentitySnapshot, RunState, UtcTimestamp};
+    use crate::domain::{JobId, JobState, ProcessIdentitySnapshot, RunId, RunState, UtcTimestamp};
 
     fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {
         ProcessIdentitySnapshot {
@@ -569,6 +569,51 @@ mod tests {
         let active = store.active_runs().expect("active runs");
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id(), run.id());
+    }
+
+    #[test]
+    fn active_run_flood_beyond_the_inspection_cap_is_corrupt() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        // Seed the cap-plus-one rows directly: the guard exists to catch a
+        // corrupted store, not anything a healthy scheduler could produce.
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create job");
+        let connection = store.database().connection();
+        for sequence in 1..=1_001_i64 {
+            // Distinct ids, claim tokens, and schedule slots satisfy the
+            // table's UNIQUE constraints; only the volume matters to the cap.
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc,
+                        state, claim_token
+                     ) VALUES (?1, ?2, ?3, ?4,
+                               '1970-01-01T00:00:01Z', 'starting', randomblob(32))",
+                    rusqlite::params![
+                        RunId::from_u128(u128::try_from(sequence).expect("sequence fits u128"))
+                            .to_string(),
+                        job.id().to_string(),
+                        sequence,
+                        format!(
+                            "1970-01-01T{:02}:{:02}:{:02}Z",
+                            sequence / 3600,
+                            sequence / 60,
+                            sequence % 60
+                        ),
+                    ],
+                )
+                .expect("seed active run");
+        }
+        assert!(
+            super::active_runs(&store)
+                .expect_err("run flood must be corrupt")
+                .to_string()
+                .contains("more than 1000 active runs")
+        );
     }
 
     #[test]

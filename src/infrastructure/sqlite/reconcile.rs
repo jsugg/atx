@@ -292,6 +292,7 @@ mod tests {
 
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore, RetentionPolicy, StartupStore};
+    use super::MAX_RECOVERY_RECORDS;
     use crate::application::{
         CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveryAction,
         RecoveryStore, reconcile_startup,
@@ -300,6 +301,7 @@ mod tests {
         ElapsedInstant, JobState, ProcessIdentitySnapshot, RunOutcome, RunState, TransitionActor,
         UtcTimestamp,
     };
+    use crate::domain::{JobId, RunId};
 
     struct UnusedInspector(Cell<usize>);
 
@@ -684,5 +686,149 @@ mod tests {
 
     fn timestamp(second: i64) -> UtcTimestamp {
         UtcTimestamp::from_second(second).expect("timestamp")
+    }
+
+    fn bulk_job_id(value: u128) -> String {
+        JobId::from_u128(value).to_string()
+    }
+
+    fn bulk_run_id(value: u128) -> String {
+        RunId::from_u128(value).to_string()
+    }
+
+    /// Seed `count` copies of `template` under fresh identifiers so the
+    /// recovery volume guards can be exercised without 100k store calls.
+    /// Copies use small-u128 ids; real ids are time-ordered v7 uuids and can
+    /// never collide with them.
+    fn bulk_copy_jobs(store: &mut JobStore, template_id: JobId, count: i64) {
+        let connection = store.database.connection_mut();
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("begin bulk copy");
+        {
+            let mut statement = connection
+                .prepare(
+                    "INSERT INTO jobs(
+                        id, revision, name, description, created_at_utc,
+                        updated_at_utc, state, runtime_tier, schedule_json,
+                        missed_policy, execution_json, next_due_utc,
+                        timezone_database_version, owner_uid
+                     )
+                     SELECT ?1, revision, name, description, created_at_utc,
+                            updated_at_utc, state, runtime_tier, schedule_json,
+                            missed_policy, execution_json, next_due_utc,
+                            timezone_database_version, owner_uid
+                     FROM jobs WHERE id = ?2",
+                )
+                .expect("prepare job copy");
+            for index in 0..count {
+                let id = bulk_job_id(u128::try_from(index + 1).expect("index fits u128"));
+                statement
+                    .execute(rusqlite::params![id, template_id.to_string()])
+                    .expect("copy job row");
+            }
+        }
+        connection
+            .execute_batch("COMMIT")
+            .expect("commit bulk copy");
+    }
+
+    #[test]
+    fn job_volume_beyond_the_recovery_cap_is_corrupt() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create");
+        let cap = i64::try_from(MAX_RECOVERY_RECORDS).expect("cap fits i64") + 1;
+        bulk_copy_jobs(&mut store, job.id(), cap);
+
+        let startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        let error = startup
+            .load_nonterminal()
+            .expect_err("job flood must be corrupt");
+        assert!(error.to_string().contains("too many jobs to reconcile"));
+    }
+
+    #[test]
+    fn active_run_volume_beyond_the_recovery_cap_is_corrupt() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let (job, _run, _revision) = claimed_job(&mut store, 2_000);
+        let cap = i64::try_from(MAX_RECOVERY_RECORDS).expect("cap fits i64") + 1;
+        bulk_copy_jobs(&mut store, job.id(), cap);
+
+        // One still-active run per copied job: distinct ids and claim tokens,
+        // per-job uniqueness keys satisfied by copying them verbatim.
+        let connection = store.database.connection_mut();
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("begin run copy");
+        {
+            let mut statement = connection
+                .prepare(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc,
+                        started_at_utc, finished_at_utc, state, claim_token,
+                        monitor_identity_json, command_identity_json,
+                        process_group_id, exit_code, terminating_signal,
+                        failure, outcome_json, stdout_path, stderr_path
+                     )
+                     SELECT ?1, ?2, sequence, scheduled_for_utc, created_at_utc,
+                            started_at_utc, finished_at_utc, state, randomblob(32),
+                            monitor_identity_json, command_identity_json,
+                            process_group_id, exit_code, terminating_signal,
+                            failure, outcome_json, stdout_path, stderr_path
+                     FROM runs LIMIT 1",
+                )
+                .expect("prepare run copy");
+            for index in 0..cap {
+                let ordinal = u128::try_from(index + 1).expect("index fits u128");
+                statement
+                    .execute(rusqlite::params![
+                        bulk_run_id(ordinal),
+                        bulk_job_id(ordinal)
+                    ])
+                    .expect("copy run row");
+            }
+        }
+        connection.execute_batch("COMMIT").expect("commit run copy");
+
+        let startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        let error = startup
+            .load_nonterminal()
+            .expect_err("run flood must be corrupt");
+        assert!(error.to_string().contains("too many active runs"));
+    }
+
+    #[test]
+    fn lost_update_during_recovery_transition_conflicts() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = sample_job(3_000, 3_030);
+        store.create(&job).expect("create");
+
+        // Simulate a peer winning the row between the state read and the
+        // revision-CAS write: RAISE(IGNORE) silently skips the UPDATE, so
+        // changed == 0 and recovery must surface a conflict.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER ignore_job_updates BEFORE UPDATE ON jobs
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("trigger");
+        let action = RecoveryAction::MarkMissed {
+            job_id: job.id(),
+            expected_revision: job.revision(),
+        };
+        let mut startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        assert!(matches!(
+            startup.apply_recovery(std::slice::from_ref(&action), timestamp(3_100)),
+            Err(crate::application::RecoveryStoreError(_))
+        ));
     }
 }
