@@ -517,7 +517,7 @@ mod tests {
         );
         fresh
             .request_cancellation()
-            .and_then(|run| run.request_cancellation())
+            .and_then(Run::request_cancellation)
             .expect("idempotent cancel request");
 
         let running = Run::new(
