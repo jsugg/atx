@@ -2323,4 +2323,134 @@ mod tests {
             render_job(&job, &mode);
         }
     }
+
+    #[test]
+    fn service_install_refuses_unwritable_state_directory() {
+        let root = tempdir().expect("root");
+        let blocker = root.path().join("blocker");
+        fs::write(&blocker, b"").expect("file");
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--state-dir",
+                blocker.to_str().expect("utf8"),
+                "service",
+                "install"
+            ])),
+            exit::permission()
+        );
+    }
+
+    #[test]
+    fn unreadable_config_file_is_a_usage_error() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        fs::create_dir_all(state.join("config.toml")).expect("config.toml as directory");
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "30s",
+                "--dry-run",
+                "--",
+                "true"
+            ])),
+            exit::usage()
+        );
+    }
+
+    #[test]
+    fn submit_honors_verbosity_capture_env_and_shell_warnings() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let base = [
+            "atx",
+            "--state-dir",
+            state.to_str().expect("utf8"),
+            "30s",
+            "--dry-run",
+            "--",
+            "true",
+        ];
+        assert_eq!(run(cli(&base)), ExitCode::SUCCESS);
+
+        // Verbose mode selects the verbose config override; capture-env and
+        // shell modes print their warnings and still submit.
+        let mut verbose = base.to_vec();
+        verbose.insert(1, "-v");
+        assert_eq!(run(cli(&verbose)), ExitCode::SUCCESS);
+
+        let mut captured = base.to_vec();
+        captured.insert(4, "--capture-env");
+        assert_eq!(run(cli(&captured)), ExitCode::SUCCESS);
+
+        let mut shelled = base.to_vec();
+        shelled.insert(4, "--shell");
+        let command = shelled.pop().expect("command slot");
+        assert_eq!(command, OsString::from("true"));
+        // Shell mode takes the whole command line as a single argument.
+        shelled.push("echo done");
+        assert_eq!(run(cli(&shelled)), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn durable_submission_without_a_service_reports_capability() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        // No service is installed in the test environment, so the durable
+        // tier must refuse rather than silently degrade to session scope.
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "30s",
+                "--durable",
+                "--dry-run",
+                "--",
+                "true"
+            ])),
+            exit::capability()
+        );
+    }
+
+    #[test]
+    fn insecure_supervisor_files_fail_the_doctor_check() {
+        let runtime = tempdir().expect("runtime root");
+        // Both entries exist but carry insecure metadata: the lock is world
+        // readable and the socket path is a regular file.
+        fs::write(runtime.path().join("supervisor.lock"), b"").expect("lock");
+        fs::set_permissions(
+            runtime.path().join("supervisor.lock"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("relax lock mode");
+        fs::write(runtime.path().join("supervisor.sock"), b"").expect("socket file");
+
+        let mut builder = DoctorReportBuilder::default();
+        let inspector = NativeProcessInspector::new("boot".to_owned());
+        check_supervisor(&mut builder, runtime.path(), &inspector, 501);
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(!report.healthy);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "supervisor" && check.status == DiagnosticStatus::Fail)
+        );
+    }
+
+    #[test]
+    fn doctor_exit_falls_back_to_permission_for_unknown_failures() {
+        let mut builder = DoctorReportBuilder::default();
+        builder.push(
+            "miscellaneous",
+            DiagnosticStatus::Fail,
+            "unexpected failure",
+            None,
+        );
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert_eq!(doctor_exit(&report), exit::permission());
+    }
 }
