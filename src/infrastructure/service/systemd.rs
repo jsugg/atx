@@ -389,6 +389,42 @@ mod tests {
     }
 
     #[test]
+    fn failed_linger_probe_reports_lingering_disabled_while_running() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(
+            &unit,
+            render_unit(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            )
+            .expect("unit"),
+        )
+        .expect("write unit");
+
+        // A failing loginctl probe must degrade to lingering disabled
+        // instead of failing the whole status report.
+        let service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner {
+                failing_command: Some("show-user"),
+                ..FakeRunner::healthy()
+            },
+        );
+        let status = service.status().expect("status");
+        assert!(status.running);
+        assert_eq!(
+            status.detail,
+            "user service is enabled and running; lingering is disabled"
+        );
+    }
+
+    #[test]
     fn uninstall_disables_removes_unit_and_reloads() {
         let root = tempdir().expect("root");
         let unit = root.path().join(UNIT_NAME);

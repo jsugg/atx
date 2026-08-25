@@ -278,8 +278,24 @@ mod tests {
         };
         assert!(matches!(
             resolve_job(&ambiguous, "0"),
-            Err(ManagementError::Ambiguous(ids)) if ids.len() == 2
+            Err(ManagementError::Ambiguous(_))
         ));
+    }
+
+    #[test]
+    fn ambiguous_prefixes_report_every_matched_job_id() {
+        let first = terminal(JobState::Succeeded);
+        let second = terminal(JobState::Failed);
+        let expected = vec![first.id(), second.id()];
+        let store = Store {
+            jobs: vec![first, second],
+            hidden: false,
+            rerun: false,
+        };
+        assert_eq!(
+            resolve_job(&store, "0"),
+            Err(ManagementError::Ambiguous(expected))
+        );
     }
 
     #[test]
@@ -317,6 +333,15 @@ mod tests {
         );
         assert!(rerun_job(&mut store, "0", true, timestamp(10)).is_ok());
         assert!(store.rerun);
+
+        // Terminal jobs other than Interrupted need no confirmation.
+        let mut done = Store {
+            jobs: vec![terminal(JobState::Succeeded)],
+            hidden: false,
+            rerun: false,
+        };
+        assert!(rerun_job(&mut done, "0", false, timestamp(10)).is_ok());
+        assert!(done.rerun);
     }
 
     #[test]

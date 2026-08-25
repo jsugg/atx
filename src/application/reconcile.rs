@@ -536,13 +536,9 @@ mod tests {
             ElapsedInstant::from_nanos(500),
             "boot",
         );
-        assert!(
-            matches!(
-                &result,
-                Err(super::ReconciliationError::TerminalJobLoaded(job_id))
-                    if *job_id == finished.id()
-            ),
-            "{result:?}"
+        assert_eq!(
+            result,
+            Err(super::ReconciliationError::TerminalJobLoaded(finished.id()))
         );
 
         let waiting = overdue_job(MissedPolicy::Hold, false);
@@ -556,13 +552,11 @@ mod tests {
             ElapsedInstant::from_nanos(500),
             "boot",
         );
-        assert!(
-            matches!(
-                &result,
-                Err(super::ReconciliationError::UnexpectedActiveRun(job_id))
-                    if *job_id == waiting.id()
-            ),
-            "{result:?}"
+        assert_eq!(
+            result,
+            Err(super::ReconciliationError::UnexpectedActiveRun(
+                waiting.id()
+            ))
         );
     }
 
