@@ -1236,4 +1236,50 @@ mod tests {
             Err(StoreError::Corrupt(_))
         ));
     }
+
+    #[test]
+    fn signal_and_failure_outcome_rows_decode() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let finished = UtcTimestamp::from_second(4_003).expect("finished");
+
+        for (seed, outcome) in [
+            (1_000, RunOutcome::Signal(9)),
+            (2_000, RunOutcome::Failure("boom".to_owned())),
+        ] {
+            let job = sample_job(seed, seed + 30);
+            store.create(&job).expect("job");
+            let run = store
+                .claim_run(
+                    job.id(),
+                    UtcTimestamp::from_second(seed + 30).expect("scheduled"),
+                    UtcTimestamp::from_second(seed + 1).expect("created"),
+                )
+                .expect("claim");
+            let run = store
+                .mark_run_running(
+                    run.id(),
+                    run.claim_token(),
+                    UtcTimestamp::from_second(seed + 2).expect("started"),
+                    identity(10, 100, 20),
+                    identity(11, 101, 20),
+                    "runs/out.log",
+                    "runs/err.log",
+                )
+                .expect("running");
+            store
+                .record_run_terminal(run.id(), run.claim_token(), finished, outcome.clone())
+                .expect("complete");
+            assert_eq!(
+                store
+                    .load_run(run.id())
+                    .expect("decode")
+                    .expect("run")
+                    .outcome(),
+                Some(&outcome)
+            );
+        }
+    }
 }
