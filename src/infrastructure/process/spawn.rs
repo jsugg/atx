@@ -150,11 +150,12 @@ pub(crate) enum SpawnError {
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use std::io::Read;
     use std::os::fd::AsRawFd;
 
     use tempfile::tempfile;
 
-    use super::NativeProcessRunner;
+    use super::{NativeProcessRunner, SpawnError};
     use crate::application::ElapsedClock;
     use crate::domain::{Environment, ExecutionMode, ExecutionSpec};
     use crate::infrastructure::process::NativeProcessInspector;
@@ -242,6 +243,45 @@ mod tests {
         let child = runner()
             .spawn(&execution(ExecutionMode::Shell, &[&probe], "/"))
             .expect("spawn");
+        assert!(child.wait_with_output().expect("wait").status.success());
+    }
+
+    #[test]
+    fn output_pipes_can_only_be_taken_once() {
+        let mut child = runner()
+            .spawn(&execution(ExecutionMode::Shell, &["printf payload"], "/"))
+            .expect("spawn");
+        let (mut stdout, stderr) = child.take_output().expect("pipes");
+        assert!(stdout.as_raw_fd() >= 0);
+        assert!(stderr.as_raw_fd() >= 0);
+        assert!(matches!(child.take_output(), Err(SpawnError::MissingPipe)));
+        let mut captured = String::new();
+        stdout.read_to_string(&mut captured).expect("read stdout");
+        assert_eq!(captured, "payload");
+        assert!(child.wait().expect("wait").success());
+    }
+
+    #[test]
+    fn terminate_and_wait_reaps_the_child() {
+        let mut child = runner()
+            .spawn(&execution(
+                ExecutionMode::Direct,
+                &["/bin/sleep", "30"],
+                "/",
+            ))
+            .expect("spawn");
+        assert!(child.identity().process_group_id > 0);
+        child.terminate_and_wait();
+        let status = child.wait().expect("wait");
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn child_mut_exposes_the_underlying_handle() {
+        let mut child = runner()
+            .spawn(&execution(ExecutionMode::Shell, &["printf x"], "/"))
+            .expect("spawn");
+        assert!(child.child_mut().id() > 0);
         assert!(child.wait_with_output().expect("wait").status.success());
     }
 }
