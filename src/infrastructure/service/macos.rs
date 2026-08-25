@@ -348,6 +348,128 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_running_loaded_agent() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        let service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent,
+            501,
+            FakeRunner::default(),
+        );
+        let status = service.status().expect("status");
+        assert!(status.installed);
+        assert!(status.running);
+        assert_eq!(status.detail, "launch agent is loaded and running");
+    }
+
+    #[test]
+    fn uninstall_bootouts_and_removes_the_agent() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        let runner = FakeRunner::default();
+        let calls = runner.calls.clone();
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent.clone(),
+            501,
+            runner,
+        );
+        service.uninstall().expect("uninstall");
+        assert!(
+            calls
+                .borrow()
+                .iter()
+                .any(|call| call == "bootout gui/501/io.github.jsugg.atx")
+        );
+        assert!(!agent.exists());
+    }
+
+    #[test]
+    fn uninstall_without_install_is_a_noop() {
+        let root = tempdir().expect("root");
+        let runner = FakeRunner::default();
+        let calls = runner.calls.clone();
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            runner,
+        );
+        service.uninstall().expect("uninstall");
+        assert!(!calls.borrow().iter().any(|call| call.contains("bootout")));
+    }
+
+    #[test]
+    fn bootout_leaving_the_agent_running_is_an_error() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent,
+            501,
+            FakeRunner {
+                failing_command: Some("bootout"),
+                ..FakeRunner::default()
+            },
+        );
+        let error = service.uninstall().expect_err("bootout failure");
+        assert!(error.to_string().contains("launchctl bootout failed"));
+    }
+
+    #[test]
+    fn bootstrap_failure_fails_the_install() {
+        let root = tempdir().expect("root");
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            FakeRunner {
+                failing_command: Some("bootstrap"),
+                ..FakeRunner::default()
+            },
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
     fn status_reports_unavailable_when_launchctl_probe_fails() {
         let root = tempdir().expect("root");
         let service = LaunchdService::with_runner(
@@ -379,13 +501,17 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeRunner {
         calls: std::rc::Rc<RefCell<Vec<String>>>,
+        failing_command: Option<&'static str>,
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&self, _program: &str, args: &[&str]) -> Result<std::process::Output, String> {
             self.calls.borrow_mut().push(args.join(" "));
+            let success = !self
+                .failing_command
+                .is_some_and(|needle| args.contains(&needle));
             Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(0),
+                status: std::process::ExitStatus::from_raw(i32::from(!success) << 8),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
             })

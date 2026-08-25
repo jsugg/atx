@@ -335,6 +335,144 @@ mod tests {
     }
 
     #[test]
+    fn status_reflects_running_and_lingering_states() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(
+            &unit,
+            render_unit(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            )
+            .expect("unit"),
+        )
+        .expect("write unit");
+
+        let mut lingering = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit.clone(),
+            1000,
+            FakeRunner::healthy(),
+        );
+        let status = lingering.status().expect("status");
+        assert!(status.running);
+        assert_eq!(
+            status.detail,
+            "user service is enabled, running, and lingering is enabled"
+        );
+        assert_eq!(
+            status.guarantee,
+            "restarts after crashes and starts without an interactive login"
+        );
+
+        let mut plain = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner::no_linger(),
+        );
+        let status = plain.status().expect("status");
+        assert!(status.running);
+        assert_eq!(
+            status.detail,
+            "user service is enabled and running; lingering is disabled"
+        );
+        assert_eq!(
+            status.guarantee,
+            "restarts after crashes while this user's systemd manager is running"
+        );
+    }
+
+    #[test]
+    fn uninstall_disables_removes_unit_and_reloads() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(
+            &unit,
+            render_unit(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            )
+            .expect("unit"),
+        )
+        .expect("write unit");
+        let runner = FakeRunner::healthy();
+        let calls = runner.calls.clone();
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit.clone(),
+            1000,
+            runner,
+        );
+        service.uninstall().expect("uninstall");
+        let calls = calls.borrow().join("\n");
+        assert!(calls.contains("systemctl --user disable --now atx.service"));
+        assert!(calls.contains("systemctl --user daemon-reload"));
+        assert!(!unit.exists());
+    }
+
+    #[test]
+    fn uninstall_without_install_is_a_noop() {
+        let root = tempdir().expect("root");
+        let runner = FakeRunner::healthy();
+        let calls = runner.calls.clone();
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join(UNIT_NAME),
+            1000,
+            runner,
+        );
+        service.uninstall().expect("uninstall");
+        assert!(!calls.borrow().iter().any(|call| call.contains("disable")));
+    }
+
+    #[test]
+    fn failed_enable_fails_the_install_without_leaving_temporary_files() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner::failing("enable"),
+        );
+        assert!(service.install().is_err());
+        let leftovers: Vec<_> = fs::read_dir(root.path())
+            .expect("directory")
+            .filter_map(|entry| entry.expect("entry").file_name().into_string().ok())
+            .collect();
+        assert!(leftovers.iter().all(|name| !name.ends_with(".tmp")));
+    }
+
+    #[test]
+    fn foreign_unit_blocks_install() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(&unit, "foreign").expect("foreign unit");
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner::healthy(),
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
     fn unavailable_manager_and_foreign_unit_are_rejected() {
         let root = tempdir().expect("root");
         let unit = root.path().join(UNIT_NAME);
@@ -358,6 +496,8 @@ mod tests {
     struct FakeRunner {
         calls: Rc<RefCell<Vec<String>>>,
         available: bool,
+        linger: bool,
+        failing_command: Option<&'static str>,
     }
 
     impl FakeRunner {
@@ -365,12 +505,28 @@ mod tests {
             Self {
                 calls: Rc::new(RefCell::new(Vec::new())),
                 available: true,
+                linger: true,
+                failing_command: None,
             }
         }
 
         fn unavailable() -> Self {
             Self {
                 available: false,
+                ..Self::healthy()
+            }
+        }
+
+        fn no_linger() -> Self {
+            Self {
+                linger: false,
+                ..Self::healthy()
+            }
+        }
+
+        fn failing(command: &'static str) -> Self {
+            Self {
+                failing_command: Some(command),
                 ..Self::healthy()
             }
         }
@@ -381,8 +537,11 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("{program} {}", args.join(" ")));
-            let success = self.available;
-            let stdout = if program == "loginctl" && success {
+            let success = self.available
+                && !self
+                    .failing_command
+                    .is_some_and(|needle| args.contains(&needle));
+            let stdout = if program == "loginctl" && success && self.linger {
                 b"yes\n".to_vec()
             } else {
                 Vec::new()
