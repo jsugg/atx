@@ -313,8 +313,8 @@ mod tests {
     };
     use crate::domain::{
         ClaimToken, DurationSeconds, ElapsedInstant, Environment, ExecutionMode, ExecutionSpec,
-        Job, JobState, MissedPolicy, ProcessIdentitySnapshot, Run, RuntimeTier, Schedule, Sequence,
-        TransitionActor, UtcTimestamp,
+        Job, JobState, MissedPolicy, ProcessIdentitySnapshot, Run, RunOutcome, RuntimeTier,
+        Schedule, Sequence, TransitionActor, UtcTimestamp,
     };
 
     struct Inspector {
@@ -491,6 +491,156 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, RecoveryAction::AdvanceRecurring { .. }))
         );
+    }
+
+    #[test]
+    fn invalid_boot_identity_is_rejected() {
+        let job = job_in(JobState::Running, MissedPolicy::Hold, false);
+        for boot_identity in ["", "b\0ot"] {
+            let result = plan_recovery(
+                &[RecoveryRecord {
+                    job: job.clone(),
+                    active_run: None,
+                }],
+                &inspector(IdentityStatus::Dead, false),
+                timestamp(200),
+                ElapsedInstant::from_nanos(500),
+                boot_identity,
+            );
+            assert!(
+                matches!(result, Err(super::ReconciliationError::InvalidBootIdentity)),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_job_and_stray_active_run_are_rejected() {
+        let mut finished = job_in(JobState::Running, MissedPolicy::Hold, false);
+        finished
+            .transition(
+                JobState::Succeeded,
+                false,
+                TransitionActor::Monitor,
+                "finished",
+                timestamp(20),
+            )
+            .expect("terminal");
+        let result = plan_recovery(
+            &[RecoveryRecord {
+                job: finished.clone(),
+                active_run: None,
+            }],
+            &inspector(IdentityStatus::Dead, false),
+            timestamp(200),
+            ElapsedInstant::from_nanos(500),
+            "boot",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(super::ReconciliationError::TerminalJobLoaded(job_id))
+                    if *job_id == finished.id()
+            ),
+            "{result:?}"
+        );
+
+        let waiting = overdue_job(MissedPolicy::Hold, false);
+        let result = plan_recovery(
+            &[RecoveryRecord {
+                job: waiting.clone(),
+                active_run: Some(starting_run(&waiting)),
+            }],
+            &inspector(IdentityStatus::Dead, false),
+            timestamp(200),
+            ElapsedInstant::from_nanos(500),
+            "boot",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(super::ReconciliationError::UnexpectedActiveRun(job_id))
+                    if *job_id == waiting.id()
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn active_jobs_without_a_live_run_are_interrupted() {
+        // No run row at all: the command fate is unknowable.
+        let plan = plan_recovery(
+            &[RecoveryRecord {
+                job: job_in(JobState::Running, MissedPolicy::Hold, false),
+                active_run: None,
+            }],
+            &inspector(IdentityStatus::Alive, false),
+            timestamp(200),
+            ElapsedInstant::from_nanos(500),
+            "boot",
+        )
+        .expect("plan");
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [RecoveryAction::Interrupt {
+                command_fate: CommandFate::Unknown,
+                ..
+            }]
+        ));
+
+        // A run that already recorded a terminal outcome needs no inspection.
+        let finished = job_in(JobState::Running, MissedPolicy::Hold, false);
+        let done = running_run(&finished, "old-boot")
+            .with_outcome(timestamp(12), RunOutcome::Exit(0))
+            .expect("finish");
+        let plan = plan_recovery(
+            &[RecoveryRecord {
+                job: finished,
+                active_run: Some(done),
+            }],
+            &inspector(IdentityStatus::Alive, false),
+            timestamp(200),
+            ElapsedInstant::from_nanos(500),
+            "boot",
+        )
+        .expect("plan");
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [RecoveryAction::Interrupt {
+                command_fate: CommandFate::Unknown,
+                ..
+            }]
+        ));
+        assert!(plan.preserved_runs.is_empty());
+    }
+
+    #[test]
+    fn run_latest_recurring_job_reschedules_from_its_anchor() {
+        let latest = overdue_job(MissedPolicy::RunLatest, true);
+        let plan = plan_recovery(
+            &[RecoveryRecord {
+                job: latest,
+                active_run: None,
+            }],
+            &inspector(IdentityStatus::Dead, false),
+            timestamp(200),
+            ElapsedInstant::from_nanos(1_000),
+            "boot",
+        )
+        .expect("plan");
+        assert_eq!(plan.actions.len(), 1);
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [RecoveryAction::AdvanceRecurring { .. }]
+        ));
+    }
+
+    fn inspector(status: IdentityStatus, fail: bool) -> Inspector {
+        Inspector {
+            status,
+            fail,
+            calls: Cell::new(0),
+        }
     }
 
     fn overdue_job(policy: MissedPolicy, recurring: bool) -> Job {
