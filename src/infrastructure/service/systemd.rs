@@ -349,7 +349,7 @@ mod tests {
         )
         .expect("write unit");
 
-        let mut lingering = SystemdUserService::with_runner(
+        let lingering = SystemdUserService::with_runner(
             "/bin/atx".into(),
             root.path().join("state"),
             root.path().join("runtime"),
@@ -368,7 +368,7 @@ mod tests {
             "restarts after crashes and starts without an interactive login"
         );
 
-        let mut plain = SystemdUserService::with_runner(
+        let plain = SystemdUserService::with_runner(
             "/bin/atx".into(),
             root.path().join("state"),
             root.path().join("runtime"),
@@ -453,7 +453,12 @@ mod tests {
             .expect("directory")
             .filter_map(|entry| entry.expect("entry").file_name().into_string().ok())
             .collect();
-        assert!(leftovers.iter().all(|name| !name.ends_with(".tmp")));
+        let temporary_left = leftovers.iter().any(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "tmp")
+        });
+        assert!(!temporary_left);
     }
 
     #[test]
