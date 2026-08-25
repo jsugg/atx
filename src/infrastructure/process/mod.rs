@@ -412,13 +412,20 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id();
+        // Give the short command time to exit without reaping it, so the
+        // inspection reliably exercises the zombie fallback instead of
+        // racing the still-live process.
+        std::thread::sleep(std::time::Duration::from_millis(100));
         let identity = inspector
             .inspect(pid)
             .expect("inspect zombie")
             .expect("unreaped child still inspectable");
         assert_eq!(identity.pid, pid);
         assert!(identity.process_group_id > 0);
-        let _ = child.wait();
+
+        // Once reaped, the same PID reports as gone rather than dead-wrong.
+        assert!(child.wait().expect("reap").success());
+        assert_eq!(inspector.inspect(pid).expect("inspect reaped pid"), None);
     }
 
     #[cfg(target_os = "linux")]

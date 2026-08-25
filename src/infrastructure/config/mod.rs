@@ -389,6 +389,18 @@ mod tests {
     }
 
     #[test]
+    fn default_shell_with_an_embedded_nul_byte_is_rejected() {
+        assert!(
+            load_config(
+                None,
+                &env(&[("ATX_DEFAULT_SHELL", "/bin/sh\0")]),
+                ConfigOverrides::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn redacted_view_contains_only_effective_safe_values() {
         let unrelated_secret = "do-not-leak";
         let config = load_config(

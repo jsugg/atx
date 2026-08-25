@@ -190,7 +190,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::tempdir;
 
@@ -415,6 +415,26 @@ mod tests {
         let dirs = Store::with_run(run);
         assert!(matches!(
             read_run_output(&dirs, root.path(), "0"),
+            Err(RunOutputError::MissingLogs)
+        ));
+    }
+
+    #[test]
+    fn log_paths_escaping_the_runs_directory_are_rejected() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let run = running_run("runs/x/stdout.log", "runs/x/stderr.log");
+        // A symlinked log resolves outside the runs directory.
+        fs::create_dir_all(root.path().join("runs/x")).expect("runs directory");
+        fs::write(root.path().join("outside.log"), b"leak").expect("write outside");
+        symlink(
+            root.path().join("outside.log"),
+            root.path().join("runs/x/stdout.log"),
+        )
+        .expect("escaping link");
+        let store = Store::with_run(run);
+        assert!(matches!(
+            read_run_output(&store, root.path(), "0"),
             Err(RunOutputError::MissingLogs)
         ));
     }

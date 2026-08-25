@@ -141,6 +141,19 @@ mod tests {
         assert_eq!(ack.calls.get(), 1);
     }
 
+    #[test]
+    fn acknowledged_commit_reports_a_supervised_job() {
+        let mut store = Store(Cell::new(0));
+        let ack = Ack {
+            calls: Cell::new(0),
+            fail: false,
+        };
+        let outcome = submit_job(&mut store, &ack, job(), false).expect("commit");
+        assert!(matches!(outcome, SubmissionOutcome::Supervised(_)));
+        assert_eq!(store.0.get(), 1);
+        assert_eq!(ack.calls.get(), 1);
+    }
+
     fn job() -> Job {
         let now = UtcTimestamp::from_second(100).expect("timestamp");
         Job::new(

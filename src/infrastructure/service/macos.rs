@@ -444,12 +444,42 @@ mod tests {
             agent,
             501,
             FakeRunner {
-                failing_command: Some("bootout"),
+                failing_commands: &["bootout"],
                 ..FakeRunner::default()
             },
         );
         let error = service.uninstall().expect_err("bootout failure");
         assert!(error.to_string().contains("launchctl bootout failed"));
+    }
+
+    #[test]
+    fn bootout_failure_with_a_stopped_agent_still_uninstalls() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        // A failed bootout is tolerated when the agent is not running, so
+        // the stale plist file is still removed.
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent.clone(),
+            501,
+            FakeRunner {
+                failing_commands: &["bootout", "print"],
+                ..FakeRunner::default()
+            },
+        );
+        service.uninstall().expect("uninstall");
+        assert!(!agent.exists());
     }
 
     #[test]
@@ -462,7 +492,7 @@ mod tests {
             root.path().join("agent.plist"),
             501,
             FakeRunner {
-                failing_command: Some("bootstrap"),
+                failing_commands: &["bootstrap"],
                 ..FakeRunner::default()
             },
         );
@@ -510,7 +540,7 @@ mod tests {
             agent,
             501,
             FakeRunner {
-                failing_command: Some("print"),
+                failing_commands: &["print"],
                 ..FakeRunner::default()
             },
         );
@@ -590,7 +620,7 @@ mod tests {
             root.path().join("agent.plist"),
             501,
             FakeRunner {
-                failing_command: Some("kickstart"),
+                failing_commands: &["kickstart"],
                 ..FakeRunner::default()
             },
         );
@@ -625,15 +655,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeRunner {
         calls: std::rc::Rc<RefCell<Vec<String>>>,
-        failing_command: Option<&'static str>,
+        failing_commands: &'static [&'static str],
     }
 
     impl CommandRunner for FakeRunner {
         fn run(&self, _program: &str, args: &[&str]) -> Result<std::process::Output, String> {
             self.calls.borrow_mut().push(args.join(" "));
             let success = !self
-                .failing_command
-                .is_some_and(|needle| args.contains(&needle));
+                .failing_commands
+                .iter()
+                .any(|needle| args.contains(needle));
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(i32::from(!success) << 8),
                 stdout: Vec::new(),
