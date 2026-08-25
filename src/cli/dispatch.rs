@@ -360,7 +360,7 @@ fn build_doctor_report(global: &GlobalArgs) -> Result<DoctorReport, CliError> {
                 Some("Process-safe cancellation is unavailable.".to_owned()),
             ),
         }
-        check_supervisor(&mut builder, &paths, &inspector, uid);
+        check_supervisor(&mut builder, paths.runtime_dir(), &inspector, uid);
     }
     let durable_available = check_durable_service(&mut builder, &paths, global.json);
     Ok(builder.finish(
@@ -477,12 +477,12 @@ fn check_database(builder: &mut DoctorReportBuilder, state_directory: &Path) -> 
 
 fn check_supervisor(
     builder: &mut DoctorReportBuilder,
-    paths: &PlatformPaths,
+    runtime_dir: &Path,
     inspector: &NativeProcessInspector,
     uid: u32,
 ) {
-    let lock = paths.runtime_dir().join("supervisor.lock");
-    let socket = paths.runtime_dir().join("supervisor.sock");
+    let lock = runtime_dir.join("supervisor.lock");
+    let socket = runtime_dir.join("supervisor.sock");
     match (fs::symlink_metadata(&lock), fs::symlink_metadata(&socket)) {
         (Err(lock_error), Err(socket_error))
             if lock_error.kind() == std::io::ErrorKind::NotFound
@@ -1566,15 +1566,77 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+    use std::path::Path;
+    use std::process::ExitCode;
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
-    use super::{build_doctor_report, build_job, check_live_supervisor, read_env_file, schedule};
-    use crate::application::{DiagnosticStatus, DoctorReportBuilder, ElapsedClock, WallClock};
-    use crate::cli::args::{ParsedCli, parse_from};
+    use super::{
+        build_doctor_report, build_job, cancel_job, check_database, check_live_supervisor,
+        check_private_directory, check_supervisor, doctor_exit, finish_job_cancellation,
+        parse_job_state, print_error, read_env_file, render_job, render_jobs, render_runs,
+        render_submission, resolve_submitting_tty, run, schedule, split_assignment,
+    };
+    use crate::application::{
+        DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, SubmissionOutcome,
+        SupervisorAckError, WallClock,
+    };
+    use crate::cli::args::{ColorArg, GlobalArgs, ParsedCli, parse_from};
+    use crate::cli::exit;
+    use crate::domain::{
+        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobState, MissedPolicy,
+        RunState, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
+    };
     use crate::infrastructure::config::{ConfigOverrides, load_config};
     use crate::infrastructure::process::NativeProcessInspector;
+    use crate::infrastructure::sqlite::{Database, JobStore};
     use crate::infrastructure::time::NativeClock;
+
+    fn shell_execution() -> ExecutionSpec {
+        ExecutionSpec::new(
+            ExecutionMode::Shell,
+            vec!["true".to_owned()],
+            "/".to_owned(),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+        )
+        .expect("execution")
+    }
+
+    fn fixture_job(now: i64) -> Job {
+        Job::new(
+            UtcTimestamp::from_second(now).expect("now"),
+            Schedule::one_shot_relative(
+                DurationSeconds::new(30).expect("duration"),
+                UtcTimestamp::from_second(now + 30).expect("due"),
+            ),
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            shell_execution(),
+            501,
+        )
+        .expect("job")
+    }
+
+    fn opened_store(path: &Path) -> JobStore {
+        let database =
+            Database::open(&path.join("atx.db"), Duration::from_millis(100)).expect("database");
+        JobStore::new(database)
+    }
+
+    fn global(json: bool, quiet: bool) -> GlobalArgs {
+        GlobalArgs {
+            quiet,
+            verbose: 0,
+            json,
+            color: ColorArg::Never,
+            state_dir: None,
+        }
+    }
+
+    fn cli(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
 
     #[test]
     fn schedule_matrix_builds_relative_calendar_and_recurring_jobs() {
@@ -1720,5 +1782,545 @@ mod tests {
             unreachable!("doctor");
         };
         global
+    }
+
+    #[test]
+    fn parse_failures_and_help_pick_their_exit_codes() {
+        assert_eq!(run(cli(&["atx", "--definitely-not-a-flag"])), exit::usage());
+        assert_eq!(
+            run(cli(&["atx", "--json", "--definitely-not-a-flag"])),
+            exit::usage()
+        );
+        assert_eq!(run(cli(&["atx", "--help"])), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn version_and_completions_render_in_every_mode() {
+        assert_eq!(run(cli(&["atx", "version"])), ExitCode::SUCCESS);
+        assert_eq!(run(cli(&["atx", "--json", "version"])), ExitCode::SUCCESS);
+        for shell in ["bash", "zsh", "fish", "power-shell"] {
+            let code = run(cli(&["atx", "completions", "--shell", shell]));
+            assert_eq!(code, ExitCode::SUCCESS, "completions {shell}");
+        }
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn man_pages_export_and_report_write_failures() {
+        let root = tempdir().expect("root");
+        super::export_man_pages(root.path()).expect("export");
+        assert!(root.path().join("atx.1").exists());
+
+        let blocker = root.path().join("blocker");
+        fs::write(&blocker, b"").expect("file");
+        assert!(super::export_man_pages(&blocker).is_err());
+    }
+
+    #[test]
+    fn doctor_database_check_covers_missing_corrupt_and_valid() {
+        // Missing database: warning diagnostic, no schema version.
+        let missing = tempdir().expect("missing root");
+        let mut builder = DoctorReportBuilder::default();
+        assert_eq!(check_database(&mut builder, missing.path()), None);
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(report.healthy);
+
+        // Corrupt database file: failing diagnostic.
+        let corrupt = tempdir().expect("corrupt root");
+        fs::write(corrupt.path().join("atx.db"), b"garbage").expect("corrupt file");
+        let mut builder = DoctorReportBuilder::default();
+        assert_eq!(check_database(&mut builder, corrupt.path()), None);
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(!report.healthy);
+
+        // Valid database: schema version is reported.
+        let valid = tempdir().expect("valid root");
+        let database = Database::open(&valid.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        drop(database);
+        let mut builder = DoctorReportBuilder::default();
+        assert!(check_database(&mut builder, valid.path()).is_some());
+    }
+
+    #[test]
+    fn private_directory_check_reports_missing_private_and_shared() {
+        let root = tempdir().expect("root");
+        let mut builder = DoctorReportBuilder::default();
+        let uid = rustix::process::geteuid().as_raw();
+
+        check_private_directory(&mut builder, "missing", &root.path().join("nope"), uid);
+        fs::create_dir(root.path().join("private")).expect("dir");
+        fs::set_permissions(
+            root.path().join("private"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("mode");
+        check_private_directory(&mut builder, "private", &root.path().join("private"), uid);
+        fs::create_dir(root.path().join("shared")).expect("dir");
+        fs::set_permissions(
+            root.path().join("shared"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("mode");
+        check_private_directory(&mut builder, "shared", &root.path().join("shared"), uid);
+
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        let statuses: Vec<_> = report
+            .checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("missing", DiagnosticStatus::Warning),
+                ("private", DiagnosticStatus::Pass),
+                ("shared", DiagnosticStatus::Fail),
+            ]
+        );
+    }
+
+    #[test]
+    fn supervisor_check_flags_disagreeing_runtime_entries() {
+        let root = tempdir().expect("root");
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).expect("runtime dir");
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("mode");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let uid = rustix::process::geteuid().as_raw();
+
+        let mut fresh = DoctorReportBuilder::default();
+        check_supervisor(&mut fresh, &runtime, &inspector, uid);
+
+        fs::write(runtime.join("supervisor.lock"), b"x").expect("lock only");
+        let mut disagreeing = DoctorReportBuilder::default();
+        check_supervisor(&mut disagreeing, &runtime, &inspector, uid);
+        let report = disagreeing.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.status == DiagnosticStatus::Warning)
+        );
+        drop(fresh);
+    }
+
+    #[test]
+    fn live_supervisor_with_unreadable_identity_is_stale() {
+        let root = tempdir().expect("root");
+        let lock = root.path().join("supervisor.lock");
+        fs::write(&lock, b"not json").expect("lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).expect("lock mode");
+        let socket = root.path().join("supervisor.sock");
+        let _listener = UnixListener::bind(&socket).expect("socket");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("socket mode");
+
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let mut builder = DoctorReportBuilder::default();
+        check_live_supervisor(
+            &mut builder,
+            &lock,
+            &fs::symlink_metadata(&lock).expect("metadata"),
+            &fs::symlink_metadata(&socket).expect("metadata"),
+            &inspector,
+            rustix::process::geteuid().as_raw(),
+        );
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(report.healthy, "stale identity is a warning, not a failure");
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.status == DiagnosticStatus::Warning)
+        );
+    }
+
+    #[test]
+    fn doctor_exit_maps_failure_kinds_to_exit_codes() {
+        let healthy = DoctorReportBuilder::default().finish(
+            "tz".to_owned(),
+            None,
+            false,
+            serde_json::json!({}),
+        );
+        assert_eq!(doctor_exit(&healthy), ExitCode::SUCCESS);
+
+        let mut storage = DoctorReportBuilder::default();
+        storage.push("SQLite", DiagnosticStatus::Fail, "broken", None);
+        assert_eq!(
+            doctor_exit(&storage.finish("tz".to_owned(), None, false, serde_json::json!({}))),
+            exit::storage()
+        );
+
+        let mut supervision = DoctorReportBuilder::default();
+        supervision.push("supervisor", DiagnosticStatus::Fail, "unsafe", None);
+        assert_eq!(
+            doctor_exit(&supervision.finish("tz".to_owned(), None, false, serde_json::json!({}))),
+            exit::supervision()
+        );
+
+        let mut other = DoctorReportBuilder::default();
+        other.push("state directory", DiagnosticStatus::Fail, "shared", None);
+        assert_eq!(
+            doctor_exit(&other.finish("tz".to_owned(), None, false, serde_json::json!({}))),
+            exit::permission()
+        );
+    }
+
+    #[test]
+    fn job_state_parsing_accepts_known_states_only() {
+        for (value, expected) in [
+            ("scheduled", JobState::Scheduled),
+            ("waiting", JobState::Waiting),
+            ("starting", JobState::Starting),
+            ("running", JobState::Running),
+            ("cancel_requested", JobState::CancelRequested),
+            ("succeeded", JobState::Succeeded),
+            ("failed", JobState::Failed),
+            ("cancelled", JobState::Cancelled),
+            ("interrupted", JobState::Interrupted),
+            ("missed", JobState::Missed),
+        ] {
+            assert_eq!(parse_job_state(value), Ok(expected));
+        }
+        assert!(parse_job_state("").is_err());
+        assert!(parse_job_state("bogus").is_err());
+    }
+
+    #[test]
+    fn cancel_paths_are_idempotent_or_conflicting() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let grace = DurationSeconds::new(5).expect("grace");
+
+        // Already cancel-requested: satisfied without touching storage.
+        let pending = fixture_job(1_000);
+        store.create(&pending).expect("create");
+        store
+            .transition_job(
+                pending.id(),
+                pending.revision(),
+                JobState::CancelRequested,
+                false,
+                TransitionActor::Cli,
+                "seed",
+                UtcTimestamp::from_second(1_001).expect("ts"),
+            )
+            .expect("cancel requested");
+        let id = pending.id().to_string();
+        let satisfied = cancel_job(&mut store, &id, grace).expect("satisfied");
+        assert_eq!(satisfied.state(), JobState::CancelRequested);
+
+        // Terminal job: cancellation is refused.
+        let done = fixture_job(2_000);
+        store.create(&done).expect("create");
+        store
+            .transition_job(
+                done.id(),
+                done.revision(),
+                JobState::Missed,
+                false,
+                TransitionActor::Cli,
+                "seed",
+                UtcTimestamp::from_second(2_001).expect("ts"),
+            )
+            .expect("missed");
+        let done_id = done.id().to_string();
+        assert!(matches!(
+            cancel_job(&mut store, &done_id, grace),
+            Err(ManagementError::StateConflict(_))
+        ));
+    }
+
+    #[test]
+    fn finish_cancellation_maps_run_outcomes_to_terminal_jobs() {
+        for (run_state, expected) in [
+            (RunState::Succeeded, JobState::Succeeded),
+            (RunState::Cancelled, JobState::Cancelled),
+            (RunState::Failed, JobState::Failed),
+            (RunState::Interrupted, JobState::Interrupted),
+        ] {
+            let root = tempdir().expect("root");
+            let mut store = opened_store(root.path());
+            let job = fixture_job(3_000);
+            store.create(&job).expect("create");
+            let requested = store
+                .transition_job(
+                    job.id(),
+                    job.revision(),
+                    JobState::CancelRequested,
+                    false,
+                    TransitionActor::Cli,
+                    "seed",
+                    UtcTimestamp::from_second(3_001).expect("ts"),
+                )
+                .expect("cancel requested");
+            let finished = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
+                .expect("finish");
+            assert_eq!(finished.state(), expected);
+            // Already-terminal jobs return as-is instead of re-transitioning.
+            let again = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
+                .expect("repeat");
+            assert_eq!(again.revision(), finished.revision());
+            drop(requested);
+        }
+    }
+
+    #[test]
+    fn finish_cancellation_refuses_nonterminal_runs() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(4_000);
+        store.create(&job).expect("create");
+        store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::CancelRequested,
+                false,
+                TransitionActor::Cli,
+                "seed",
+                UtcTimestamp::from_second(4_001).expect("ts"),
+            )
+            .expect("cancel requested");
+        assert!(matches!(
+            finish_job_cancellation(&mut store, job.id(), RunState::Starting, NativeClock),
+            Err(ManagementError::StateConflict(_))
+        ));
+    }
+
+    #[test]
+    fn submission_rendering_reports_unsupervised_commits() {
+        let outcome = SubmissionOutcome::CommittedUnsupervised {
+            job: fixture_job(5_000),
+            error: SupervisorAckError("no supervisor socket".to_owned()),
+        };
+        render_submission(&outcome, true, false, ColorArg::Never);
+        render_submission(&outcome, false, true, ColorArg::Never);
+        render_submission(&outcome, false, false, ColorArg::Never);
+        let dry = SubmissionOutcome::DryRun(fixture_job(5_100));
+        render_submission(&dry, true, false, ColorArg::Never);
+    }
+
+    #[test]
+    fn error_output_selects_remediations_per_code() {
+        print_error(true, "JOB_NOT_FOUND", "gone");
+        print_error(true, "STATE_CONFLICT", "racing");
+        print_error(true, "STORAGE_ERROR", "disk");
+        print_error(false, "JOB_NOT_FOUND", "gone");
+    }
+
+    #[test]
+    fn manage_commands_render_without_a_supervisor() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let state_flag = state.clone().into_os_string();
+
+        // No database yet: not-found diagnostics, never a crash.
+        assert_eq!(
+            run([
+                OsString::from("atx"),
+                OsString::from("--state-dir"),
+                state_flag.clone(),
+                OsString::from("list")
+            ]),
+            exit::not_found()
+        );
+
+        let _store = {
+            fs::create_dir(&state).expect("state dir");
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("mode");
+            opened_store(&state)
+        };
+        for command in [vec!["--json", "history"], vec!["--quiet", "ps"]] {
+            let mut argv = vec![
+                OsString::from("atx"),
+                OsString::from("--state-dir"),
+                state_flag.clone(),
+            ];
+            argv.extend(command.iter().map(OsString::from));
+            assert_eq!(run(argv), ExitCode::SUCCESS, "command {command:?}");
+        }
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "show",
+                "zzzzzzzzzzzzzzzzzzzzzzzzzz",
+            ])),
+            exit::not_found()
+        );
+
+        for extra in [
+            vec![OsString::from("--json")],
+            vec![OsString::from("--quiet")],
+        ] {
+            let mut argv = vec![
+                OsString::from("atx"),
+                OsString::from("--state-dir"),
+                state_flag.clone(),
+            ];
+            argv.extend(extra);
+            argv.push(OsString::from("list"));
+            assert_eq!(run(argv), ExitCode::SUCCESS);
+        }
+
+        assert_eq!(
+            run([
+                OsString::from("atx"),
+                OsString::from("--state-dir"),
+                state_flag,
+                OsString::from("list"),
+                OsString::from("--state"),
+                OsString::from("bogus"),
+            ]),
+            exit::usage()
+        );
+    }
+
+    #[test]
+    fn monitor_and_supervisor_commands_surface_errors() {
+        let root = tempdir().expect("root");
+        assert_eq!(
+            run([
+                OsString::from("atx"),
+                OsString::from("__monitor"),
+                OsString::from("--state-dir"),
+                root.path().join("s").into_os_string(),
+                OsString::from("--runtime-dir"),
+                root.path().join("r").into_os_string(),
+                OsString::from("--job"),
+                OsString::from("not-a-job-id"),
+                OsString::from("--run"),
+                OsString::from("not-a-run-id"),
+            ]),
+            exit::supervision()
+        );
+
+        // A regular file cannot serve as the supervisor's state directory.
+        let blocker = root.path().join("blocker");
+        fs::write(&blocker, b"").expect("file");
+        assert_eq!(
+            run([
+                OsString::from("atx"),
+                OsString::from("__supervisor"),
+                OsString::from("--state-dir"),
+                blocker.clone().into_os_string(),
+                OsString::from("--runtime-dir"),
+                root.path().join("runtime").into_os_string(),
+            ]),
+            exit::supervision()
+        );
+        drop(blocker);
+    }
+
+    #[test]
+    fn schedule_calendar_option_conflicts_are_rejected() {
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        for args in [
+            vec!["atx", "--every", "5m", "--utc", "--", "true"],
+            vec!["atx", "--every", "5m", "--dst", "earlier", "--", "true"],
+            vec!["atx", "--every", "5m", "--no-rollover", "--", "true"],
+            vec!["atx", "--utc", "30s", "--", "true"],
+            vec!["atx", "--tz", "UTC", "30s", "--", "true"],
+            vec!["atx", "30s", "--dst", "later", "--", "true"],
+            vec!["atx", "--no-rollover", "30s", "--", "true"],
+            vec!["atx", "--every", "5m", "--tz", "UTC", "--", "true"],
+        ] {
+            let ParsedCli::Schedule(args) =
+                parse_from(args.into_iter().map(OsString::from)).expect("parse")
+            else {
+                unreachable!("schedule");
+            };
+            assert!(
+                build_job(&args, &config, wall, elapsed).is_err(),
+                "conflict accepted"
+            );
+        }
+
+        // A non-local default timezone resolves calendar input as named UTC.
+        let named = load_config(
+            None,
+            &[],
+            ConfigOverrides {
+                default_timezone: Some("UTC".to_owned()),
+                ..ConfigOverrides::default()
+            },
+        )
+        .expect("config");
+        let ParsedCli::Schedule(args) = parse_from(
+            ["atx", "23:59", "--", "true"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .expect("parse") else {
+            unreachable!("schedule");
+        };
+        assert!(build_job(&args, &named, wall, elapsed).is_ok());
+    }
+
+    #[test]
+    fn tty_echo_requires_a_terminal_stdout() {
+        // Test harnesses capture stdout through a pipe, so the submitting-tty
+        // probe must refuse rather than resolve a device path.
+        assert!(resolve_submitting_tty().is_err());
+    }
+
+    #[test]
+    fn env_assignments_require_a_key_before_the_equals_sign() {
+        assert_eq!(split_assignment("KEY=value"), Ok(("KEY", "value")));
+        assert_eq!(
+            split_assignment("KEY=with=equals"),
+            Ok(("KEY", "with=equals"))
+        );
+        assert!(split_assignment("NO_EQUALS").is_err());
+        assert!(split_assignment("=NO_KEY").is_err());
+    }
+
+    #[test]
+    fn env_files_reject_directories_nul_bytes_and_oversize() {
+        let root = tempdir().expect("root");
+
+        assert!(read_env_file(root.path()).is_err());
+
+        let nul = root.path().join("nul.env");
+        fs::write(&nul, b"A=1\0B=2").expect("write");
+        assert!(read_env_file(&nul).is_err());
+
+        let oversize = root.path().join("big.env");
+        fs::write(&oversize, vec![b'a'; 1024 * 1024 + 1]).expect("write");
+        assert!(read_env_file(&oversize).is_err());
+    }
+
+    #[test]
+    fn job_renderers_honor_json_and_quiet_modes() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(6_030).expect("scheduled"),
+                UtcTimestamp::from_second(6_001).expect("created"),
+            )
+            .expect("claim");
+        let runs = vec![run];
+
+        for mode in [
+            global(true, false),
+            global(false, true),
+            global(false, false),
+        ] {
+            render_jobs(std::slice::from_ref(&job), &mode);
+            render_runs(&runs, &mode);
+            render_job(&job, &mode);
+        }
     }
 }
