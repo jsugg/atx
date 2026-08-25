@@ -3220,7 +3220,7 @@ mod tests {
         fn set(key: &'static str, value: OsString) -> Self {
             // SAFETY: process-global mutation restored by Drop; no other test
             // reads these variables concurrently.
-            let saved = unsafe { std::env::var_os(key) };
+            let saved = std::env::var_os(key);
             unsafe { std::env::set_var(key, &value) };
             Self { key, saved }
         }
@@ -3357,7 +3357,7 @@ mod tests {
         let root = tempdir().expect("root");
         let state = private_dir(root.path(), "state");
         let runtime = private_dir(root.path(), "runtime");
-        let unit_path = root.join("config/systemd/user/atx.service");
+        let unit_path = root.path().join("config/systemd/user/atx.service");
         let _env = install_running_service_fixture(root.path(), &state, &runtime);
 
         // Installed + running: both JSON and human printers take the pass arm.
