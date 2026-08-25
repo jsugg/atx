@@ -320,6 +320,35 @@ mod tests {
     }
 
     #[test]
+    fn rerun_and_prefixes_reject_active_jobs_and_bad_input() {
+        let mut active = Store {
+            jobs: vec![waiting()],
+            hidden: false,
+            rerun: false,
+        };
+        assert!(matches!(
+            rerun_job(&mut active, "0", true, timestamp(10)),
+            Err(ManagementError::StateConflict(_))
+        ));
+        assert!(!active.rerun);
+
+        let store = Store {
+            jobs: vec![terminal(JobState::Succeeded)],
+            hidden: false,
+            rerun: false,
+        };
+        assert_eq!(
+            resolve_job(&store, "!!"),
+            Err(ManagementError::InvalidPrefix)
+        );
+        assert_eq!(resolve_job(&store, ""), Err(ManagementError::InvalidPrefix));
+        assert_eq!(
+            resolve_job(&store, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Err(ManagementError::InvalidPrefix)
+        );
+    }
+
+    #[test]
     fn result_limits_are_bounded_before_storage() {
         let store = Store {
             jobs: vec![terminal(JobState::Succeeded)],
