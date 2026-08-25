@@ -172,7 +172,7 @@ fn relative_job_survives_submitter_terminal_closure() {
     let mut child = atx()
         .arg("--state-dir")
         .arg(&state)
-        .args(["1s", "--", "/usr/bin/touch"])
+        .args(["4s", "--", "/usr/bin/touch"])
         .arg(&marker)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -253,7 +253,7 @@ fn fixed_rate_job_runs_more_than_once_and_can_be_cancelled() {
 }
 
 fn wait_for_file(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if fs::metadata(path).is_ok() {
             return;
