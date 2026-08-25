@@ -23,6 +23,10 @@ pub(crate) enum IpcMessage {
         job_id: JobId,
         revision: Revision,
     },
+    Nack {
+        protocol: u16,
+        reason: String,
+    },
     Shutdown {
         protocol: u16,
     },

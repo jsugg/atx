@@ -45,6 +45,8 @@ use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
 
 const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SUPERVISOR_READY_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     let args = args.into_iter().collect::<Vec<_>>();
@@ -1484,15 +1486,24 @@ impl SupervisorAcknowledger for SessionAcknowledger {
         }
         start_session_supervisor(&self.state_directory, &self.runtime_directory)
             .map_err(|error| SupervisorAckError(error.to_string()))?;
-        let mut last_error = SupervisorAckError("supervisor did not become ready".to_owned());
-        for _ in 0..40 {
-            std::thread::sleep(Duration::from_millis(50));
+        // The supervisor may still be opening its store and reconciling
+        // startup under load; poll until a hard deadline rather than a fixed
+        // attempt count.
+        let deadline = std::time::Instant::now() + SUPERVISOR_READY_TIMEOUT;
+        std::thread::sleep(SUPERVISOR_READY_POLL);
+        loop {
             match self.socket.acknowledge(job_id, revision) {
                 Ok(()) => return Ok(()),
-                Err(error) => last_error = error,
+                // A rejected wake is definitive; retrying cannot fix it.
+                Err(error) if error.to_string().contains("rejected the wake") => return Err(error),
+                Err(error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    std::thread::sleep(SUPERVISOR_READY_POLL);
+                }
             }
         }
-        Err(last_error)
     }
 }
 
