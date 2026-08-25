@@ -318,6 +318,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn vanished_proc_entries_map_to_dead_not_error() {
+        use std::io;
         assert!(proc_entry_vanished(&io::Error::from_raw_os_error(
             libc::ESRCH
         )));
