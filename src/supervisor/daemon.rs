@@ -155,7 +155,7 @@ fn serve_ipc(
                 // Every Wake gets a reply so clients never read a bare EOF:
                 // retry the load briefly to ride out transient database
                 // contention, then nack with the reason.
-                let reply = match load_deadline_with_retry(database_path, job_id, revision) {
+                let reply = match load_deadline_with_retry(database_path, job_id) {
                     Ok(deadline) => {
                         if sender
                             .send(SupervisorEvent::Schedule { job_id, deadline })
@@ -188,7 +188,6 @@ fn serve_ipc(
 fn load_deadline_with_retry(
     database_path: &Path,
     job_id: crate::domain::JobId,
-    revision: crate::domain::Revision,
 ) -> Result<crate::domain::ElapsedInstant, DaemonError> {
     const LOAD_ATTEMPTS: usize = 3;
     let mut last_error = DaemonError::MissingJob;
@@ -196,9 +195,9 @@ fn load_deadline_with_retry(
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
-        match load_deadline(database_path, job_id, revision) {
+        match load_deadline(database_path, job_id) {
             Ok(deadline) => return Ok(deadline),
-            // A missing or superseded revision is definitive; only retry
+            // A missing or terminal job is definitive; only retry
             // storage-level faults.
             Err(error @ (DaemonError::MissingJob | DaemonError::RevisionChanged)) => {
                 return Err(error);
@@ -209,14 +208,16 @@ fn load_deadline_with_retry(
     Err(last_error)
 }
 
+/// The wake carries the submitter's revision, but the deadline is always read
+/// from the freshly-loaded job: racing the supervisor's own Scheduled→Waiting
+/// transition must not nack a valid submission.
 fn load_deadline(
     database_path: &Path,
     job_id: crate::domain::JobId,
-    revision: crate::domain::Revision,
 ) -> Result<crate::domain::ElapsedInstant, DaemonError> {
     let store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
     let job = store.load(job_id)?.ok_or(DaemonError::MissingJob)?;
-    if job.revision() != revision || job.state().is_terminal() {
+    if job.state().is_terminal() {
         return Err(DaemonError::RevisionChanged);
     }
     let clock = NativeClock;
@@ -358,7 +359,7 @@ pub(crate) enum DaemonError {
     MissingIdentity,
     #[error("submitted job was not found")]
     MissingJob,
-    #[error("submitted job revision changed before acknowledgement")]
+    #[error("submitted job already reached a terminal state")]
     RevisionChanged,
     #[error("IPC thread panicked")]
     IpcThreadPanicked,
@@ -436,7 +437,7 @@ mod tests {
         let job = scheduled_job(1000, 1030);
         store.create(&job).expect("create");
         let db_path = root.path().join("atx.db");
-        load_deadline(&db_path, job.id(), job.revision()).expect("deadline");
+        load_deadline(&db_path, job.id()).expect("deadline");
     }
 
     #[test]
@@ -444,21 +445,35 @@ mod tests {
         let root = tempdir().expect("root");
         let _store = store_in(root.path());
         let db_path = root.path().join("atx.db");
-        let error = load_deadline(&db_path, JobId::new(), Revision::new(1).expect("revision"))
-            .expect_err("missing job");
+        let error = load_deadline(&db_path, JobId::new()).expect_err("missing job");
         assert!(matches!(error, DaemonError::MissingJob));
     }
 
     #[test]
-    fn load_deadline_reports_wrong_revision() {
+    fn load_deadline_accepts_job_after_revision_advanced() {
+        // The supervisor's own Scheduled→Waiting transition may race the wake;
+        // the deadline must still load from the freshly-read job.
         let root = tempdir().expect("root");
         let mut store = store_in(root.path());
         let job = scheduled_job(1000, 1030);
         store.create(&job).expect("create");
+        let advanced = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                UtcTimestamp::from_second(1001).expect("now"),
+            )
+            .expect("transition");
+        assert_ne!(advanced.revision(), job.revision());
         let db_path = root.path().join("atx.db");
-        let error = load_deadline(&db_path, job.id(), Revision::new(99).expect("revision"))
-            .expect_err("revision changed");
-        assert!(matches!(error, DaemonError::RevisionChanged));
+        // The deadline maps to the live elapsed clock; assert only that it
+        // loaded rather than nacked.
+        let deadline = load_deadline(&db_path, job.id()).expect("deadline after revision advance");
+        assert!(deadline.as_nanos() > 0);
     }
 
     #[test]
@@ -468,7 +483,7 @@ mod tests {
         let job = scheduled_job(1000, 1030);
         store.create(&job).expect("create");
         let now = UtcTimestamp::from_second(1001).expect("now");
-        let terminal = store
+        store
             .transition_job(
                 job.id(),
                 job.revision(),
@@ -480,8 +495,7 @@ mod tests {
             )
             .expect("mark terminal");
         let db_path = root.path().join("atx.db");
-        let error =
-            load_deadline(&db_path, job.id(), terminal.revision()).expect_err("terminal job");
+        let error = load_deadline(&db_path, job.id()).expect_err("terminal job");
         assert!(matches!(error, DaemonError::RevisionChanged));
     }
 
