@@ -899,12 +899,15 @@ fn ps_lists_monitor_and_command_roles_while_job_runs() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let marker = root.path().join("started");
+    // A short lead keeps the suite fast; 5s leaves room for a cold supervisor
+    // start on loaded runners, where startup reconciliation would otherwise
+    // mark the overdue one-shot missed before the wake lands.
     let script = format!("touch '{}'; sleep 30", marker.display());
     let submitted = atx()
         .arg("--json")
         .arg("--state-dir")
         .arg(&state)
-        .args(["1s", "--", "/bin/sh", "-c"])
+        .args(["5s", "--", "/bin/sh", "-c"])
         .arg(script)
         .output()
         .expect("submit ps candidate");
