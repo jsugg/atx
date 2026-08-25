@@ -297,7 +297,8 @@ mod tests {
         RecoveryStore, reconcile_startup,
     };
     use crate::domain::{
-        ElapsedInstant, JobState, ProcessIdentitySnapshot, TransitionActor, UtcTimestamp,
+        ElapsedInstant, JobState, ProcessIdentitySnapshot, RunOutcome, RunState, TransitionActor,
+        UtcTimestamp,
     };
 
     struct UnusedInspector(Cell<usize>);
@@ -310,6 +311,86 @@ mod tests {
             self.0.set(self.0.get() + 1);
             Ok(IdentityStatus::Dead)
         }
+    }
+
+    #[test]
+    fn interrupt_action_finalizes_the_claimed_run() {
+        let root = tempdir().expect("root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1, 100);
+        store.create(&job).expect("create");
+        let scheduled = UtcTimestamp::from_second(100).expect("scheduled");
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "loaded",
+                UtcTimestamp::from_second(2).expect("timestamp"),
+            )
+            .expect("waiting");
+        let starting = store
+            .transition_job(
+                job.id(),
+                waiting.revision(),
+                JobState::Starting,
+                false,
+                TransitionActor::Supervisor,
+                "claimed",
+                UtcTimestamp::from_second(3).expect("timestamp"),
+            )
+            .expect("starting");
+        let running = store
+            .transition_job(
+                job.id(),
+                starting.revision(),
+                JobState::Running,
+                false,
+                TransitionActor::Supervisor,
+                "spawned",
+                UtcTimestamp::from_second(4).expect("timestamp"),
+            )
+            .expect("running");
+        let run = store
+            .claim_run(
+                job.id(),
+                scheduled,
+                UtcTimestamp::from_second(50).expect("created"),
+            )
+            .expect("claim");
+
+        let action = RecoveryAction::Interrupt {
+            job_id: job.id(),
+            expected_revision: running.revision(),
+            run: Some((run.id(), run.claim_token())),
+            command_fate: CommandFate::Dead,
+        };
+        {
+            let mut startup =
+                StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+            startup
+                .apply_recovery(&[action], UtcTimestamp::from_second(200).expect("now"))
+                .expect("apply recovery");
+        }
+
+        let stored = store.load_run(run.id()).expect("load").expect("run");
+        assert_eq!(stored.state(), RunState::Interrupted);
+        assert_eq!(
+            stored.outcome(),
+            Some(&RunOutcome::Interrupted(
+                "run monitor and command are no longer alive".to_owned()
+            ))
+        );
+        assert_eq!(
+            stored.finished_at_utc(),
+            Some(UtcTimestamp::from_second(200).expect("ts"))
+        );
+        let updated = store.load(job.id()).expect("load job").expect("job");
+        assert_eq!(updated.state(), JobState::Interrupted);
     }
 
     #[test]
