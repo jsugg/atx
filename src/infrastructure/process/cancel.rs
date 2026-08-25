@@ -116,7 +116,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::application::{ElapsedClock, ProcessGroupCanceller};
-    use crate::domain::{Environment, ExecutionMode, ExecutionSpec, ProcessIdentitySnapshot};
+    use crate::domain::{Environment, ExecutionMode, ExecutionSpec};
     use crate::infrastructure::process::{
         CancellationResult, NativeGroupCanceller, NativeProcessInspector, NativeProcessRunner,
         cancel_validated_group,
@@ -187,12 +187,13 @@ mod tests {
     #[test]
     fn already_dead_identity_short_circuits_before_signalling() {
         let inspector = inspector();
-        let dead = ProcessIdentitySnapshot {
-            boot_identity: "boot-a".to_owned(),
-            pid: 4242,
-            start_token: 999,
-            process_group_id: 4242,
-        };
+        let runner = NativeProcessRunner::new(inspector.clone());
+        // A reaped child guarantees a genuinely dead identity; a hardcoded
+        // PID can collide with a live process on busy runners and be
+        // classified as reused instead of dead.
+        let child = runner.spawn(&shell("exit 0")).expect("spawn");
+        let dead = child.identity().clone();
+        child.wait_with_output().expect("wait");
         assert_eq!(
             cancel_validated_group(&inspector, &dead, Duration::from_millis(1))
                 .expect("classification"),
