@@ -270,6 +270,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn retention_policy_rejects_out_of_range_days() {
+        for (history, terminal) in [(0, 30), (3_651, 30), (30, 0), (30, 3_651)] {
+            assert!(RetentionPolicy::new(history, terminal).is_err());
+        }
+        assert!(RetentionPolicy::new(3_650, 3_650).is_ok());
+    }
+
+    #[test]
+    fn truncation_flags_require_the_live_claim() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE runs SET claim_token = ?1 WHERE id = ?2",
+                params![vec![9_u8; 32], run.id().to_string()],
+            )
+            .expect("substitute token");
+        assert!(matches!(
+            store.record_log_truncation(run.id(), run.claim_token(), true, false),
+            Err(super::super::StoreError::InvalidClaim)
+        ));
+    }
+
     fn state_name(state: JobState) -> &'static str {
         match state {
             JobState::Succeeded => "succeeded",

@@ -241,6 +241,8 @@ mod tests {
         RunState, RuntimeTier, Schedule, UtcTimestamp,
     };
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
+    use rusqlite::params;
+
     use crate::infrastructure::sqlite::{Database, JobStore};
     use crate::infrastructure::time::NativeClock;
 
@@ -334,6 +336,121 @@ mod tests {
 
         assert_eq!(completed.state(), RunState::Succeeded);
         assert_eq!(completed.outcome(), Some(&RunOutcome::Exit(0)));
+    }
+
+    #[test]
+    fn execute_rejects_substituted_claims_and_double_starts() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let execution = execution(ExecutionMode::Shell, &["true"]);
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let first = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let second = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(2_030).expect("scheduled"),
+                UtcTimestamp::from_second(2_001).expect("created"),
+            )
+            .expect("claim");
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE runs SET claim_token = ?1 WHERE id = ?2",
+                params![vec![9_u8; 32], second.id().to_string()],
+            )
+            .expect("substitute token");
+
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        assert!(matches!(
+            monitor.execute(&second, &execution),
+            Err(MonitorError::InvalidClaim)
+        ));
+
+        monitor.execute(&first, &execution).expect("first start");
+        assert!(matches!(
+            monitor.execute(&first, &execution),
+            Err(MonitorError::AlreadyStarted)
+        ));
+    }
+
+    #[test]
+    fn truncated_output_appends_a_notice_to_the_tty() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let tty = root.path().join("fake-tty");
+        fs::write(&tty, b"").expect("seed tty file");
+        let mut execution = execution(
+            ExecutionMode::Shell,
+            &["i=0; while [ \"$i\" -lt 4096 ]; do printf x; i=$((i+1)); done"],
+        );
+        execution
+            .set_notify_tty(tty.clone())
+            .expect("notify tty path");
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+
+        assert_eq!(completed.state(), RunState::Succeeded);
+        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        assert!(
+            echoed.contains("[atx: output truncated at capture cap]"),
+            "truncation notice missing: {echoed:?}"
+        );
+    }
+
+    #[test]
+    fn echo_tty_skips_unreadable_streams_without_touching_the_terminal() {
+        let root = tempdir().expect("root");
+        let tty = root.path().join("tty");
+        fs::write(&tty, b"before").expect("seed tty");
+
+        // Unreadable stdout log: nothing may be appended.
+        super::echo_tty(
+            &tty,
+            &root.path().join("missing-stdout.log"),
+            &root.path().join("also-missing.log"),
+            false,
+        );
+        assert_eq!(fs::read_to_string(&tty).expect("tty"), "before");
+
+        // Empty stdout, unreadable stderr log, no truncation: only the newline.
+        let stdout_log = root.path().join("stdout.log");
+        fs::write(&stdout_log, b"").expect("empty stdout");
+        super::echo_tty(
+            &tty,
+            &stdout_log,
+            &root.path().join("missing-stderr.log"),
+            false,
+        );
+        assert_eq!(fs::read_to_string(&tty).expect("tty"), "before\n");
     }
 
     #[test]
