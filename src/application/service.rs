@@ -181,12 +181,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rollback_failures_surface_both_errors() {
+        let mut manager = FakeManager::available();
+        manager.fail_install = true;
+        manager.fail_rollback = true;
+        assert!(matches!(
+            install_service(&mut manager),
+            Err(ServiceLifecycleError::InstallRollback { .. })
+        ));
+        assert_eq!(manager.uninstalls, 1);
+    }
+
+    #[test]
+    fn incomplete_installs_are_detected_and_rolled_back() {
+        // Install reports success but the service never starts.
+        let mut half = FakeManager::available();
+        half.half_install = true;
+        assert!(matches!(
+            install_service(&mut half),
+            Err(ServiceLifecycleError::IncompleteInstall(_))
+        ));
+        assert_eq!(half.uninstalls, 1);
+        assert!(!half.installed);
+
+        // A rollback that also fails carries both diagnostics.
+        let mut stuck = FakeManager::available();
+        stuck.half_install = true;
+        stuck.fail_rollback = true;
+        assert!(matches!(
+            install_service(&mut stuck),
+            Err(ServiceLifecycleError::InstallRollback { .. })
+        ));
+    }
+
+    #[test]
+    fn uninstall_verifies_removal_before_reporting_success() {
+        let mut manager = FakeManager::available();
+        manager.installed = true;
+        manager.running = true;
+        manager.stubborn_uninstall = true;
+        assert!(matches!(
+            uninstall_service(&mut manager),
+            Err(ServiceLifecycleError::IncompleteUninstall(_))
+        ));
+    }
+
     #[allow(clippy::struct_excessive_bools)]
     struct FakeManager {
         available: bool,
         installed: bool,
         running: bool,
         fail_install: bool,
+        fail_rollback: bool,
+        half_install: bool,
+        stubborn_uninstall: bool,
         installs: usize,
         uninstalls: usize,
     }
@@ -198,6 +247,9 @@ mod tests {
                 installed: false,
                 running: false,
                 fail_install: false,
+                fail_rollback: false,
+                half_install: false,
+                stubborn_uninstall: false,
                 installs: 0,
                 uninstalls: 0,
             }
@@ -234,14 +286,21 @@ mod tests {
             if self.fail_install {
                 return Err(ServiceManagerError::new("injected failure"));
             }
-            self.running = true;
+            if !self.half_install {
+                self.running = true;
+            }
             Ok(())
         }
 
         fn uninstall(&mut self) -> Result<(), ServiceManagerError> {
             self.uninstalls += 1;
-            self.installed = false;
-            self.running = false;
+            if self.fail_rollback {
+                return Err(ServiceManagerError::new("rollback failure"));
+            }
+            if !self.stubborn_uninstall {
+                self.installed = false;
+                self.running = false;
+            }
             Ok(())
         }
     }

@@ -92,11 +92,11 @@ mod tests {
     use std::cell::Cell;
 
     use super::{
-        CancelRunResult, CancellationStore, CancellationStoreError, GroupCancellation,
-        ProcessCancellationError, ProcessGroupCanceller, cancel_claimed_run,
+        CancelRunError, CancelRunResult, CancellationStore, CancellationStoreError,
+        GroupCancellation, ProcessCancellationError, ProcessGroupCanceller, cancel_claimed_run,
     };
     use crate::domain::{
-        ClaimToken, JobId, ProcessIdentitySnapshot, Run, RunId, Sequence, UtcTimestamp,
+        ClaimToken, JobId, ProcessIdentitySnapshot, Run, RunId, RunOutcome, Sequence, UtcTimestamp,
     };
 
     struct Store {
@@ -165,6 +165,109 @@ mod tests {
             cancel_claimed_run(&mut store, &FlagCanceller(&committed), id, token).expect("cancel");
         assert!(committed.get());
         assert!(matches!(result, CancelRunResult::Signalled { .. }));
+    }
+
+    struct MissingStore;
+
+    impl CancellationStore for MissingStore {
+        fn load_for_cancellation(&self, _id: RunId) -> Result<Option<Run>, CancellationStoreError> {
+            Ok(None)
+        }
+
+        fn commit_cancellation(
+            &mut self,
+            _id: RunId,
+            _claim_token: ClaimToken,
+        ) -> Result<Run, CancellationStoreError> {
+            Err(CancellationStoreError("nothing to commit".to_owned()))
+        }
+    }
+
+    #[test]
+    fn cancellation_rejects_missing_runs_and_stale_claims() {
+        let timestamp = UtcTimestamp::from_second(2_000).expect("timestamp");
+        let token = ClaimToken::from_bytes([7; 32]);
+        let run = Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            timestamp,
+            timestamp,
+            token,
+        );
+        let id = run.id();
+
+        let mut missing = MissingStore;
+        assert!(matches!(
+            cancel_claimed_run(&mut missing, &FlagCanceller(&Cell::new(false)), id, token),
+            Err(CancelRunError::NotFound)
+        ));
+
+        let mut store = Store {
+            run,
+            committed: false,
+        };
+        let stale = ClaimToken::from_bytes([9; 32]);
+        assert!(matches!(
+            cancel_claimed_run(&mut store, &FlagCanceller(&Cell::new(false)), id, stale),
+            Err(CancelRunError::InvalidClaim)
+        ));
+    }
+
+    #[test]
+    fn terminal_runs_and_prespawn_commits_short_circuit() {
+        let timestamp = UtcTimestamp::from_second(3_000).expect("timestamp");
+        let token = ClaimToken::from_bytes([7; 32]);
+        let finished = Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            timestamp,
+            timestamp,
+            token,
+        )
+        .mark_running(
+            timestamp,
+            identity(10, 100, 10),
+            identity(11, 101, 20),
+            "runs/out.log".to_owned(),
+            "runs/err.log".to_owned(),
+        )
+        .and_then(|run| {
+            run.with_outcome(
+                UtcTimestamp::from_second(3_002).expect("finished"),
+                RunOutcome::Exit(0),
+            )
+        })
+        .expect("terminal");
+        let id = finished.id();
+        let mut store = Store {
+            run: finished,
+            committed: false,
+        };
+        let result = cancel_claimed_run(&mut store, &FlagCanceller(&Cell::new(false)), id, token)
+            .expect("already terminal");
+        assert!(matches!(result, CancelRunResult::AlreadyTerminal(_)));
+        assert!(!store.committed);
+
+        // A run committed before the command spawned has no process group to
+        // signal; the canceller must never run.
+        let fresh = Run::new(
+            JobId::new(),
+            Sequence::new(2).expect("sequence"),
+            timestamp,
+            timestamp,
+            token,
+        );
+        let fresh_id = fresh.id();
+        let mut prespawn = Store {
+            run: fresh,
+            committed: false,
+        };
+        let signalled = Cell::new(false);
+        let result = cancel_claimed_run(&mut prespawn, &FlagCanceller(&signalled), fresh_id, token)
+            .expect("pre-spawn");
+        assert!(matches!(result, CancelRunResult::CommittedBeforeSpawn(_)));
+        assert!(prespawn.committed);
+        assert!(!signalled.get());
     }
 
     fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {

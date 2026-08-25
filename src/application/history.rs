@@ -334,4 +334,88 @@ mod tests {
             Err(RunOutputError::MissingLogs)
         ));
     }
+
+    #[test]
+    fn output_prefixes_reject_empty_and_oversized_inputs() {
+        let store = Store {
+            runs: Vec::new(),
+            jobs: Vec::new(),
+        };
+        let nowhere = std::path::Path::new("/nonexistent");
+        assert!(matches!(
+            read_run_output(&store, nowhere, ""),
+            Err(RunOutputError::InvalidPrefix)
+        ));
+        let oversized = "a".repeat(27);
+        assert!(matches!(
+            read_run_output(&store, nowhere, oversized.as_str()),
+            Err(RunOutputError::InvalidPrefix)
+        ));
+    }
+
+    #[test]
+    fn ambiguous_run_prefixes_are_rejected() {
+        let first = running_run("runs/a/stdout.log", "runs/a/stderr.log");
+        let second = running_run("runs/b/stdout.log", "runs/b/stderr.log");
+        let store = Store {
+            runs: vec![first, second],
+            jobs: Vec::new(),
+        };
+        assert!(matches!(
+            read_run_output(&store, std::path::Path::new("/nonexistent"), "0"),
+            Err(RunOutputError::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn uncaptured_runs_and_directory_logs_are_rejected() {
+        // A starting run has no log paths yet.
+        let timestamp = UtcTimestamp::from_second(4_000).expect("timestamp");
+        let fresh = Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            timestamp,
+            timestamp,
+            ClaimToken::from_bytes([7; 32]),
+        );
+        let store = Store::with_run(fresh);
+        assert!(matches!(
+            read_run_output(&store, std::path::Path::new("/nonexistent"), "0"),
+            Err(RunOutputError::NotCaptured)
+        ));
+
+        // Terminal spawn failures record an outcome without any capture.
+        let failed = Run::new(
+            JobId::new(),
+            Sequence::new(2).expect("sequence"),
+            timestamp,
+            timestamp,
+            ClaimToken::from_bytes([7; 32]),
+        )
+        .with_outcome(
+            UtcTimestamp::from_second(4_001).expect("finished"),
+            RunOutcome::Failure("spawn failed".to_owned()),
+        )
+        .expect("terminal");
+        let empty = read_run_output(
+            &Store::with_run(failed),
+            std::path::Path::new("/nowhere"),
+            "0",
+        )
+        .expect("empty capture");
+        assert_eq!(empty.stdout.content, b"");
+        assert_eq!(empty.stderr.content, b"");
+
+        // Log paths that resolve to directories are not readable files.
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let run = running_run("runs/x/stdout.log", "runs/x/stderr.log");
+        fs::create_dir_all(root.path().join("runs/x/stdout.log")).expect("stdout as dir");
+        fs::create_dir_all(root.path().join("runs/x/stderr.log")).expect("stderr as dir");
+        let dirs = Store::with_run(run);
+        assert!(matches!(
+            read_run_output(&dirs, root.path(), "0"),
+            Err(RunOutputError::MissingLogs)
+        ));
+    }
 }
