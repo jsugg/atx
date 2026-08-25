@@ -3227,7 +3227,7 @@ mod tests {
             // SAFETY: process-global mutation restored by Drop; no other test
             // reads these variables concurrently.
             let saved = std::env::var_os(key);
-            unsafe { std::env::set_var(key, &value) };
+            unsafe { std::env::set_var(key, value) };
             Self { key, saved }
         }
     }
