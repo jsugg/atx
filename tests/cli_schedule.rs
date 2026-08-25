@@ -367,27 +367,33 @@ fn wait_for(predicate: impl Fn() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
-/// Wait until `atx history <job>` shows at least one terminal run.
+/// Wait until `atx show <job>` reports a terminal job state. The run row and
+/// the job finalize are separate transactions, so the job state is what
+/// gates rerun/remove.
 fn wait_for_history(state: &std::path::Path, job: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let done = match atx()
             .arg("--state-dir")
             .arg(state)
-            .args(["history", job, "--limit", "1"])
+            .args(["show", job])
             .output()
         {
-            Ok(runs) if runs.status.success() => {
-                // Only a row for this job in a terminal state counts; an
-                // empty or transiently failing listing must keep waiting.
-                let text = String::from_utf8_lossy(&runs.stdout);
-                text.lines().any(|line| {
-                    line.contains(job)
-                        && matches!(
-                            line.split('\t').nth(2),
-                            Some("Succeeded" | "Failed" | "Cancelled" | "Interrupted")
+            Ok(job_view) if job_view.status.success() => {
+                // Only a terminal job counts; an empty or transiently
+                // failing listing must keep waiting.
+                String::from_utf8_lossy(&job_view.stdout)
+                    .lines()
+                    .any(|line| {
+                        matches!(
+                            line.trim(),
+                            "State: Succeeded"
+                                | "State: Failed"
+                                | "State: Cancelled"
+                                | "State: Interrupted"
+                                | "State: Missed"
                         )
-                })
+                    })
             }
             _ => false,
         };

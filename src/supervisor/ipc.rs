@@ -55,6 +55,10 @@ impl SocketAcknowledger {
                 job_id: acknowledged_job,
                 revision: acknowledged_revision,
             } if acknowledged_job == job_id && acknowledged_revision == revision => Ok(()),
+            IpcMessage::Nack {
+                protocol: PROTOCOL_VERSION,
+                reason,
+            } => Err(IpcError::Rejected(reason)),
             _ => Err(IpcError::InvalidAcknowledgement),
         }
     }
@@ -200,6 +204,8 @@ pub(crate) enum IpcError {
     FrameTooLarge,
     #[error("supervisor returned the wrong acknowledgement")]
     InvalidAcknowledgement,
+    #[error("supervisor rejected the wake: {0}")]
+    Rejected(String),
     #[error("runtime setup failed: {0}")]
     Runtime(String),
     #[error("IPC I/O failed: {0}")]
@@ -288,6 +294,34 @@ mod tests {
         });
         let client = SocketAcknowledger::new(socket, Duration::from_secs(1));
         client.acknowledge(job_id, revision).expect("acknowledged");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn wake_surfaces_a_nack_as_a_rejection() {
+        let root = tempdir().expect("root");
+        let socket = root.path().join("ack.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("permissions");
+        let job_id = JobId::new();
+        let revision = Revision::new(2).expect("revision");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_frame(&mut stream).expect("wake");
+            write_frame(
+                &mut stream,
+                &IpcMessage::Nack {
+                    protocol: 1,
+                    reason: "job not found".to_owned(),
+                },
+            )
+            .expect("nack");
+        });
+        let client = SocketAcknowledger::new(socket, Duration::from_secs(1));
+        let error = client
+            .acknowledge(job_id, revision)
+            .expect_err("nack must fail");
+        assert!(error.to_string().contains("rejected the wake"), "{error}");
         server.join().expect("server");
     }
 

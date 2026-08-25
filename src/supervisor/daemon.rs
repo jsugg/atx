@@ -152,28 +152,61 @@ fn serve_ipc(
                 job_id,
                 revision,
             }) => {
-                let loaded = load_deadline(database_path, job_id, revision);
-                if let Ok(deadline) = loaded {
-                    if sender
-                        .send(SupervisorEvent::Schedule { job_id, deadline })
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let _ = write_frame(
-                        &mut stream,
-                        &IpcMessage::Ack {
+                // Every Wake gets a reply so clients never read a bare EOF:
+                // retry the load briefly to ride out transient database
+                // contention, then nack with the reason.
+                let reply = match load_deadline_with_retry(database_path, job_id, revision) {
+                    Ok(deadline) => {
+                        if sender
+                            .send(SupervisorEvent::Schedule { job_id, deadline })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        IpcMessage::Ack {
                             protocol: 1,
                             job_id,
                             revision,
-                        },
-                    );
-                }
+                        }
+                    }
+                    Err(error) => IpcMessage::Nack {
+                        protocol: 1,
+                        reason: error.to_string(),
+                    },
+                };
+                let _ = write_frame(&mut stream, &reply);
             }
             Ok(IpcMessage::Shutdown { .. }) => break,
-            Ok(IpcMessage::Wake { .. } | IpcMessage::Ack { .. }) | Err(_) => {}
+            Ok(IpcMessage::Wake { .. } | IpcMessage::Ack { .. } | IpcMessage::Nack { .. })
+            | Err(_) => {}
         }
     }
+}
+
+/// Load the deadline, retrying transient database failures so a busy store
+/// under load does not turn into an immediate nack.
+fn load_deadline_with_retry(
+    database_path: &Path,
+    job_id: crate::domain::JobId,
+    revision: crate::domain::Revision,
+) -> Result<crate::domain::ElapsedInstant, DaemonError> {
+    const LOAD_ATTEMPTS: usize = 3;
+    let mut last_error = DaemonError::MissingJob;
+    for attempt in 0..LOAD_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        match load_deadline(database_path, job_id, revision) {
+            Ok(deadline) => return Ok(deadline),
+            // A missing or superseded revision is definitive; only retry
+            // storage-level faults.
+            Err(error @ (DaemonError::MissingJob | DaemonError::RevisionChanged)) => {
+                return Err(error);
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 fn load_deadline(
@@ -584,6 +617,45 @@ mod tests {
             },
         )
         .expect("write wake");
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn serve_ipc_answers_unknown_job_with_a_nack() {
+        let root = tempdir().expect("root");
+        // Schema must exist so the load fails on the missing row, not setup.
+        let _store = store_in(root.path());
+        let socket = root.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("mode");
+        // No store rows at all: the load fails and the client must receive an
+        // explicit nack instead of a silent connection close (EOF).
+        let db_clone = root.path().join("atx.db");
+        let (sender, _receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_ipc(&listener, &db_clone, &sender);
+        });
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        write_frame(
+            &mut client,
+            &IpcMessage::Wake {
+                protocol: 1,
+                job_id: JobId::new(),
+                revision: Revision::new(1).expect("revision"),
+            },
+        )
+        .expect("write wake");
+        let nack = read_frame(&mut client).expect("nack reply, not EOF");
+        assert!(
+            matches!(&nack, IpcMessage::Nack { protocol: 1, .. }),
+            "expected a nack, got: {nack:?}"
+        );
+        drop(client);
+        // The server only exits on a Shutdown frame; send it on a fresh
+        // connection like real clients do.
+        let mut shutdown = UnixStream::connect(&socket).expect("connect shutdown");
+        write_frame(&mut shutdown, &IpcMessage::Shutdown { protocol: 1 }).expect("shutdown");
         server.join().expect("join server");
     }
 
