@@ -133,3 +133,67 @@ fn service_managed_daemon_executes_due_jobs_and_stops_cleanly_on_sigterm() {
     // The stopped unit leaves no stale socket for the next start to trip on.
     assert!(!socket.exists(), "runtime socket survived daemon stop");
 }
+
+/// When the deadline fires but the store has been destroyed underneath it,
+/// the supervisor must report the failure and keep running, never crash.
+#[test]
+fn service_managed_daemon_survives_a_broken_store_at_execution_time() {
+    let root = tempdir().expect("root");
+    let mut daemon = spawn_daemon(root.path());
+    let socket = runtime_directory(root.path()).join("supervisor.sock");
+    wait_for(
+        || {
+            socket.exists()
+                && atx()
+                    .arg("--json")
+                    .arg("--state-dir")
+                    .arg(root.path().join("state"))
+                    .arg("list")
+                    .output()
+                    .expect("probe list")
+                    .status
+                    .success()
+        },
+        "daemon to finish initializing",
+    );
+
+    // Submit while the store is healthy so the Wake is acknowledged, then
+    // destroy the store before the deadline fires. The live daemon keeps its
+    // WAL sidecars open, so the path itself must become unopenable for the
+    // next fresh connection to fail.
+    let submitted = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(root.path().join("state"))
+        .args(["2s", "--", "/bin/sh", "-c", "true"])
+        .output()
+        .expect("submit job");
+    assert!(submitted.status.success(), "{submitted:?}");
+    for entry in ["atx.db", "atx.db-wal", "atx.db-shm"] {
+        match fs::remove_file(root.path().join("state").join(entry)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove {entry}: {error}"),
+        }
+    }
+    fs::create_dir(root.path().join("state").join("atx.db")).expect("block the store path");
+
+    wait_for(
+        || {
+            fs::read_to_string(root.path().join("daemon.err"))
+                .is_ok_and(|log| log.contains("atx supervisor:"))
+        },
+        "the daemon to report the execution failure",
+    );
+
+    kill_process(
+        Pid::from_raw(daemon.id().try_into().expect("pid")).expect("valid pid"),
+        Signal::TERM,
+    )
+    .expect("signal the daemon after the fault");
+    let status = daemon.wait().expect("reap daemon");
+    assert!(
+        status.success(),
+        "a broken store at execution time must not prevent a clean stop"
+    );
+}

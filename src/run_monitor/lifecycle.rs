@@ -627,6 +627,94 @@ mod tests {
     }
 
     #[test]
+    fn cancel_requested_before_completion_is_recorded_as_cancelled() {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        // A long-sleeping child leaves a wide window to cancel mid-run.
+        let execution = execution(ExecutionMode::Shell, &["/bin/sleep 20"]);
+        let job = job(execution.clone());
+        store.create(&job).expect("create");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+
+        // Mirror a concurrent `atx cancel`: once the run is live, flip it to
+        // CancelRequested and stop the child's process group. The monitor must
+        // record the cancellation instead of the raw signal death.
+        let canceller_store =
+            Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+                .expect("canceller database");
+        thread::spawn(move || {
+            let canceller = canceller_store.connection();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "run never reached the running state"
+                );
+                let started: i64 = canceller
+                    .query_row(
+                        "SELECT COUNT(*) FROM runs WHERE state = 'running'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("poll running state");
+                if started > 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            canceller
+                .execute(
+                    "UPDATE runs SET state = 'cancel_requested' WHERE state = 'running'",
+                    [],
+                )
+                .expect("mark cancel_requested");
+            let process_group_id: i64 = canceller
+                .query_row(
+                    "SELECT process_group_id FROM runs WHERE state = 'cancel_requested'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read process group");
+            // SAFETY: kill takes only scalar arguments.
+            unsafe { libc::kill(i32::try_from(process_group_id).expect("pid"), libc::SIGTERM) };
+        });
+
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 1_024);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+
+        assert_eq!(
+            completed.outcome(),
+            Some(&RunOutcome::Cancelled(
+                "cancel request stopped command".to_owned()
+            )),
+            "the cancel request must win over the child's signal death"
+        );
+        assert_eq!(
+            store
+                .load_run(run.id())
+                .expect("reload")
+                .expect("run")
+                .state(),
+            RunState::Cancelled
+        );
+    }
+
+    #[test]
     fn a_zero_capture_budget_fails_the_run_without_executing_twice() {
         let root = tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");

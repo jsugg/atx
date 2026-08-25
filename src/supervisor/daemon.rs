@@ -379,8 +379,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DaemonError, execute_due_jobs, load_deadline, request_ipc_shutdown, serve_ipc,
-        stop_signal_set,
+        DaemonError, execute_due_jobs, load_deadline, load_deadline_with_retry,
+        request_ipc_shutdown, serve_ipc, stop_signal_set,
     };
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
@@ -497,6 +497,26 @@ mod tests {
         let db_path = root.path().join("atx.db");
         let error = load_deadline(&db_path, job.id()).expect_err("terminal job");
         assert!(matches!(error, DaemonError::RevisionChanged));
+    }
+
+    #[test]
+    fn storage_faults_exhaust_the_wake_load_retries() {
+        let root = tempdir().expect("root");
+        let _store = store_in(root.path());
+        let db_path = root.path().join("atx.db");
+        // A directory at the database path makes every open fail with a
+        // storage-level fault; only such faults may exhaust the retries.
+        fs::remove_file(&db_path).expect("drop fresh database");
+        fs::create_dir(&db_path).expect("block the database path");
+
+        // A storage-level fault retries to exhaustion; only the definitive
+        // outcomes (missing job, changed revision) return immediately.
+        let error =
+            load_deadline_with_retry(&db_path, JobId::new()).expect_err("corrupt store fails");
+        assert!(!matches!(
+            error,
+            DaemonError::MissingJob | DaemonError::RevisionChanged
+        ));
     }
 
     #[test]
@@ -674,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn serve_ipc_stops_when_the_listener_fails() {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        let root = tempdir().expect("root");
+        let _store = store_in(root.path());
+        // A connected stream wrapped as a listener is never in listening
+        // state: accept fails immediately (EINVAL), which must end the IPC
+        // thread instead of spinning on a broken runtime socket.
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        let bogus_listener = unsafe { UnixListener::from_raw_fd(stream.into_raw_fd()) };
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let db_clone = root.path().join("atx.db");
+        let server = std::thread::spawn(move || serve_ipc(&bogus_listener, &db_clone, &sender));
+        server.join().expect("server must stop when accept fails");
+    }
+
+    #[test]
     fn request_ipc_shutdown_writes_shutdown_frame_to_runtime_socket() {
         let root = tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
@@ -733,5 +771,62 @@ mod tests {
         let db_path = root.path().join("atx.db");
         let result = execute_due_jobs(&db_path, root.path(), &runtime, &[]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_failing_run_monitor_spawn_records_a_failed_terminal_run() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let runtime = root.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        // The monitor spawns `current_exe __monitor`; a state directory whose
+        // supervisor.log path is a directory makes the spawn's log open fail,
+        // exercising the in-loop failure recording without touching main.rs.
+        fs::create_dir(root.path().join("supervisor.log")).expect("block the log path");
+
+        let now = UtcTimestamp::from_second(1001).expect("now");
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                now,
+            )
+            .expect("mark waiting");
+
+        // The failure arm runs inside run_loop's due-callback; drive it
+        // directly with one due job.
+        let db_path = root.path().join("atx.db");
+        execute_due_jobs(&db_path, root.path(), &runtime, &[job.id()]).expect("handled failure");
+
+        let mut statement = store
+            .database()
+            .connection()
+            .prepare("SELECT state, COALESCE(failure, '') FROM runs WHERE job_id = ?1")
+            .expect("prepare run query");
+        let rows: Vec<(String, String)> = statement
+            .query_map([waiting.id().to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query runs")
+            .map(|row| row.expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "failed");
+        assert!(
+            rows[0].1.contains("monitor spawn failed"),
+            "unexpected failure text: {:?}",
+            rows[0].1
+        );
+        assert_eq!(
+            store.load(job.id()).expect("reload").expect("job").state(),
+            JobState::Failed
+        );
     }
 }
