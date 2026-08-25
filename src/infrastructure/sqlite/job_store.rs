@@ -714,6 +714,62 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn lost_update_during_advance_conflicts_on_the_cas_write() {
+        let (_root, mut store) = store();
+        let job = recurring_job(1_000, 1_060);
+        store.create(&job).expect("create");
+        let at = |second: i64| UtcTimestamp::from_second(second).expect("timestamp");
+        let mut current = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                true,
+                TransitionActor::Supervisor,
+                "queued recurring",
+                at(1_001),
+            )
+            .expect("schedule recurring");
+        current = store
+            .transition_job(
+                current.id(),
+                current.revision(),
+                JobState::Starting,
+                true,
+                TransitionActor::Supervisor,
+                "starting",
+                at(1_002),
+            )
+            .expect("starting");
+        let running = store
+            .transition_job(
+                current.id(),
+                current.revision(),
+                JobState::Running,
+                true,
+                TransitionActor::Supervisor,
+                "running",
+                at(1_003),
+            )
+            .expect("running");
+
+        // Simulate a peer winning the row between the load and the CAS write:
+        // RAISE(IGNORE) silently skips the UPDATE, so changed == 0.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER ignore_job_updates BEFORE UPDATE ON jobs
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("trigger");
+        assert!(matches!(
+            store.advance_recurring_job(running.id(), running.revision(), at(1_061),),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
     fn advance_recurring_rejects_missing_job_with_not_found() {
         let (_root, mut store) = store();
         assert!(matches!(

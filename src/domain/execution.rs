@@ -444,14 +444,23 @@ mod tests {
             "stderr": "bounded_file",
             "shell_path": null
         });
-        let mut bad_policy = base.clone();
-        bad_policy["stdout"] = serde_json::json!("null");
-        assert!(
-            ExecutionSpec::from_persistence_json(
-                &serde_json::to_string(&bad_policy).expect("json")
-            )
-            .is_err()
-        );
+        // Each of the three stored policies must match the only value this
+        // build supports; any other shape is rejected before decode.
+        for (field, value) in [
+            ("stdin", "inherit"),
+            ("stdout", "discard"),
+            ("stderr", "null"),
+        ] {
+            let mut wrong_policy = base.clone();
+            wrong_policy[field] = serde_json::json!(value);
+            assert!(
+                ExecutionSpec::from_persistence_json(
+                    &serde_json::to_string(&wrong_policy).expect("json")
+                )
+                .is_err(),
+                "{field} = {value} must be rejected"
+            );
+        }
 
         let mut shell_without_path = base.clone();
         shell_without_path["mode"] = serde_json::json!("shell");

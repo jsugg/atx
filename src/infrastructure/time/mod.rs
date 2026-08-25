@@ -89,11 +89,21 @@ fn platform_elapsed() -> Result<ElapsedInstant, ClockError> {
     };
     // SAFETY: `info` is writable for the full C call and has the expected ABI.
     let status = unsafe { mach_timebase_info(&raw mut info) };
+    // SAFETY: `mach_continuous_time` has no arguments or memory preconditions.
+    let ticks = unsafe { mach_continuous_time() };
+    elapsed_from_mach(status, ticks, &info)
+}
+
+/// Converts a mach timebase reading, rejecting a failed `mach_timebase_info`.
+#[cfg(target_os = "macos")]
+fn elapsed_from_mach(
+    status: i32,
+    ticks: u64,
+    info: &MachTimebaseInfo,
+) -> Result<ElapsedInstant, ClockError> {
     if status != 0 {
         return Err(ClockError::Unavailable);
     }
-    // SAFETY: `mach_continuous_time` has no arguments or memory preconditions.
-    let ticks = unsafe { mach_continuous_time() };
     ticks_to_nanos(u128::from(ticks), info.numerator, info.denominator)
         .map(ElapsedInstant::from_nanos)
 }
@@ -115,6 +125,16 @@ fn platform_boot_identity() -> Result<String, ClockError> {
             0,
         )
     };
+    boot_identity_from_timeval(status, size, boot_time)
+}
+
+/// Validates the `kern.boottime` answer before trusting it as a boot identity.
+#[cfg(target_os = "macos")]
+fn boot_identity_from_timeval(
+    status: i32,
+    size: usize,
+    boot_time: libc::timeval,
+) -> Result<String, ClockError> {
     if status != 0
         || size != std::mem::size_of::<libc::timeval>()
         || boot_time.tv_sec <= 0
@@ -157,5 +177,62 @@ mod tests {
         assert_eq!(ticks_to_nanos(3, 2, 1).expect("ticks"), 6);
         assert!(ticks_to_nanos(1, 1, 0).is_err());
         assert!(ticks_to_nanos(u128::MAX, u32::MAX, 1).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_readings_reject_a_failed_timebase_call() {
+        use super::{MachTimebaseInfo, boot_identity_from_timeval, elapsed_from_mach};
+
+        let good = MachTimebaseInfo {
+            numerator: 1,
+            denominator: 1,
+        };
+        assert_eq!(
+            elapsed_from_mach(0, 7, &good)
+                .expect("valid reading")
+                .as_nanos(),
+            7
+        );
+        assert!(matches!(
+            elapsed_from_mach(-1, 7, &good),
+            Err(crate::application::ClockError::Unavailable)
+        ));
+
+        let boot_time = libc::timeval {
+            tv_sec: 1_700_000_000,
+            tv_usec: 42,
+        };
+        let identity =
+            boot_identity_from_timeval(0, std::mem::size_of::<libc::timeval>(), boot_time)
+                .expect("valid boot time");
+        assert_eq!(identity, "macos:1700000000:42");
+        // Every rejection arm must be reachable: syscall failure, truncated
+        // output buffer, non-positive seconds, and negative microseconds.
+        for (status, size, boot_time) in [
+            (-1, std::mem::size_of::<libc::timeval>(), boot_time),
+            (0, std::mem::size_of::<libc::timeval>() - 1, boot_time),
+            (
+                0,
+                std::mem::size_of::<libc::timeval>(),
+                libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+            ),
+            (
+                0,
+                std::mem::size_of::<libc::timeval>(),
+                libc::timeval {
+                    tv_sec: 10,
+                    tv_usec: -1,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                boot_identity_from_timeval(status, size, boot_time),
+                Err(crate::application::ClockError::Unavailable)
+            ));
+        }
     }
 }

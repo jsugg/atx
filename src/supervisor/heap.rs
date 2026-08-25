@@ -131,15 +131,56 @@ mod tests {
     use crate::domain::{ElapsedInstant, JobId};
 
     #[test]
+    fn removing_a_deep_entry_can_sift_the_replacement_up() {
+        use std::collections::HashMap;
+
+        let mut heap = DeadlineHeap::default();
+        // Upserting in this order builds the valid heap layout
+        // [1, 2, 3, 50, 100, 4, 60, 61, 62, 200, 201, 5]: index 9 (due 200)
+        // sits under index 4 (due 100), while the last entry (due 5) sits
+        // under index 5 (due 4). Removing index 9 therefore moves due 5 into
+        // a slot whose parent (due 100) is larger, which must sift it up.
+        let dues = [1_u128, 2, 3, 50, 100, 4, 60, 61, 62, 200, 201, 5];
+        let jobs: Vec<JobId> = dues.iter().map(|_| JobId::new()).collect();
+        let due_of: HashMap<JobId, u128> = std::iter::zip(jobs.iter().copied(), dues).collect();
+        for (&job_id, &due) in std::iter::zip(&jobs, &dues) {
+            heap.upsert(job_id, ElapsedInstant::from_nanos(due));
+        }
+        assert_eq!(
+            heap.entries
+                .iter()
+                .map(|entry| entry.due.as_nanos())
+                .collect::<Vec<_>>(),
+            dues.to_vec()
+        );
+
+        assert!(heap.remove(jobs[9]));
+        assert_eq!(heap.positions.len(), heap.entries.len());
+        assert_eq!(
+            heap.entries[4].due.as_nanos(),
+            5,
+            "replacement must have sifted up past its larger parent"
+        );
+
+        // The heap stays consistent: everything drains in due order.
+        let drained = heap.pop_due(ElapsedInstant::from_nanos(u128::MAX));
+        let mut expected: Vec<u128> = dues.to_vec();
+        expected.retain(|&due| due != 200);
+        expected.sort_unstable();
+        let mut drained_dues: Vec<u128> =
+            drained.into_iter().map(|job_id| due_of[&job_id]).collect();
+        drained_dues.sort_unstable();
+        assert_eq!(drained_dues, expected);
+        assert!(heap.is_empty());
+    }
+
+    #[test]
     fn ordering_ties_updates_and_removal_are_deterministic() {
         let mut heap = DeadlineHeap::default();
-        let first = JobId::new();
-        let second = JobId::new();
-        let (lower, higher) = if first < second {
-            (first, second)
-        } else {
-            (second, first)
-        };
+        // Fixed IDs so both arms of the tie-break comparison are exercised.
+        let first = JobId::from_u128(2);
+        let second = JobId::from_u128(1);
+        let (lower, higher) = (second, first);
 
         heap.upsert(first, ElapsedInstant::from_nanos(20));
         heap.upsert(second, ElapsedInstant::from_nanos(10));

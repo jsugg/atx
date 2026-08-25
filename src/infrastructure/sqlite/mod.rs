@@ -278,7 +278,7 @@ mod tests {
     use rustix::fs::OpenOptionsExt as _;
     use tempfile::tempdir;
 
-    use super::{CURRENT_SCHEMA_VERSION, Database, apply_migrations};
+    use super::{CURRENT_SCHEMA_VERSION, Database, apply_migrations, map_read_error};
 
     #[test]
     fn schema_has_expected_constraints_and_indexes() {
@@ -578,6 +578,19 @@ mod tests {
                 "{table}"
             );
         }
+    }
+
+    #[test]
+    fn non_store_conversion_failures_stay_sqlite_errors() {
+        let error = map_read_error(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other("not a store error")),
+        ));
+        assert!(
+            error.to_string().starts_with("database operation failed"),
+            "{error}"
+        );
     }
 
     #[test]
