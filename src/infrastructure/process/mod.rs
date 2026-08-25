@@ -169,8 +169,10 @@ fn inspect_platform(
         )
     };
     if written == 0 {
+        // proc_pidinfo cannot see zombies (ESRCH), but an unreaped child is
+        // still a live identity for spawn/cancel bookkeeping; sysctl observes it.
         return match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) | None => Ok(None),
+            Some(libc::ESRCH) | None => inspect_zombie_via_sysctl(pid, boot_identity),
             Some(libc::EPERM | libc::EACCES) => Err(ProcessError::PermissionDenied),
             _ => Err(ProcessError::Unavailable),
         };
@@ -191,6 +193,81 @@ fn inspect_platform(
         pid: info.pbi_pid,
         start_token,
         process_group_id,
+    };
+    validate_snapshot(&snapshot)?;
+    Ok(Some(snapshot))
+}
+
+/// Inspect a PID through `sysctl(CTL_KERN/KERN_PROC/PID)`, the only interface
+/// on macOS that still reports unreaped zombies. Returns `Ok(None)` when the
+/// kernel has no such process.
+#[cfg(target_os = "macos")]
+fn inspect_zombie_via_sysctl(
+    pid: i32,
+    boot_identity: &str,
+) -> Result<Option<ProcessIdentitySnapshot>, ProcessError> {
+    #[repr(C)]
+    struct KinfoProcBytes([u8; KINFO_PROC_SIZE]);
+    // SAFETY-CONTRACT: 648 bytes matches sizeof(struct kinfo_proc) on arm64
+    // and x86_64; sysctl rejects smaller buffers with ENOMEM. Field offsets
+    // verified with offsetof() against <sys/sysctl.h>.
+    const KINFO_PROC_SIZE: usize = 648;
+    const STARTTIME_SEC_OFFSET: usize = 0;
+    const STARTTIME_USEC_OFFSET: usize = 8;
+    const PID_OFFSET: usize = 40;
+    const PGID_OFFSET: usize = 564;
+
+    fn read_i32(raw: &[u8; KINFO_PROC_SIZE], offset: usize) -> Option<i32> {
+        Some(i32::from_ne_bytes(
+            raw.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut raw = std::mem::MaybeUninit::<KinfoProcBytes>::zeroed();
+    let mut size = KINFO_PROC_SIZE;
+    // SAFETY: `raw` points to writable storage of exactly `size` bytes.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            raw.as_mut_ptr().cast(),
+            std::ptr::addr_of_mut!(size),
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(ProcessError::Unavailable);
+    }
+    if size == 0 {
+        return Ok(None);
+    }
+    if size != KINFO_PROC_SIZE {
+        return Err(ProcessError::Malformed);
+    }
+    // SAFETY: sysctl wrote exactly KINFO_PROC_SIZE bytes.
+    let raw = unsafe { raw.assume_init() };
+    let (Some(start_sec), Some(usec), Some(recorded), Some(group)) = (
+        read_i32(&raw.0, STARTTIME_SEC_OFFSET).map(i64::from),
+        read_i32(&raw.0, STARTTIME_USEC_OFFSET).map(i64::from),
+        read_i32(&raw.0, PID_OFFSET),
+        read_i32(&raw.0, PGID_OFFSET),
+    ) else {
+        return Err(ProcessError::Malformed);
+    };
+    if recorded != pid {
+        return Err(ProcessError::Malformed);
+    }
+    let start_token = start_sec
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(usec))
+        .ok_or(ProcessError::Malformed)?;
+    let snapshot = ProcessIdentitySnapshot {
+        boot_identity: boot_identity.to_owned(),
+        pid: u32::try_from(pid).map_err(|_| ProcessError::InvalidIdentity)?,
+        start_token: u64::try_from(start_token).map_err(|_| ProcessError::Malformed)?,
+        process_group_id: group,
     };
     validate_snapshot(&snapshot)?;
     Ok(Some(snapshot))
@@ -293,6 +370,32 @@ mod tests {
     fn inspect_rejects_pid_zero() {
         let inspector = NativeProcessInspector::new("boot-a".to_owned());
         assert!(inspector.inspect(0).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_but_unreaped_child_still_reports_its_identity() {
+        // proc_pidinfo cannot observe zombies; the sysctl fallback must keep
+        // reporting the identity so spawn inspection survives fast commands.
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        loop {
+            match inspector.inspect(pid).expect("inspect zombie") {
+                Some(identity) => {
+                    assert_eq!(identity.pid, pid);
+                    assert!(identity.process_group_id > 0);
+                    break;
+                }
+                None => panic!("unreaped child vanished from inspection"),
+            }
+        }
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "linux")]

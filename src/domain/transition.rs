@@ -187,7 +187,9 @@ pub(crate) enum TransitionError {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{Completion, TransitionActor, complete_run, job_transition, run_transition};
+    use super::{
+        Completion, TransitionActor, TransitionError, complete_run, job_transition, run_transition,
+    };
     use crate::domain::state::{JobState, RunState};
 
     #[test]
@@ -274,6 +276,14 @@ mod tests {
             complete_run(RunState::CancelRequested, Completion::Exit(7)),
             Ok(RunState::Failed)
         );
+        // A cancellation completion without a committed cancel request is a
+        // protocol violation, not a cancelled outcome.
+        for state in [RunState::Starting, RunState::Running] {
+            assert_eq!(
+                complete_run(state, Completion::TerminatedByCancellation),
+                Err(TransitionError::CancellationNotCommitted)
+            );
+        }
     }
 
     #[test]

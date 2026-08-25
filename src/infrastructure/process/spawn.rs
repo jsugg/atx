@@ -71,9 +71,9 @@ impl NativeProcessRunner {
                             return Err(SpawnError::ExitedBeforeInspection);
                         }
                         // The child stays unreaped while retrying: a zombie
-                        // pins the PID, so there is no reuse risk, and on
-                        // some platforms an exited-but-unreaped child is
-                        // still inspectable.
+                        // pins the PID, so there is no reuse risk. Zombies
+                        // stay inspectable via /proc on Linux and via the
+                        // sysctl fallback on macOS.
                         std::thread::sleep(INSPECTION_RETRY_DELAY);
                     }
                     Err(error) => {
