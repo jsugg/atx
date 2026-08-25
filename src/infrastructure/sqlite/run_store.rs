@@ -1158,7 +1158,7 @@ mod tests {
                         claim_token, outcome_json, terminating_signal, exit_code,
                         stdout_path, stderr_path
                      ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
-                        '1970-01-01T00:00:01Z', 'failed', ?3, '{\"Signal\":9}', 9, 0, '', '')",
+                        '1970-01-01T00:00:01Z', 'failed', ?3, '{\"kind\":\"signal\",\"value\":9}', 9, 0, '', '')",
                     params![run_id(7).to_string(), job.id().to_string(), vec![0_u8; 32]],
                 )
                 .expect("seed");
@@ -1251,7 +1251,7 @@ mod tests {
                         id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
                         claim_token, outcome_json, exit_code, stdout_path, stderr_path
                      ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
-                        '1970-01-01T00:00:01Z', 'succeeded', ?3, '{\"Exit\":0}', 7, '', '')",
+                        '1970-01-01T00:00:01Z', 'succeeded', ?3, '{\"kind\":\"exit\",\"value\":0}', 7, '', '')",
                     params![run_id(6).to_string(), job.id().to_string(), vec![0_u8; 32]],
                 )
                 .expect("seed");
@@ -1305,6 +1305,274 @@ mod tests {
                     .outcome(),
                 Some(&outcome)
             );
+        }
+    }
+
+    #[test]
+    fn non_constraint_claim_failures_pass_through_as_sqlite_errors() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        // A failing trigger that is not a constraint violation must not be
+        // misreported as DuplicateClaim.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER broken_run_insert BEFORE INSERT ON runs
+                 BEGIN INSERT INTO no_such_table VALUES (1); END;",
+            )
+            .expect("trigger");
+        assert!(matches!(
+            store.claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            ),
+            Err(StoreError::Sqlite(_))
+        ));
+    }
+
+    #[test]
+    fn lost_update_races_surface_as_conflict_on_every_transition() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_100);
+        store.create(&job).expect("job");
+        let claimed: Vec<_> = (0..3)
+            .map(|offset| {
+                store
+                    .claim_run(
+                        job.id(),
+                        UtcTimestamp::from_second(1_030 + offset).expect("scheduled"),
+                        UtcTimestamp::from_second(1_001).expect("created"),
+                    )
+                    .expect("claim")
+            })
+            .collect();
+        // Simulate a peer winning the row between our load and our UPDATE:
+        // RAISE(IGNORE) silently skips the statement, so changed == 0.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER ignore_run_updates BEFORE UPDATE ON runs
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("trigger");
+        assert!(matches!(
+            store.mark_run_running(
+                claimed[0].id(),
+                claimed[0].claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            ),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.record_run_terminal(
+                claimed[1].id(),
+                claimed[1].claim_token(),
+                UtcTimestamp::from_second(1_003).expect("finished"),
+                RunOutcome::Exit(0),
+            ),
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.request_run_cancellation(claimed[2].id(), claimed[2].claim_token(),),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn terminal_record_conflicts_when_finish_time_differs() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        let finished = UtcTimestamp::from_second(1_003).expect("finished");
+        store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Exit(0),
+            )
+            .expect("complete");
+        // Same outcome but a different finish time on an already-terminal run.
+        assert!(matches!(
+            store.record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                UtcTimestamp::from_second(1_004).expect("later finish"),
+                RunOutcome::Exit(0),
+            ),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn non_decode_read_errors_stay_sqlite_errors() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        store
+            .database()
+            .connection()
+            .execute_batch("DROP TABLE runs;")
+            .expect("drop table");
+        assert!(matches!(
+            store.load_run(run_id(50)),
+            Err(StoreError::Sqlite(_))
+        ));
+    }
+
+    // Seed a runs row via direct SQL so `updates` can produce column states
+    // the store would never write, then leave check constraints off.
+    fn seed_outcome_row(store: &mut JobStore, n: i64, id: RunId, updates: &str) {
+        let scheduled = n * 1_000;
+        let job = sample_job(scheduled, scheduled + 30);
+        store.create(&job).expect("job");
+        let connection = store.database().connection();
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .expect("disable checks");
+        connection
+            .execute(
+                "INSERT INTO runs(
+                    id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                    claim_token, stdout_path, stderr_path
+                 ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                    '1970-01-01T00:00:01Z', 'starting', randomblob(32), '', '')",
+                params![id.to_string(), job.id().to_string()],
+            )
+            .expect("seed");
+        connection
+            .execute(
+                &format!("UPDATE runs SET {updates}, finished_at_utc = '1970-01-01T00:00:02Z' WHERE id = ?1"),
+                [id.to_string()],
+            )
+            .expect("apply updates");
+    }
+
+    #[test]
+    fn outcome_column_combinations_validate_against_json() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let cases: [(i64, &str, Option<RunOutcome>); 13] = [
+            (
+                21,
+                "state='failed', outcome_json=NULL, terminating_signal=9",
+                None,
+            ),
+            (
+                22,
+                "state='failed', outcome_json=NULL, failure='boom'",
+                None,
+            ),
+            (
+                23,
+                "state='succeeded', outcome_json='{\"kind\":\"exit\",\"value\":0}', exit_code=5",
+                None,
+            ),
+            (
+                24,
+                "state='succeeded', outcome_json='{\"kind\":\"exit\",\"value\":0}', exit_code=0, terminating_signal=9",
+                None,
+            ),
+            (
+                25,
+                "state='succeeded', outcome_json='{\"kind\":\"exit\",\"value\":0}', exit_code=0, failure='boom'",
+                None,
+            ),
+            (
+                26,
+                "state='failed', outcome_json='{\"kind\":\"signal\",\"value\":9}', terminating_signal=5",
+                None,
+            ),
+            (
+                27,
+                "state='failed', outcome_json='{\"kind\":\"signal\",\"value\":9}', terminating_signal=9, exit_code=0",
+                None,
+            ),
+            (
+                28,
+                "state='failed', outcome_json='{\"kind\":\"signal\",\"value\":9}', terminating_signal=9, failure='boom'",
+                None,
+            ),
+            (
+                29,
+                "state='failed', outcome_json='{\"kind\":\"failure\",\"value\":\"a\"}', failure='b'",
+                None,
+            ),
+            (
+                30,
+                "state='failed', outcome_json='{\"kind\":\"failure\",\"value\":\"a\"}', failure='a', exit_code=0",
+                None,
+            ),
+            (
+                31,
+                "state='failed', outcome_json='{\"kind\":\"failure\",\"value\":\"a\"}', failure='a', terminating_signal=1",
+                None,
+            ),
+            (
+                32,
+                "state='interrupted', outcome_json='{\"kind\":\"interrupted\",\"value\":\"a\"}', failure='a'",
+                Some(RunOutcome::Interrupted("a".to_owned())),
+            ),
+            (
+                33,
+                "state='cancelled', outcome_json='{\"kind\":\"cancelled\",\"value\":\"a\"}', failure='a'",
+                Some(RunOutcome::Cancelled("a".to_owned())),
+            ),
+        ];
+        for (n, updates, want) in cases {
+            let id = run_id(u128::try_from(n).expect("positive"));
+            seed_outcome_row(&mut store, n, id, updates);
+            match want {
+                Some(outcome) => assert_eq!(
+                    store.load_run(id).expect("decode").expect("run").outcome(),
+                    Some(&outcome),
+                    "{updates}"
+                ),
+                None => assert!(
+                    matches!(store.load_run(id), Err(StoreError::Corrupt(_))),
+                    "{updates}"
+                ),
+            }
         }
     }
 }
