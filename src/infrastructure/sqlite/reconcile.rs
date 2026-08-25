@@ -607,6 +607,81 @@ mod tests {
         assert!(error.to_string().contains("terminal or missing job"));
     }
 
+    #[test]
+    fn two_active_runs_for_one_job_are_corrupt() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = sample_job(5_000, 5_030);
+        store.create(&job).expect("create");
+        // Distinct scheduled slots each claim their own still-starting run.
+        for second in [5_030_i64, 6_030] {
+            store
+                .claim_run(job.id(), timestamp(second), timestamp(second - 29))
+                .expect("claim");
+        }
+        let startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        let error = startup
+            .load_nonterminal()
+            .expect_err("duplicate active runs must be corrupt");
+        assert!(error.to_string().contains("more than one active run"));
+    }
+
+    #[test]
+    fn interrupt_without_a_claimed_run_still_interrupts_the_job() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let (job, run, revision) = claimed_job(&mut store, 7_000);
+
+        let action = RecoveryAction::Interrupt {
+            job_id: job.id(),
+            expected_revision: revision,
+            run: None,
+            command_fate: CommandFate::Unknown,
+        };
+        {
+            let mut startup =
+                StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+            startup
+                .apply_recovery(&[action], timestamp(8_000))
+                .expect("apply");
+        }
+        let recovered = store.load(job.id()).expect("load").expect("job");
+        assert_eq!(recovered.state(), JobState::Interrupted);
+        // The untouched run must remain claimable state: no run rows changed.
+        let stored = store.load_run(run.id()).expect("run").expect("run");
+        assert_eq!(stored.state(), RunState::Starting);
+    }
+
+    #[test]
+    fn stale_advance_recurring_conflicts() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = sample_job(9_000, 9_030);
+        store.create(&job).expect("create");
+
+        let action = RecoveryAction::AdvanceRecurring {
+            job_id: job.id(),
+            expected_revision: job.revision(),
+            next_due_utc: timestamp(9_100),
+        };
+        {
+            let mut startup =
+                StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+            startup
+                .apply_recovery(std::slice::from_ref(&action), timestamp(9_050))
+                .expect("first advance");
+        }
+        // Replaying with the pre-advance revision matches zero rows.
+        let mut startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        assert!(
+            startup
+                .apply_recovery(std::slice::from_ref(&action), timestamp(9_060))
+                .is_err()
+        );
+    }
+
     fn timestamp(second: i64) -> UtcTimestamp {
         UtcTimestamp::from_second(second).expect("timestamp")
     }

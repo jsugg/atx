@@ -313,6 +313,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_malformed_timezone_selections() {
+        let now = UtcTimestamp::from_str("2026-01-01T00:00:00Z").expect("valid timestamp");
+        let zones = [
+            "",                      // empty
+            "America/N\u{e9}w_York", // non-ASCII
+            "America/New_York\0",    // embedded NUL
+            &"A/".repeat(128),       // over the 255-byte cap
+        ];
+        for zone in zones {
+            assert!(
+                matches!(
+                    resolve_calendar(
+                        "2027-01-01T09:30",
+                        &TimeZoneSelection::Named(zone.to_owned()),
+                        DstResolution::Reject,
+                        false,
+                        now,
+                    ),
+                    Err(super::CalendarError::InvalidTimeZone)
+                ),
+                "{zone}"
+            );
+        }
+    }
+
     proptest::proptest! {
         /// Every accepted resolution must map back to the exact wall clock
         /// that was asked for, in the selected zone. DST policies may reject

@@ -227,6 +227,41 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn installed_but_stopped_service_is_repaired_by_install() {
+        let mut manager = FakeManager::available();
+        manager.installed = true;
+        assert!(
+            install_service(&mut manager)
+                .expect("stopped service is installable")
+                .changed
+        );
+        assert_eq!(manager.installs, 1);
+    }
+
+    #[test]
+    fn phantom_install_that_leaves_nothing_behind_is_rolled_back() {
+        let mut manager = FakeManager::available();
+        manager.phantom_install = true;
+        assert!(matches!(
+            install_service(&mut manager),
+            Err(ServiceLifecycleError::IncompleteInstall(_))
+        ));
+        assert_eq!(manager.uninstalls, 1);
+    }
+
+    #[test]
+    fn uninstall_that_leaves_the_process_running_is_incomplete() {
+        let mut manager = FakeManager::available();
+        manager.installed = true;
+        manager.running = true;
+        manager.lingering_process = true;
+        assert!(matches!(
+            uninstall_service(&mut manager),
+            Err(ServiceLifecycleError::IncompleteUninstall(_))
+        ));
+    }
+
     #[allow(clippy::struct_excessive_bools)]
     struct FakeManager {
         available: bool,
@@ -235,7 +270,9 @@ mod tests {
         fail_install: bool,
         fail_rollback: bool,
         half_install: bool,
+        phantom_install: bool,
         stubborn_uninstall: bool,
+        lingering_process: bool,
         installs: usize,
         uninstalls: usize,
     }
@@ -249,7 +286,9 @@ mod tests {
                 fail_install: false,
                 fail_rollback: false,
                 half_install: false,
+                phantom_install: false,
                 stubborn_uninstall: false,
+                lingering_process: false,
                 installs: 0,
                 uninstalls: 0,
             }
@@ -282,11 +321,13 @@ mod tests {
 
         fn install(&mut self) -> Result<(), ServiceManagerError> {
             self.installs += 1;
-            self.installed = true;
+            if !self.phantom_install {
+                self.installed = true;
+            }
             if self.fail_install {
                 return Err(ServiceManagerError::new("injected failure"));
             }
-            if !self.half_install {
+            if !self.half_install && !self.phantom_install {
                 self.running = true;
             }
             Ok(())
@@ -299,6 +340,8 @@ mod tests {
             }
             if !self.stubborn_uninstall {
                 self.installed = false;
+            }
+            if !self.lingering_process && !self.stubborn_uninstall {
                 self.running = false;
             }
             Ok(())

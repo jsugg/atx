@@ -177,6 +177,21 @@ mod tests {
     }
 
     #[test]
+    fn removing_the_root_moves_the_last_entry_into_place() {
+        let mut heap = DeadlineHeap::default();
+        let root = JobId::new();
+        let later = JobId::new();
+        heap.upsert(root, ElapsedInstant::from_nanos(10));
+        heap.upsert(later, ElapsedInstant::from_nanos(20));
+
+        // The popped last entry lands at index 0, so only sift-down applies.
+        assert!(heap.remove(root));
+        assert!(heap.pop_due(ElapsedInstant::from_nanos(15)).is_empty());
+        assert_eq!(heap.pop_due(ElapsedInstant::from_nanos(20)), vec![later]);
+        assert!(heap.is_empty());
+    }
+
+    #[test]
     fn ten_thousand_jobs_batch_without_stale_entries() {
         let mut heap = DeadlineHeap::default();
         let mut jobs = Vec::with_capacity(10_000);

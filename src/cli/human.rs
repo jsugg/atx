@@ -235,9 +235,19 @@ fn display_argv(argv: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::{HumanRenderer, display_argv, remaining};
+    use crate::application::{
+        DiagnosticCheck, DiagnosticStatus, DoctorReport, RunOutput, RunStream, ServiceAvailability,
+        ServiceStatus,
+    };
     use crate::cli::args::ColorArg;
-    use crate::domain::JobState;
+    use crate::cli::view::JobView;
+    use crate::domain::{
+        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
+        MissedPolicy, RunId, RunState, RuntimeTier, Schedule, UtcTimestamp,
+    };
 
     #[test]
     fn remaining_time_is_short_and_readable() {
@@ -267,5 +277,102 @@ mod tests {
                 .state(JobState::Scheduled)
                 .contains("\u{1b}[")
         );
+    }
+
+    #[test]
+    fn job_without_environment_keys_renders_a_placeholder() {
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Shell,
+            vec!["true".to_owned()],
+            "/".to_owned(),
+            Environment::empty(),
+        )
+        .expect("execution");
+        let job = Job::new(
+            UtcTimestamp::from_second(1_000).expect("now"),
+            Schedule::one_shot_relative(
+                DurationSeconds::new(30).expect("duration"),
+                UtcTimestamp::from_second(1_030).expect("due"),
+            ),
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job");
+        let view = JobView::from_job(&job, UtcTimestamp::from_second(1_000).expect("now"));
+        let rendered = HumanRenderer::new(ColorArg::Never).job(&view);
+        assert!(rendered.contains("Environment keys: -"), "{rendered}");
+    }
+
+    #[test]
+    fn run_output_marks_truncated_streams() {
+        let output = RunOutput {
+            run_id: RunId::new(),
+            job_id: JobId::new(),
+            state: RunState::Failed,
+            outcome: None,
+            stdout: RunStream {
+                content: b"kept".to_vec(),
+                truncated: true,
+            },
+            stderr: RunStream::empty(),
+        };
+        let rendered = HumanRenderer::run_output(&output);
+        assert!(
+            rendered.contains("--- stdout (truncated at capture cap) ---"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("--- stderr ---"), "{rendered}");
+    }
+
+    #[test]
+    fn doctor_reports_unhealthy_and_colored_markers() {
+        let report = DoctorReport {
+            healthy: false,
+            checks: vec![],
+            tzdb_version: "test".to_owned(),
+            schema_version: None,
+            durable_available: true,
+            config: serde_json::Value::Null,
+        };
+        let rendered = HumanRenderer::new(ColorArg::Never).doctor(&report);
+        assert!(rendered.starts_with("ATX needs attention."), "{rendered}");
+
+        let mut healthy = report.clone();
+        healthy.healthy = true;
+        healthy.checks = vec![
+            DiagnosticCheck {
+                name: "store".to_owned(),
+                status: DiagnosticStatus::Pass,
+                message: "open".to_owned(),
+                remediation: None,
+            },
+            DiagnosticCheck {
+                name: "tz".to_owned(),
+                status: DiagnosticStatus::Fail,
+                message: "missing".to_owned(),
+                remediation: None,
+            },
+        ];
+        let rendered = HumanRenderer::new(ColorArg::Always).doctor(&healthy);
+        assert!(rendered.starts_with("ATX is ready."), "{rendered}");
+        assert!(rendered.contains("\u{1b}[32mok\u{1b}[0m"), "{rendered}");
+        assert!(rendered.contains("\u{1b}[31mfail\u{1b}[0m"), "{rendered}");
+    }
+
+    #[test]
+    fn service_status_with_no_files_renders_a_placeholder() {
+        let status = ServiceStatus {
+            manager: "fake".to_owned(),
+            availability: ServiceAvailability::Available,
+            installed: true,
+            running: false,
+            files: Vec::new(),
+            guarantee: "best-effort".to_owned(),
+            detail: "test fixture".to_owned(),
+        };
+        let rendered = HumanRenderer::service_status(&status);
+        assert!(rendered.contains("\nFiles: -\n"), "{rendered}");
     }
 }

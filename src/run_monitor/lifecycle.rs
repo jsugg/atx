@@ -543,4 +543,117 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_starting_run_that_drifted_from_its_claim_is_rejected() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let execution = execution(ExecutionMode::Shell, &["true"]);
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        // Mutate a non-identity column so the stored run no longer equals the
+        // claimed run while both remain Starting with matching claim tokens.
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE runs SET created_at_utc = ?1 WHERE id = ?2",
+                params![
+                    UtcTimestamp::from_second(1_002)
+                        .expect("drifted")
+                        .to_string(),
+                    run.id().to_string()
+                ],
+            )
+            .expect("drift run row");
+
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        assert!(matches!(
+            monitor.execute(&run, &execution),
+            Err(MonitorError::AlreadyStarted)
+        ));
+    }
+
+    #[test]
+    fn stderr_only_overflow_marks_the_echo_as_truncated() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let tty = root.path().join("fake-tty");
+        fs::write(&tty, b"").expect("seed tty file");
+        let mut execution = execution(
+            ExecutionMode::Shell,
+            &["i=0; while [ \"$i\" -lt 4096 ]; do printf x >&2; i=$((i+1)); done"],
+        );
+        execution
+            .set_notify_tty(tty.clone())
+            .expect("notify tty path");
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 128);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+
+        assert_eq!(completed.state(), RunState::Succeeded);
+        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        assert!(
+            echoed.contains("[atx: output truncated at capture cap]"),
+            "truncation notice missing: {echoed:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_capture_budget_fails_the_run_without_executing_twice() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let execution = execution(ExecutionMode::Shell, &["true"]);
+        let job = job(execution.clone());
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let runner = NativeProcessRunner::new(inspector.clone());
+        // A zero-byte budget makes stream capture impossible; the run must
+        // finish as a failure instead of being recorded as a success.
+        let mut monitor = RunMonitor::new(&mut store, runner, inspector, clock, root.path(), 0);
+        let completed = monitor.execute(&run, &execution).expect("execute");
+        assert_eq!(completed.state(), RunState::Failed);
+        assert_eq!(
+            completed.outcome(),
+            Some(&RunOutcome::Failure("output capture failed".to_owned()))
+        );
+    }
 }

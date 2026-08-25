@@ -154,12 +154,13 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{MonitorProcessError, run_monitor_process};
+    use super::{MonitorProcessError, finish_job, run_monitor_process};
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobState, MissedPolicy,
-        RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
+        RunState, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
     use crate::infrastructure::sqlite::{Database, JobStore};
+    use crate::infrastructure::time::NativeClock;
 
     fn shell_job(store: &mut JobStore, root: &std::path::Path, script: &str) -> crate::domain::Job {
         let now = UtcTimestamp::from_second(1_000).expect("now");
@@ -342,5 +343,189 @@ mod tests {
         assert_eq!(finished.state(), crate::domain::JobState::Failed);
         let completed = store.load_run(run.id()).expect("run").expect("run");
         assert_eq!(completed.state(), crate::domain::RunState::Failed);
+    }
+
+    fn recurring_shell_job(store: &mut JobStore, script: &str) -> crate::domain::Job {
+        let now = UtcTimestamp::from_second(1_000).expect("now");
+        let schedule = Schedule::RecurringInterval {
+            interval: DurationSeconds::new(60).expect("duration"),
+            persisted_anchor_utc: UtcTimestamp::from_second(1_030).expect("anchor"),
+        };
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Shell,
+            vec![script.to_owned()],
+            "/".to_owned(),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+        )
+        .expect("execution");
+        let job = Job::new(
+            now,
+            schedule,
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job");
+        store.create(&job).expect("create job");
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                true,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                now,
+            )
+            .expect("waiting transition");
+        let starting = store
+            .transition_job(
+                waiting.id(),
+                waiting.revision(),
+                JobState::Starting,
+                true,
+                TransitionActor::Supervisor,
+                "deadline became due",
+                now,
+            )
+            .expect("start transition");
+        store
+            .transition_job(
+                starting.id(),
+                starting.revision(),
+                JobState::Running,
+                true,
+                TransitionActor::Supervisor,
+                "run monitor claimed command",
+                now,
+            )
+            .expect("run transition");
+        job
+    }
+
+    #[test]
+    fn finish_job_leaves_already_terminal_jobs_untouched() {
+        let root = private_state_root();
+        let mut store = JobStore::new(
+            Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+                .expect("database"),
+        );
+        let mut job = shell_job(&mut store, root.path(), "true");
+        let cancel_requested = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::CancelRequested,
+                false,
+                TransitionActor::Supervisor,
+                "cancelling",
+                UtcTimestamp::from_second(1_100).expect("timestamp"),
+            )
+            .expect("cancel requested");
+        job = store
+            .transition_job(
+                cancel_requested.id(),
+                cancel_requested.revision(),
+                JobState::Cancelled,
+                false,
+                TransitionActor::Supervisor,
+                "cancelled",
+                UtcTimestamp::from_second(1_110).expect("timestamp"),
+            )
+            .expect("cancelled");
+
+        finish_job(&mut store, &job, RunState::Succeeded, NativeClock)
+            .expect("terminal job short-circuits");
+        let unchanged = store.load(job.id()).expect("reload").expect("job");
+        assert_eq!(unchanged.state(), JobState::Cancelled);
+        assert_eq!(unchanged.revision(), job.revision());
+    }
+
+    #[test]
+    fn finish_job_refuses_to_cancel_jobs_outside_cancel_requested() {
+        let root = private_state_root();
+        let mut store = JobStore::new(
+            Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+                .expect("database"),
+        );
+        let now = UtcTimestamp::from_second(1_000).expect("now");
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Shell,
+            vec!["true".to_owned()],
+            "/".to_owned(),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+        )
+        .expect("execution");
+        let job = Job::new(
+            now,
+            Schedule::one_shot_relative(
+                DurationSeconds::new(30).expect("duration"),
+                UtcTimestamp::from_second(1_030).expect("due"),
+            ),
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job");
+        store.create(&job).expect("create job");
+        // Only CancelRequested jobs may move to Cancelled, so a cancelled run
+        // over any other live state must surface the domain rejection instead
+        // of silently rewriting the lifecycle.
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                now,
+            )
+            .expect("waiting transition");
+
+        assert!(matches!(
+            finish_job(&mut store, &waiting, RunState::Cancelled, NativeClock),
+            Err(MonitorProcessError::Store(
+                crate::infrastructure::sqlite::StoreError::Domain(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn recurring_monitor_finishes_and_tolerates_a_missing_supervisor_socket() {
+        let root = private_state_root();
+        let runtime = tempdir().expect("runtime");
+        let mut store = JobStore::new(
+            Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+                .expect("database"),
+        );
+        let job = recurring_shell_job(&mut store, "true");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+
+        // The runtime directory has no supervisor socket; the failed wake is
+        // reported on stderr but must not fail the monitor process.
+        run_monitor_process(
+            root.path(),
+            runtime.path(),
+            &job.id().to_string(),
+            &run.id().to_string(),
+        )
+        .expect("monitor process tolerates missing supervisor");
+
+        let advanced = store.load(job.id()).expect("reload").expect("job");
+        assert_eq!(advanced.state(), JobState::Waiting);
+        let completed = store.load_run(run.id()).expect("run").expect("run");
+        assert_eq!(
+            completed.outcome(),
+            Some(&crate::domain::RunOutcome::Exit(0))
+        );
     }
 }
