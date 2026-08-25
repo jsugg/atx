@@ -135,7 +135,6 @@ mod tests {
                     crate::application::ServiceAvailability::Unavailable
                 );
             }
-            _ => panic!("expected a systemd manager on Linux"),
         }
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
