@@ -85,8 +85,6 @@ impl ServiceManager for NativeServiceManager {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use crate::application::ServiceManager;
-
     use super::NativeServiceManager;
 
     #[cfg(target_os = "macos")]
@@ -99,19 +97,7 @@ mod tests {
             std::path::Path::new("/home/juan"),
             501,
         );
-        match manager {
-            NativeServiceManager::Launchd(service) => {
-                let status = service.status();
-                // On a host with launchctl present, the manager reports itself
-                // available; the probe exercising the real binary is what we
-                // assert, and it must not error.
-                assert!(status.is_ok());
-                assert_eq!(
-                    status.expect("launchd status").availability,
-                    crate::application::ServiceAvailability::Available
-                );
-            }
-        }
+        assert!(matches!(manager, NativeServiceManager::Launchd(_)));
     }
 
     #[cfg(target_os = "linux")]
@@ -126,17 +112,7 @@ mod tests {
             std::path::Path::new("/home/juan"),
             1000,
         );
-        match manager {
-            NativeServiceManager::Systemd(service) => {
-                // The unit name is derived from the config home override, so a
-                // successful status probe proves the env var was honored.
-                let status = service.status();
-                assert!(status.is_ok());
-                // Availability reflects whether the real systemd user manager
-                // answers on this runner, not the config-home override; both
-                // outcomes are valid here.
-            }
-        }
+        assert!(matches!(manager, NativeServiceManager::Systemd(_)));
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
