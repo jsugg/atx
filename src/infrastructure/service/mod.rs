@@ -85,8 +85,6 @@ impl ServiceManager for NativeServiceManager {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use crate::application::ServiceManager;
-
     use super::NativeServiceManager;
 
     #[cfg(target_os = "macos")]
