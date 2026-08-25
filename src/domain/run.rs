@@ -348,6 +348,7 @@ mod tests {
 
     use super::super::id::{JobId, RunId};
     use super::{ClaimToken, Run, RunOutcome, RunSnapshot};
+    use crate::domain::ProcessIdentitySnapshot;
     use crate::domain::primitives::{Sequence, UtcTimestamp};
     use crate::domain::state::RunState;
 
@@ -476,5 +477,111 @@ mod tests {
         terminal.finished_at_utc = Some(finished);
         terminal.outcome = Some(RunOutcome::Signal(9));
         assert!(Run::rehydrate(terminal).is_ok());
+    }
+
+    #[test]
+    fn rehydrate_validates_stored_log_paths() {
+        let created = UtcTimestamp::from_second(100).expect("valid timestamp");
+
+        let mut escaping_stdout = snapshot(RunState::Running, created);
+        escaping_stdout.started_at_utc = Some(created);
+        escaping_stdout.stdout_path = Some("../escape.log".to_owned());
+        assert!(Run::rehydrate(escaping_stdout).is_err());
+
+        let mut absolute_stderr = snapshot(RunState::Running, created);
+        absolute_stderr.started_at_utc = Some(created);
+        absolute_stderr.stderr_path = Some("/etc/passwd".to_owned());
+        assert!(Run::rehydrate(absolute_stderr).is_err());
+
+        let mut contained = snapshot(RunState::Running, created);
+        contained.started_at_utc = Some(created);
+        contained.stdout_path = Some("runs/x/stdout.log".to_owned());
+        contained.stderr_path = Some("runs/x/stderr.log".to_owned());
+        assert!(Run::rehydrate(contained).is_ok());
+    }
+
+    #[test]
+    fn cancellation_start_and_second_outcome_edges_are_rejected() {
+        let created = UtcTimestamp::from_second(200).expect("created");
+        let earlier = UtcTimestamp::from_second(199).expect("earlier");
+        let token = ClaimToken::from_bytes([3; 32]);
+
+        // request_cancellation accepts Starting, Running, and repeats on
+        // CancelRequested; terminal states refuse.
+        let fresh = Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            created,
+            created,
+            token,
+        );
+        fresh
+            .request_cancellation()
+            .and_then(Run::request_cancellation)
+            .expect("idempotent cancel request");
+
+        let running = Run::new(
+            JobId::new(),
+            Sequence::new(2).expect("sequence"),
+            created,
+            created,
+            token,
+        )
+        .mark_running(
+            created,
+            identity(10, 100, 10),
+            identity(11, 101, 20),
+            "runs/x/stdout.log".to_owned(),
+            "runs/x/stderr.log".to_owned(),
+        )
+        .expect("running");
+
+        // A start time before creation never becomes a running run.
+        let premature = Run::new(
+            JobId::new(),
+            Sequence::new(3).expect("sequence"),
+            created,
+            created,
+            token,
+        );
+        assert!(
+            premature
+                .mark_running(
+                    earlier,
+                    identity(10, 100, 10),
+                    identity(11, 101, 20),
+                    "runs/x/stdout.log".to_owned(),
+                    "runs/x/stderr.log".to_owned(),
+                )
+                .is_err()
+        );
+
+        // Cancelled outcomes require a prior cancel request; terminal runs
+        // have no second outcome slot.
+        assert!(
+            running
+                .clone()
+                .with_outcome(created, RunOutcome::Cancelled("no request".to_owned()))
+                .is_err()
+        );
+        let finished = running
+            .with_outcome(created, RunOutcome::Exit(0))
+            .expect("finish");
+        assert!(
+            finished
+                .clone()
+                .with_outcome(created, RunOutcome::Exit(1))
+                .is_err()
+        );
+        assert!(finished.request_cancellation().is_err());
+    }
+
+    fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {
+        ProcessIdentitySnapshot {
+            boot_identity: "boot".to_owned(),
+            pid,
+            start_token,
+            process_group_id,
+        }
     }
 }

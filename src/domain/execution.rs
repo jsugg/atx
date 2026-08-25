@@ -341,7 +341,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use super::{Environment, ExecutionMode, ExecutionSpec};
+    use super::{Environment, ExecutionError, ExecutionMode, ExecutionSpec};
 
     #[test]
     fn direct_mode_preserves_arguments() {
@@ -545,6 +545,59 @@ mod tests {
                 Environment::empty(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn total_size_policy_and_persisted_tty_edges_are_enforced() {
+        // Every argument fits its own cap; the serialized total does not.
+        assert!(matches!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                vec!["x".repeat(128 * 1024); 9],
+                "/tmp".to_owned(),
+                Environment::empty(),
+            ),
+            Err(ExecutionError::SerializedSizeExceeded)
+        ));
+
+        let base = serde_json::json!({
+            "mode": "direct",
+            "argv": ["true"],
+            "working_directory": "/tmp",
+            "environment": {},
+            "stdin": "null",
+            "stdout": "bounded_file",
+            "stderr": "bounded_file",
+            "shell_path": null
+        });
+
+        let mut bad_stderr = base.clone();
+        bad_stderr["stderr"] = serde_json::json!("null");
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&bad_stderr).expect("json")
+            )
+            .is_err()
+        );
+
+        // A persisted notify tty must still satisfy submit-time invariants.
+        let mut with_tty = base.clone();
+        with_tty["notify_tty"] = serde_json::json!("/dev/ttys001");
+        let restored =
+            ExecutionSpec::from_persistence_json(&serde_json::to_string(&with_tty).expect("json"))
+                .expect("tty row loads");
+        assert_eq!(
+            restored.notify_tty(),
+            Some(std::path::Path::new("/dev/ttys001"))
+        );
+        assert_eq!(restored.working_directory(), std::path::Path::new("/tmp"));
+
+        let mut empty_tty = base;
+        empty_tty["notify_tty"] = serde_json::json!("");
+        assert!(
+            ExecutionSpec::from_persistence_json(&serde_json::to_string(&empty_tty).expect("json"))
+                .is_err()
         );
     }
 
