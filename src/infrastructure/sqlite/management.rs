@@ -378,6 +378,42 @@ mod tests {
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore};
     use super::{Job, hide_job};
+    use crate::application::{ManagementStore as _, RunOutputStore as _};
+    use crate::domain::{JobId, JobState, ProcessIdentitySnapshot, RunState, UtcTimestamp};
+
+    fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {
+        ProcessIdentitySnapshot {
+            boot_identity: "boot-a".to_owned(),
+            pid,
+            start_token,
+            process_group_id,
+        }
+    }
+
+    /// Fixture: job with one run advanced to `Running` so it counts as active.
+    fn active_job_with_run(store: &mut JobStore, seed: i64) -> (Job, crate::domain::Run) {
+        let job = sample_job(seed, seed + 30);
+        store.create(&job).expect("create job");
+        let mut run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(seed + 30).expect("scheduled"),
+                UtcTimestamp::from_second(seed + 1).expect("created"),
+            )
+            .expect("claim run");
+        run = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(seed + 2).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("mark running");
+        (job, run)
+    }
 
     fn run_row_count(store: &JobStore, job_id: String) -> i64 {
         store
@@ -430,5 +466,221 @@ mod tests {
         let job = terminal_job_with_run(&mut store, 2_000);
         let hidden = hide_job(&mut store, job.id(), job.revision(), true).expect("hide");
         assert_eq!(run_row_count(&store, hidden.id().to_string()), 1);
+    }
+
+    #[test]
+    fn list_jobs_filters_by_state_and_excludes_hidden() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let succeeded = terminal_job_with_run(&mut store, 1_000);
+        let pending = sample_job(2_000, 2_030);
+        store.create(&pending).expect("create pending");
+
+        // State filter: only the succeeded (terminal) job should appear.
+        let listed = store
+            .list_jobs(Some(JobState::Succeeded), None, 10)
+            .expect("list succeeded");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id(), succeeded.id());
+
+        // Hiding the succeeded job removes it from both unfiltered and filtered views.
+        hide_job(&mut store, succeeded.id(), succeeded.revision(), true).expect("hide");
+        assert_eq!(
+            store
+                .list_jobs(Some(JobState::Succeeded), None, 10)
+                .expect("list succeeded after hide")
+                .len(),
+            0
+        );
+        let all = store.list_jobs(None, None, 10).expect("list all");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), pending.id());
+    }
+
+    #[test]
+    fn list_jobs_paginates_after_given_id() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let jobs = [sample_job(1_000, 1_030), sample_job(2_000, 2_030)];
+        for job in &jobs {
+            store.create(job).expect("create");
+        }
+
+        let first = store.list_jobs(None, None, 1).expect("first page");
+        assert_eq!(first.len(), 1);
+        let second = store
+            .list_jobs(None, Some(first[0].id()), 1)
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].id(), second[0].id());
+    }
+
+    #[test]
+    fn find_jobs_by_prefix_is_case_insensitive() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create");
+        let prefix = job.id().to_string()[..3].to_ascii_uppercase();
+
+        let matches = <JobStore as crate::application::ManagementStore>::find_jobs_by_prefix(
+            &store, &prefix, 10,
+        )
+        .expect("find by prefix");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id(), job.id());
+    }
+
+    #[test]
+    fn list_runs_filters_by_job_and_orders_newest_first() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let (job, run) = active_job_with_run(&mut store, 1_000);
+        let runs = store.list_runs(Some(job.id()), 10).expect("runs for job");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id(), run.id());
+
+        let none = store
+            .list_runs(Some(JobId::new()), 10)
+            .expect("runs for other job");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn active_runs_returns_only_non_terminal_runs() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let (_, run) = active_job_with_run(&mut store, 1_000);
+        let active = store.active_runs().expect("active runs");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id(), run.id());
+    }
+
+    #[test]
+    fn latest_active_run_returns_newest_sequence_for_job() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let (job, run) = active_job_with_run(&mut store, 1_000);
+        let latest = store
+            .latest_active_run(job.id())
+            .expect("latest active run")
+            .expect("present");
+        assert_eq!(latest.id(), run.id());
+        assert_eq!(latest.state(), RunState::Running);
+
+        assert!(
+            store
+                .latest_active_run(JobId::new())
+                .expect("missing")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hide_job_rejects_revision_mismatch() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let job = terminal_job_with_run(&mut store, 1_000);
+        let wrong =
+            crate::domain::Revision::new(job.revision().get() + 1).expect("bumped revision");
+        assert!(hide_job(&mut store, job.id(), wrong, true).is_err());
+        // Job remains visible after a conflicting hide.
+        assert_eq!(store.list_jobs(None, None, 10).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn prepare_rerun_resets_terminal_job_and_rejects_active() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let job = terminal_job_with_run(&mut store, 1_000);
+        let now = UtcTimestamp::from_second(9_999).expect("now");
+        let rerun = store
+            .prepare_rerun(job.id(), job.revision(), now)
+            .expect("prepare rerun");
+        assert_eq!(rerun.state(), JobState::Waiting);
+        assert_eq!(rerun.revision(), job.revision().next().expect("next"));
+
+        // A still-running job cannot be rerun, and the revision bump is consumed.
+        let (active_job, _) = active_job_with_run(&mut store, 2_000);
+        assert!(
+            store
+                .prepare_rerun(active_job.id(), active_job.revision(), now)
+                .is_err()
+        );
+
+        // Original terminal job already advanced: stale revision now conflicts.
+        assert!(store.prepare_rerun(job.id(), job.revision(), now).is_err());
+    }
+
+    #[test]
+    fn truncation_flags_round_trip_for_run() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let (_, run) = active_job_with_run(&mut store, 1_000);
+        assert!(!store.stdout_truncated(run.id()).expect("stdout flag"));
+        assert!(!store.stderr_truncated(run.id()).expect("stderr flag"));
+
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE runs SET stdout_truncated = 1 WHERE id = ?1",
+                [run.id().to_string()],
+            )
+            .expect("set stdout truncated");
+        assert!(
+            store
+                .stdout_truncated(run.id())
+                .expect("stdout flag after update")
+        );
+    }
+
+    #[test]
+    fn latest_and_prefix_run_queries_resolve_as_expected() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+
+        let (job, run) = active_job_with_run(&mut store, 1_000);
+        let latest = store
+            .latest_run(job.id())
+            .expect("latest run")
+            .expect("present");
+        assert_eq!(latest.id(), run.id());
+
+        let prefix = run.id().to_string()[..4].to_ascii_uppercase();
+        let matches = store
+            .find_runs_by_prefix(&prefix, 10)
+            .expect("find runs by prefix");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id(), run.id());
     }
 }
