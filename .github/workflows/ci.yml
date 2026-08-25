@@ -150,8 +150,10 @@ jobs:
       # job/run store edge paths and cli dispatch. Raise both floors as those
       # gain tests.
       - name: Coverage gate
+        # +nightly overrides the repo's rust-toolchain.toml pin (stable);
+        # --branch needs -Z coverage-options=branch.
         run: >-
-          cargo llvm-cov --branch --all-targets --all-features --locked
+          cargo +nightly llvm-cov --branch --all-targets --all-features --locked
           --fail-under-lines 87 --fail-under-regions 80
 
   doc:
