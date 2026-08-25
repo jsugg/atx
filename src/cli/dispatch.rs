@@ -3223,7 +3223,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl EnvRestore {
-        fn set(key: &'static str, value: OsString) -> Self {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
             // SAFETY: process-global mutation restored by Drop; no other test
             // reads these variables concurrently.
             let saved = std::env::var_os(key);
@@ -3304,8 +3304,8 @@ mod tests {
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         let env = vec![
-            EnvRestore::set("XDG_CONFIG_HOME", root.join("config").into_os_string()),
-            EnvRestore::set("PATH", path),
+            EnvRestore::set("XDG_CONFIG_HOME", root.join("config").as_os_str()),
+            EnvRestore::set("PATH", &path),
         ];
         (env, runtime)
     }
@@ -3317,7 +3317,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(target_os = "linux")]
