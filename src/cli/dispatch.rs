@@ -1570,6 +1570,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
@@ -2490,6 +2492,10 @@ mod tests {
 
     #[test]
     fn service_status_reports_in_json_human_and_quiet_modes() {
+        // Reads XDG_CONFIG_HOME-resolved unit paths; must not race the
+        // env-mutating service fixtures running on other test threads.
+        #[cfg(target_os = "linux")]
+        let _guard = service_env_lock();
         let root = tempdir().expect("root");
         let state = root.path().join("state");
         let base = [
@@ -3242,12 +3248,11 @@ mod tests {
     /// content matches what `NativeServiceManager::detect` expects for this
     /// very test binary, plus a PATH shim whose `systemctl` reports the user
     /// manager available and `atx.service` active.
+    ///
+    /// The fixture mutates process-global env (`XDG_CONFIG_HOME`, `PATH`),
+    /// so every caller must hold the service-env lock for its whole body.
     #[cfg(target_os = "linux")]
-    fn install_running_service_fixture(
-        root: &Path,
-        state: &Path,
-        runtime: &Path,
-    ) -> Vec<EnvRestore> {
+    fn install_running_service_fixture(root: &Path, state: &Path) -> (Vec<EnvRestore>, PathBuf) {
         let executable =
             fs::canonicalize(std::env::current_exe().expect("current exe")).expect("canonical exe");
 
@@ -3265,6 +3270,10 @@ mod tests {
 
         // Mirrors render_unit(): each argument double-quoted and joined with
         // spaces; temp paths contain none of the escaped characters.
+        // NOTE: with a --state-dir override, resolve_paths() derives the
+        // runtime directory as <state>/runtime — the unit must embed that
+        // same path or installed() rejects it as foreign.
+        let runtime = state.join("runtime");
         let arguments = [
             executable.to_string_lossy().into_owned(),
             "__supervisor".to_owned(),
@@ -3294,19 +3303,30 @@ mod tests {
         let mut path = OsString::from(shim.as_os_str());
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
-        vec![
+        let env = vec![
             EnvRestore::set("XDG_CONFIG_HOME", root.join("config").into_os_string()),
             EnvRestore::set("PATH", path),
-        ]
+        ];
+        (env, runtime)
+    }
+
+    /// Serialize tests that touch process-global env or the shared unit
+    /// path resolution; cargo runs test threads concurrently.
+    #[cfg(target_os = "linux")]
+    fn service_env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn doctor_reports_the_durable_service_pass_when_installed_and_running() {
+        let _guard = service_env_lock();
         let root = tempdir().expect("root");
         let state = private_dir(root.path(), "state");
-        let runtime = private_dir(root.path(), "runtime");
-        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+        let (_env, _runtime) = install_running_service_fixture(root.path(), &state);
 
         let global = GlobalArgs {
             quiet: false,
@@ -3332,10 +3352,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn durable_submission_proceeds_when_the_service_is_running() {
+        let _guard = service_env_lock();
         let root = tempdir().expect("root");
         let state = private_dir(root.path(), "state");
-        let runtime = private_dir(root.path(), "runtime");
-        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+        let (_env, _runtime) = install_running_service_fixture(root.path(), &state);
 
         let args = parsed_schedule(&[
             "atx",
@@ -3354,11 +3374,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn service_status_and_change_render_every_arm_of_a_running_service() {
+        let _guard = service_env_lock();
         let root = tempdir().expect("root");
         let state = private_dir(root.path(), "state");
-        let runtime = private_dir(root.path(), "runtime");
         let unit_path = root.path().join("config/systemd/user/atx.service");
-        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+        let (_env, _runtime) = install_running_service_fixture(root.path(), &state);
 
         // Installed + running: both JSON and human printers take the pass arm.
         assert_eq!(
