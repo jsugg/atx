@@ -293,8 +293,8 @@ mod tests {
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore, RetentionPolicy, StartupStore};
     use crate::application::{
-        IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveryStore,
-        reconcile_startup,
+        CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveryAction,
+        RecoveryStore, reconcile_startup,
     };
     use crate::domain::{
         ElapsedInstant, JobState, ProcessIdentitySnapshot, TransitionActor, UtcTimestamp,
@@ -356,5 +356,177 @@ mod tests {
         let startup =
             StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
         assert!(startup.load_nonterminal().expect("nonterminal").is_empty());
+    }
+
+    fn opened_store(root: &std::path::Path) -> JobStore {
+        let database =
+            Database::open(&root.join("atx.db"), Duration::from_millis(100)).expect("database");
+        JobStore::new(database)
+    }
+
+    fn claimed_job(
+        store: &mut JobStore,
+        seed: i64,
+    ) -> (
+        crate::domain::Job,
+        crate::domain::Run,
+        crate::domain::Revision,
+    ) {
+        let job = sample_job(seed, seed + 30);
+        store.create(&job).expect("create");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(seed + 30).expect("scheduled"),
+                UtcTimestamp::from_second(seed + 1).expect("created"),
+            )
+            .expect("claim");
+        // Move the job into a running-ish state: interrupt recovery only
+        // applies to jobs the supervisor had already started.
+        let mut current = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "loaded",
+                UtcTimestamp::from_second(seed + 31).expect("timestamp"),
+            )
+            .expect("waiting");
+        current = store
+            .transition_job(
+                current.id(),
+                current.revision(),
+                JobState::Starting,
+                false,
+                TransitionActor::Supervisor,
+                "claimed",
+                UtcTimestamp::from_second(seed + 32).expect("timestamp"),
+            )
+            .expect("starting");
+        let revision = current.revision();
+        (job, run, revision)
+    }
+
+    #[test]
+    fn interrupt_action_finalizes_claimed_run_and_job_atomically() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let (job, run, revision) = claimed_job(&mut store, 1_000);
+
+        let action = RecoveryAction::Interrupt {
+            job_id: job.id(),
+            expected_revision: revision,
+            run: Some((run.id(), run.claim_token())),
+            command_fate: CommandFate::Dead,
+        };
+        {
+            let mut startup =
+                StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+            startup
+                .apply_recovery(&[action], timestamp(2_000))
+                .expect("apply");
+        }
+        let finalized = store.load_run(run.id()).expect("run").expect("claimed");
+        assert_eq!(finalized.state(), crate::domain::RunState::Interrupted);
+        let recovered = store.load(job.id()).expect("load").expect("job");
+        assert_eq!(recovered.state(), JobState::Interrupted);
+
+        // The claim guard makes a replay of the same action a conflict.
+        let replay = RecoveryAction::Interrupt {
+            job_id: job.id(),
+            expected_revision: recovered.revision(),
+            run: Some((run.id(), run.claim_token())),
+            command_fate: CommandFate::Dead,
+        };
+        let mut startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        assert!(matches!(
+            startup.apply_recovery(std::slice::from_ref(&replay), timestamp(2_001)),
+            Err(crate::application::RecoveryStoreError(_))
+        ));
+    }
+
+    #[test]
+    fn missed_and_advance_actions_use_revision_cas() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let first = sample_job(2_000, 2_030);
+        store.create(&first).expect("create first");
+        let second = sample_job(3_000, 3_030);
+        store.create(&second).expect("create second");
+
+        let actions = [
+            RecoveryAction::AdvanceRecurring {
+                job_id: first.id(),
+                expected_revision: first.revision(),
+                next_due_utc: timestamp(9_000),
+            },
+            RecoveryAction::MarkMissed {
+                job_id: second.id(),
+                expected_revision: second.revision(),
+            },
+        ];
+        {
+            let mut startup =
+                StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+            startup
+                .apply_recovery(&actions, timestamp(4_000))
+                .expect("apply");
+        }
+
+        let advanced = store.load(first.id()).expect("load").expect("job");
+        assert_ne!(advanced.revision(), first.revision());
+        let missed = store.load(second.id()).expect("load").expect("job");
+        assert_eq!(missed.state(), JobState::Missed);
+
+        // Replaying against a terminal job conflicts instead of corrupting.
+        let replay = RecoveryAction::MarkMissed {
+            job_id: second.id(),
+            expected_revision: missed.revision(),
+        };
+        let mut startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        assert!(startup.apply_recovery(&[replay], timestamp(4_001)).is_err());
+    }
+
+    #[test]
+    fn active_run_without_a_nonterminal_job_is_corrupt() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let (job, _run, revision) = claimed_job(&mut store, 4_000);
+        let cancel_requested = store
+            .transition_job(
+                job.id(),
+                revision,
+                JobState::CancelRequested,
+                false,
+                TransitionActor::Supervisor,
+                "cancelling",
+                timestamp(4_100),
+            )
+            .expect("cancel requested");
+        store
+            .transition_job(
+                cancel_requested.id(),
+                cancel_requested.revision(),
+                JobState::Cancelled,
+                false,
+                TransitionActor::Supervisor,
+                "cancelled",
+                timestamp(4_110),
+            )
+            .expect("cancelled");
+        let startup =
+            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
+        let error = startup
+            .load_nonterminal()
+            .expect_err("orphaned active run must be corrupt");
+        assert!(error.to_string().contains("terminal or missing job"));
+    }
+
+    fn timestamp(second: i64) -> UtcTimestamp {
+        UtcTimestamp::from_second(second).expect("timestamp")
     }
 }
