@@ -462,6 +462,153 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_installed_service_that_is_not_running() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(
+            &unit,
+            render_unit(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            )
+            .expect("unit"),
+        )
+        .expect("write unit");
+        let service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner::failing("is-active"),
+        );
+        let status = service.status().expect("status");
+        assert!(!status.running);
+        assert_eq!(status.detail, "user service is installed but not running");
+    }
+
+    #[test]
+    fn status_reports_missing_installation() {
+        let root = tempdir().expect("root");
+        let service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join(UNIT_NAME),
+            1000,
+            FakeRunner::healthy(),
+        );
+        let status = service.status().expect("status");
+        assert!(!status.installed);
+        assert!(!status.running);
+        assert_eq!(status.detail, "user service is not installed");
+    }
+
+    #[test]
+    fn install_is_a_noop_when_already_installed() {
+        let root = tempdir().expect("root");
+        let unit = root.path().join(UNIT_NAME);
+        fs::write(
+            &unit,
+            render_unit(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            )
+            .expect("unit"),
+        )
+        .expect("write unit");
+        let runner = FakeRunner::healthy();
+        let calls = runner.calls.clone();
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            runner,
+        );
+        service.install().expect("install");
+        assert!(
+            !calls
+                .borrow()
+                .iter()
+                .any(|call| call.contains("daemon-reload"))
+        );
+    }
+
+    #[test]
+    fn install_fails_when_manager_unavailable() {
+        let root = tempdir().expect("root");
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join(UNIT_NAME),
+            1000,
+            FakeRunner::unavailable(),
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
+    fn install_cleans_up_when_the_unit_file_cannot_be_written() {
+        let root = tempdir().expect("root");
+        // Occupying the temporary path forces the create_new write to fail.
+        fs::create_dir(root.path().join("atx.service.tmp")).expect("block temp path");
+        let mut service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join(UNIT_NAME),
+            1000,
+            FakeRunner::healthy(),
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
+    fn unreadable_unit_fails_the_installed_check() {
+        let root = tempdir().expect("root");
+        // A directory at the unit path yields a read error that is not NotFound.
+        let unit = root.path().join(UNIT_NAME);
+        fs::create_dir(&unit).expect("unit directory");
+        let service = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit,
+            1000,
+            FakeRunner::healthy(),
+        );
+        assert!(service.status().is_err());
+    }
+
+    #[test]
+    fn render_rejects_control_characters_and_non_utf8_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        assert!(
+            render_unit(
+                std::path::Path::new("/opt/new\nline"),
+                std::path::Path::new("/tmp/state"),
+                std::path::Path::new("/tmp/runtime"),
+            )
+            .is_err()
+        );
+        assert!(
+            render_unit(
+                std::path::Path::new(OsStr::from_bytes(b"/opt/\xff\xfe")),
+                std::path::Path::new("/tmp/state"),
+                std::path::Path::new("/tmp/runtime"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn foreign_unit_blocks_install() {
         let root = tempdir().expect("root");
         let unit = root.path().join(UNIT_NAME);
