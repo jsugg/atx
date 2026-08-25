@@ -1564,31 +1564,34 @@ mod tests {
 
     use std::ffi::OsString;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
     use super::{
-        build_doctor_report, build_job, cancel_job, check_database, check_live_supervisor,
-        check_private_directory, check_supervisor, doctor_exit, finish_job_cancellation,
-        parse_job_state, print_error, read_env_file, render_job, render_jobs, render_processes,
-        render_run_output, render_runs, render_submission, resolve_submitting_tty, run, schedule,
-        split_assignment,
+        SUPERVISOR_READY_TIMEOUT, SessionAcknowledger, build_doctor_report, build_job, cancel_job,
+        check_database, check_live_supervisor, check_private_directory, check_supervisor,
+        doctor_exit, finish_job_cancellation, parse_job_state, print_error, read_env_file,
+        render_job, render_jobs, render_processes, render_run_output, render_runs,
+        render_submission, resolve_submitting_tty, run, schedule, split_assignment,
     };
     use crate::application::{
         DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, ManagementStore,
-        RunOutput, RunStream, SubmissionOutcome, SupervisorAckError, WallClock,
+        RunOutput, RunStream, SubmissionOutcome, SupervisorAckError, SupervisorAcknowledger as _,
+        WallClock,
     };
     use crate::cli::args::{ColorArg, GlobalArgs, ParsedCli, SchedulingArgs, parse_from};
     use crate::cli::exit;
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
-        MissedPolicy, ProcessIdentitySnapshot, RunId, RunOutcome, RunState, RuntimeTier, Schedule,
-        TransitionActor, UtcTimestamp,
+        MissedPolicy, ProcessIdentitySnapshot, Revision, RunId, RunOutcome, RunState, RuntimeTier,
+        Schedule, TransitionActor, UtcTimestamp,
     };
     use crate::infrastructure::config::{ConfigOverrides, load_config};
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
@@ -2536,8 +2539,10 @@ mod tests {
 
         let mut builder = DoctorReportBuilder::default();
         // A passing supervisor entry first forces the scan to reject a
-        // mismatching status before accepting the warning below.
+        // mismatching status before accepting the warning below, and an
+        // unrelated name forces the closure's name comparison to reject too.
         builder.push("supervisor", DiagnosticStatus::Pass, "decoy entry", None);
+        builder.push("state directory", DiagnosticStatus::Warning, "decoy", None);
         let inspector = NativeProcessInspector::new("boot".to_owned());
         check_supervisor(
             &mut builder,
@@ -2660,13 +2665,15 @@ mod tests {
 
         let mut builder = DoctorReportBuilder::default();
         // A warning entry first forces the scan to reject a mismatching
-        // status before accepting the live pass below.
+        // status before accepting the live pass below, and an unrelated name
+        // forces the closure's name comparison to reject too.
         builder.push(
             "supervisor",
             DiagnosticStatus::Warning,
             "stale decoy entry",
             None,
         );
+        builder.push("SQLite", DiagnosticStatus::Pass, "decoy", None);
         let inspector =
             NativeProcessInspector::new(NativeClock.boot_identity().expect("boot identity"));
         check_live_supervisor(
@@ -3049,5 +3056,372 @@ mod tests {
         let child = spawned.child_mut();
         child.kill().expect("kill child");
         child.wait().expect("reap child");
+    }
+
+    /// Create a `0700` directory under `root` and return its path.
+    fn private_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir(&dir).expect("dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("mode");
+        dir
+    }
+
+    /// Serve up to four framed Nack replies on the bound supervisor socket.
+    ///
+    /// The ipc module is private to the supervisor, so the wire format (a
+    /// big-endian u32 length prefix followed by tagged JSON) is reproduced
+    /// inline.
+    fn spawn_nack_server(listener: UnixListener) {
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok(mut stream) = listener.accept().map(|(stream, _)| stream) else {
+                    break;
+                };
+                let mut length = [0_u8; 4];
+                if stream.read_exact(&mut length).is_err() {
+                    continue;
+                }
+                let frame_length = usize::try_from(u32::from_be_bytes(length)).expect("usize");
+                let mut body = vec![0_u8; frame_length];
+                if stream.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let nack = br#"{"type":"nack","protocol":1,"reason":"job unknown"}"#;
+                let frame_length = u32::try_from(nack.len()).expect("nack fits in a frame length");
+                let _ = stream.write_all(&frame_length.to_be_bytes());
+                let _ = stream.write_all(nack);
+            }
+        });
+    }
+
+    #[test]
+    fn session_acknowledger_reports_a_rejected_wake_without_retrying() {
+        let root = tempdir().expect("root");
+        let state = private_dir(root.path(), "state");
+        let runtime = private_dir(root.path(), "runtime");
+        spawn_nack_server(bind_secure_socket(&runtime));
+
+        // The first wake attempt fails and boots a detached supervisor; the
+        // poll loop must then surface the rejection instead of retrying it.
+        let acknowledger = SessionAcknowledger::new(state, runtime);
+        let error = acknowledger
+            .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
+            .expect_err("wake was rejected");
+        assert!(error.to_string().contains("rejected the wake"));
+    }
+
+    #[test]
+    fn session_acknowledger_gives_up_at_the_readiness_deadline() {
+        let root = tempdir().expect("root");
+        let state = private_dir(root.path(), "state");
+        // No socket exists and no supervisor ever appears: every wake attempt
+        // fails immediately, so the loop must run out its readiness budget.
+        let started = Instant::now();
+        let acknowledger = SessionAcknowledger::new(
+            private_dir(root.path(), "state2"),
+            private_dir(root.path(), "runtime2"),
+        );
+        drop((
+            state,
+            acknowledger.acknowledge(JobId::new(), Revision::new(1).expect("revision")),
+        ));
+        assert!(started.elapsed() >= SUPERVISOR_READY_TIMEOUT);
+    }
+
+    #[test]
+    fn tty_probe_resolves_a_character_device_stdout() {
+        // /dev/null opened read-write so harness logging through fd 1 keeps
+        // working while the probe runs.
+        let devnull = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("open /dev/null");
+        // SAFETY: fd 1 is restored immediately after the probe returns; the
+        // brief window can only swallow incidental harness stdout.
+        let saved = unsafe { libc::dup(1) };
+        assert!(saved >= 0, "dup of stdout failed");
+        assert_eq!(unsafe { libc::dup2(devnull.as_raw_fd(), 1) }, 1);
+        let resolved = resolve_submitting_tty();
+        assert_eq!(unsafe { libc::dup2(saved, 1) }, 1);
+        unsafe { libc::close(saved) };
+
+        let tty = resolved.expect("/dev/null is a character device stdout");
+        assert_eq!(tty, PathBuf::from("/dev/null"));
+    }
+
+    #[test]
+    fn lc_prefixed_environment_variables_are_captured_for_jobs() {
+        // SAFETY: the variable name is unique to this test and removed right
+        // after building the job; no other test observes it.
+        unsafe { std::env::set_var("LC_ATX_RESIDUAL_TEST", "1") };
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        let args = parsed_schedule(&["atx", "30s", "--", "true"]);
+        let job = build_job(&args, &config, wall, elapsed).expect("job");
+        // SAFETY: see above; restoring keeps unrelated suites unaffected.
+        unsafe { std::env::remove_var("LC_ATX_RESIDUAL_TEST") };
+
+        let seeded = job
+            .execution()
+            .environment()
+            .iter()
+            .find(|&(key, _)| key == "LC_ATX_RESIDUAL_TEST")
+            .map(|(_, value)| value.expose().to_owned());
+        assert_eq!(seeded.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn finish_cancellation_conflicts_when_the_reload_is_still_active() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let requested = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::CancelRequested,
+                false,
+                TransitionActor::Cli,
+                "seed",
+                UtcTimestamp::from_second(6_001).expect("ts"),
+            )
+            .expect("cancel requested");
+        // RAISE(IGNORE) skips every UPDATE, so the cancellation transition
+        // conflicts and the reload still shows the active CancelRequested
+        // state instead of a terminal or waiting one.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER stall_job_updates BEFORE UPDATE ON jobs
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("trigger");
+
+        assert!(matches!(
+            finish_job_cancellation(&mut store, job.id(), RunState::Succeeded, NativeClock),
+            Err(ManagementError::Store(_))
+        ));
+        drop(requested);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EnvRestore {
+        key: &'static str,
+        saved: Option<OsString>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvRestore {
+        fn set(key: &'static str, value: OsString) -> Self {
+            // SAFETY: process-global mutation restored by Drop; no other test
+            // reads these variables concurrently.
+            let saved = unsafe { std::env::var_os(key) };
+            unsafe { std::env::set_var(key, &value) };
+            Self { key, saved }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            // SAFETY: restores exactly the value captured in `EnvRestore::set`.
+            if let Some(value) = self.saved.take() {
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    /// Fake an installed-and-running systemd user service: a unit file whose
+    /// content matches what `NativeServiceManager::detect` expects for this
+    /// very test binary, plus a PATH shim whose `systemctl` reports the user
+    /// manager available and `atx.service` active.
+    #[cfg(target_os = "linux")]
+    fn install_running_service_fixture(
+        root: &Path,
+        state: &Path,
+        runtime: &Path,
+    ) -> Vec<EnvRestore> {
+        let executable =
+            fs::canonicalize(std::env::current_exe().expect("current exe")).expect("canonical exe");
+
+        let shim = root.join("bin");
+        fs::create_dir_all(&shim).expect("shim dir");
+        let systemctl = shim.join("systemctl");
+        fs::write(
+            &systemctl,
+            "#!/bin/sh\ncase \"$*\" in\n  \
+             '--user show-environment'|'--user is-active --quiet atx.service') exit 0;;\n  \
+             *) exit 1;;\nesac\n",
+        )
+        .expect("write shim");
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).expect("shim mode");
+
+        // Mirrors render_unit(): each argument double-quoted and joined with
+        // spaces; temp paths contain none of the escaped characters.
+        let arguments = [
+            executable.to_string_lossy().into_owned(),
+            "__supervisor".to_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--runtime-dir".to_owned(),
+            runtime.to_string_lossy().into_owned(),
+            "--service-managed".to_owned(),
+        ]
+        .into_iter()
+        .map(|argument| format!("\"{argument}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+        let unit_directory = root.join("config/systemd/user");
+        fs::create_dir_all(&unit_directory).expect("unit dir");
+        fs::write(
+            unit_directory.join("atx.service"),
+            format!(
+                "[Unit]\nDescription=ATX per-user command scheduler\n\n\
+                 [Service]\nType=simple\nExecStart={arguments}\nRestart=on-failure\nRestartSec=2s\n\
+                 KillMode=process\nNoNewPrivileges=true\nPrivateTmp=true\n\n\
+                 [Install]\nWantedBy=default.target\n"
+            ),
+        )
+        .expect("write unit");
+
+        let mut path = OsString::from(shim.as_os_str());
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        vec![
+            EnvRestore::set("XDG_CONFIG_HOME", root.join("config").into_os_string()),
+            EnvRestore::set("PATH", path),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_reports_the_durable_service_pass_when_installed_and_running() {
+        let root = tempdir().expect("root");
+        let state = private_dir(root.path(), "state");
+        let runtime = private_dir(root.path(), "runtime");
+        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+
+        let global = GlobalArgs {
+            quiet: false,
+            verbose: 0,
+            json: true,
+            color: ColorArg::Never,
+            state_dir: Some(state.clone()),
+        };
+        let report = build_doctor_report(&global).expect("doctor report");
+        assert!(
+            report.durable_available,
+            "expected installed+running service status"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "durable service"
+                    && check.status == DiagnosticStatus::Pass)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durable_submission_proceeds_when_the_service_is_running() {
+        let root = tempdir().expect("root");
+        let state = private_dir(root.path(), "state");
+        let runtime = private_dir(root.path(), "runtime");
+        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+
+        let args = parsed_schedule(&[
+            "atx",
+            "--state-dir",
+            state.to_str().expect("utf8"),
+            "--durable",
+            "--dry-run",
+            "30s",
+            "--",
+            "true",
+        ]);
+        let (outcome, _, _) = schedule(&args).expect("durable dry run");
+        assert!(outcome.is_dry_run());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_status_and_change_render_every_arm_of_a_running_service() {
+        let root = tempdir().expect("root");
+        let state = private_dir(root.path(), "state");
+        let runtime = private_dir(root.path(), "runtime");
+        let unit_path = root.join("config/systemd/user/atx.service");
+        let _env = install_running_service_fixture(root.path(), &state, &runtime);
+
+        // Installed + running: both JSON and human printers take the pass arm.
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--json",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "service",
+                "status"
+            ])),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--quiet",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "service",
+                "status"
+            ])),
+            ExitCode::SUCCESS
+        );
+
+        // Uninstall then re-report: installed=false arm renders unchanged.
+        fs::remove_file(&unit_path).expect("remove unit");
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--json",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "service",
+                "status"
+            ])),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--quiet",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "service",
+                "uninstall"
+            ])),
+            ExitCode::SUCCESS
+        );
+
+        // Foreign content makes status fail; uninstall reports no change with
+        // the full status payload embedded in the human renderer output.
+        fs::write(&unit_path, "not ours").expect("foreign unit");
+        assert_eq!(
+            run(cli(&[
+                "atx",
+                "--json",
+                "--state-dir",
+                state.to_str().expect("utf8"),
+                "service",
+                "uninstall"
+            ])),
+            exit::capability()
+        );
     }
 }
