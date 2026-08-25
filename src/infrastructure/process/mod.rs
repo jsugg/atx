@@ -385,16 +385,12 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id();
-        loop {
-            match inspector.inspect(pid).expect("inspect zombie") {
-                Some(identity) => {
-                    assert_eq!(identity.pid, pid);
-                    assert!(identity.process_group_id > 0);
-                    break;
-                }
-                None => panic!("unreaped child vanished from inspection"),
-            }
-        }
+        let identity = inspector
+            .inspect(pid)
+            .expect("inspect zombie")
+            .expect("unreaped child still inspectable");
+        assert_eq!(identity.pid, pid);
+        assert!(identity.process_group_id > 0);
         let _ = child.wait();
     }
 

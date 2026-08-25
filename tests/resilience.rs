@@ -374,28 +374,39 @@ fn failed_spawn_records_failed_once_and_never_retries() {
     assert_eq!(history, 1, "exactly one run record");
 }
 
-/// Recurring job whose in-flight occurrence is killed: the supervisor wake
-/// path requeues the next deadline; occurrences continue without duplication.
+/// Recurring job whose in-flight command is killed: the surviving monitor
+/// records the outcome and wakes the supervisor, which requeues the next
+/// deadline; occurrences continue without duplication.
 #[test]
 fn recurring_survives_monitor_loss_between_occurrences() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let marker = root.path().join("ticks");
-    let script = format!("printf 'x\\n' >>'{}'", marker.display());
+    // Each occurrence ticks then lingers briefly so the kill below reliably
+    // lands on a live command instead of racing an instant exit.
+    let script = format!("printf 'x\\n' >>'{}'; sleep 0.3", marker.display());
     let submission = submit(
         &state,
         &["--every", "1s", "--", "/bin/sh", "-c", script.as_str()],
     );
 
     count_lines_at_least(&marker, 2);
-    // Kill the in-flight occurrence's process group; the supervisor must keep
-    // scheduling subsequent occurrences.
-    if let Some((_, _, pgid)) = live_processes(&state)
-        .into_iter()
-        .find(|(role, _, _)| role == "monitor" || role == "command")
-    {
-        kill_group(pgid);
-    }
+    // Kill the command's process group only: killing the monitor would leave
+    // no one to record the outcome, and recovery holds the job Interrupted
+    // until a fresh supervisor starts (see killed_monitor test).
+    wait_for(
+        || match live_processes(&state)
+            .into_iter()
+            .find(|(role, _, _)| role == "command")
+        {
+            Some((_, _, pgid)) => {
+                kill_group(pgid);
+                true
+            }
+            None => false,
+        },
+        "a live command row to kill",
+    );
     let baseline = line_count(&marker);
     wait_for(
         || line_count(&marker) > baseline,
