@@ -143,11 +143,12 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Measured floor is ~84% (supervisor/daemon and service-install paths
-      # are only reachable under a real launchd/systemd session). Raise this
-      # toward the plan's 90% target as those paths gain tests.
+      # Measured floor is ~86%. The service-managed supervisor loop is now
+      # covered end-to-end (tests/service_daemon.rs); the remaining gap is
+      # concentrated in human-output rendering (cli/dispatch, cli/human) and
+      # the launchd/systemd adapters. Raise toward 90 as those gain tests.
       - name: Line coverage gate
-        run: cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 83
+        run: cargo llvm-cov --all-targets --all-features --locked --fail-under-lines 85
 
   doc:
     name: doc

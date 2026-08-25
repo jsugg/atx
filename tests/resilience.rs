@@ -488,11 +488,22 @@ fn missed_skip_advances_recurring_without_catchup_burst() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
     let job_id = value["data"]["job_id"].as_str().expect("job ID").to_owned();
 
-    // Supervisor dies right after submission; at least three 1s occurrences
-    // pass with nothing running.
+    // Supervisor dies right after submission. Monitors are detached and
+    // survive their supervisor, so reap any that won the pre-kill spawn race;
+    // the quiet window is then measured as "no new occurrences".
     kill_state_supervisors(&state);
-    std::thread::sleep(Duration::from_millis(3_200));
-    assert_eq!(line_count(&marker), 0, "ran while no supervisor was alive");
+    for (role, _, pgid) in live_processes(&state) {
+        if role == "monitor" {
+            kill_group(pgid);
+        }
+    }
+    let baseline = line_count(&marker);
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(
+        line_count(&marker),
+        baseline,
+        "ran while no supervisor was alive"
+    );
 
     poke_supervisor(&state);
     count_lines_at_least(&marker, 1);
