@@ -33,6 +33,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
 ];
 const MAX_BUSY_TIMEOUT_MS: u128 = 2_147_483_647;
+/// Attempts to observe a schema before declaring an existing empty DB corrupt.
+const INIT_SCHEMA_ATTEMPTS: u32 = 10;
+/// Delay between schema-observation retries while a peer initializes the DB.
+const INIT_SCHEMA_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 pub(crate) struct Database {
     connection: Connection,
@@ -50,12 +54,20 @@ impl Database {
         configure_connection(&connection, busy_timeout)?;
         // A pre-existing file without a schema is truncation or corruption,
         // never a fresh install: refuse instead of silently rebuilding.
-        if !created
+        // Exception: a peer process may be mid-initialization with its
+        // migration transaction uncommitted, so retry briefly before
+        // declaring the empty file corrupt.
+        let mut attempts_left = INIT_SCHEMA_ATTEMPTS;
+        while !created
             && connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0
         {
-            return Err(StoreError::Corrupt(
-                "existing database file carries no schema".to_owned(),
-            ));
+            attempts_left -= 1;
+            if attempts_left == 0 {
+                return Err(StoreError::Corrupt(
+                    "existing database file carries no schema".to_owned(),
+                ));
+            }
+            std::thread::sleep(INIT_SCHEMA_RETRY_DELAY);
         }
         apply_migrations(&mut connection, MIGRATIONS, CURRENT_SCHEMA_VERSION)?;
         let database = Self { connection };

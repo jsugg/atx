@@ -16,6 +16,7 @@ use super::loop_driver::{SupervisorEvent, reconcile_wall_schedule, run_loop};
 use super::recovery::rebuild_deadline_heap;
 use crate::application::{ElapsedClock, WallClock, reconcile_startup};
 use crate::domain::{JobState, RunOutcome, TransitionActor};
+use crate::infrastructure::paths::ensure_private_dir;
 use crate::infrastructure::process::NativeProcessInspector;
 use crate::infrastructure::sqlite::{Database, JobStore, RetentionPolicy, StartupStore};
 use crate::infrastructure::time::NativeClock;
@@ -24,11 +25,27 @@ const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The signals a service manager uses to stop the unit.
+fn stop_signal_set() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let set_ptr = std::ptr::addr_of_mut!(set);
+    // SAFETY: all calls take only stack pointers and no pointer preconditions.
+    unsafe {
+        libc::sigemptyset(set_ptr);
+        libc::sigaddset(set_ptr, libc::SIGTERM);
+        libc::sigaddset(set_ptr, libc::SIGINT);
+    }
+    set
+}
+
 pub(crate) fn run_session_supervisor(
     state_directory: &Path,
     runtime_directory: &Path,
     service_managed: bool,
 ) -> Result<(), DaemonError> {
+    // Service managers may hand us directories that do not exist yet; create
+    // them with the required private mode instead of failing to open the DB.
+    ensure_private_dir(state_directory).map_err(std::io::Error::other)?;
     let database_path = state_directory.join("atx.db");
     let clock = NativeClock;
     let boot_identity = clock.boot_identity()?;
@@ -54,7 +71,31 @@ pub(crate) fn run_session_supervisor(
         .map_err(|error| DaemonError::Recovery(error.to_string()))?
     };
     let mut heap = rebuild_deadline_heap(&plan);
+    // launchd/systemd stop units with SIGTERM. Block the stop signals before
+    // any helper thread inherits the mask, then consume them in a sigwait
+    // thread so the loop unwinds cleanly: the IPC thread is joined and the
+    // runtime socket removed, instead of dying mid-write on the default
+    // disposition.
+    let mask = stop_signal_set();
+    let mask_ptr = std::ptr::addr_of!(mask);
+    // SAFETY: takes only stack pointers and no pointer preconditions.
+    unsafe {
+        let _ = libc::pthread_sigmask(libc::SIG_SETMASK, mask_ptr.cast(), std::ptr::null_mut());
+    }
     let (sender, receiver) = mpsc::channel();
+    let signal_sender = sender.clone();
+    std::thread::spawn(move || {
+        let mut delivered: i32 = 0;
+        let delivered_ptr = std::ptr::addr_of_mut!(delivered);
+        let mut set = stop_signal_set();
+        let set = std::ptr::addr_of_mut!(set);
+        // SAFETY: sigwait takes only stack pointers; the stop signals are
+        // blocked process-wide above, so no other thread can steal them.
+        unsafe {
+            libc::sigwait(set, delivered_ptr);
+        }
+        let _ = signal_sender.send(SupervisorEvent::Shutdown);
+    });
     let listener = runtime.listener().try_clone()?;
     let ipc_database = database_path.clone();
     let event_sender = sender.clone();
