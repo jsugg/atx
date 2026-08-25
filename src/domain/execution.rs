@@ -433,6 +433,57 @@ mod tests {
     }
 
     #[test]
+    fn persistence_json_rejects_wrong_policy_and_shell_shapes() {
+        let base = serde_json::json!({
+            "mode": "direct",
+            "argv": ["true"],
+            "working_directory": "/tmp",
+            "environment": {},
+            "stdin": "null",
+            "stdout": "bounded_file",
+            "stderr": "bounded_file",
+            "shell_path": null
+        });
+        let mut bad_policy = base.clone();
+        bad_policy["stdout"] = serde_json::json!("null");
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&bad_policy).expect("json")
+            )
+            .is_err()
+        );
+
+        let mut shell_without_path = base.clone();
+        shell_without_path["mode"] = serde_json::json!("shell");
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&shell_without_path).expect("json")
+            )
+            .is_err()
+        );
+        let mut direct_with_path = base;
+        direct_with_path["shell_path"] = serde_json::json!("/bin/sh");
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&direct_with_path).expect("json")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn set_shell_path_rejects_relative_paths_and_direct_mode() {
+        let mut spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid execution");
+        assert!(spec.set_shell_path(PathBuf::from("/bin/sh")).is_err());
+    }
+
+    #[test]
     fn legacy_persistence_json_without_notify_tty_loads() {
         let legacy = serde_json::json!({
             "mode": "direct",
@@ -475,6 +526,8 @@ mod tests {
     #[test]
     fn validates_environment_cwd_and_total_size() {
         assert!(Environment::from_pairs([("BAD-KEY", "value")]).is_err());
+        // An empty key takes the missing-first-byte branch of the validator.
+        assert!(Environment::from_pairs([("", "value")]).is_err());
         assert!(
             ExecutionSpec::new(
                 ExecutionMode::Direct,

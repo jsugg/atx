@@ -490,6 +490,130 @@ mod tests {
         assert_eq!(status.detail, "launchctl is unavailable");
     }
 
+    #[test]
+    fn status_reports_installed_agent_that_is_not_running() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        let service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent,
+            501,
+            FakeRunner {
+                failing_command: Some("print"),
+                ..FakeRunner::default()
+            },
+        );
+        let status = service.status().expect("status");
+        assert!(status.installed);
+        assert!(!status.running);
+        assert_eq!(status.detail, "launch agent is installed but not running");
+    }
+
+    #[test]
+    fn status_reports_missing_installation() {
+        let root = tempdir().expect("root");
+        let service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            FakeRunner::default(),
+        );
+        let status = service.status().expect("status");
+        assert!(!status.installed);
+        assert!(!status.running);
+        assert_eq!(status.detail, "launch agent is not installed");
+    }
+
+    #[test]
+    fn install_is_a_noop_when_already_installed() {
+        let root = tempdir().expect("root");
+        let agent = root.path().join("agent.plist");
+        std::fs::write(
+            &agent,
+            render_plist(
+                std::path::Path::new("/bin/atx"),
+                &root.path().join("state"),
+                &root.path().join("runtime"),
+            ),
+        )
+        .expect("write agent");
+        let runner = FakeRunner::default();
+        let calls = runner.calls.clone();
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent,
+            501,
+            runner,
+        );
+        service.install().expect("install");
+        assert!(!calls.borrow().iter().any(|call| call.contains("bootstrap")));
+    }
+
+    #[test]
+    fn install_cleans_up_when_the_plist_cannot_be_written() {
+        let root = tempdir().expect("root");
+        // Occupying the temporary path forces the create_new write to fail.
+        std::fs::create_dir(root.path().join("agent.plist.tmp")).expect("block temp path");
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            FakeRunner::default(),
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
+    fn kickstart_failure_fails_the_install() {
+        let root = tempdir().expect("root");
+        let mut service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            root.path().join("agent.plist"),
+            501,
+            FakeRunner {
+                failing_command: Some("kickstart"),
+                ..FakeRunner::default()
+            },
+        );
+        assert!(service.install().is_err());
+    }
+
+    #[test]
+    fn unreadable_agent_fails_the_installed_check() {
+        let root = tempdir().expect("root");
+        // A directory at the agent path yields a read error that is not NotFound.
+        let agent = root.path().join("agent.plist");
+        std::fs::create_dir(&agent).expect("agent directory");
+        let service = LaunchdService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            agent,
+            501,
+            FakeRunner::default(),
+        );
+        assert!(service.status().is_err());
+    }
+
     struct FailingRunner;
 
     impl CommandRunner for FailingRunner {

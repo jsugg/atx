@@ -158,6 +158,25 @@ mod tests {
     }
 
     #[test]
+    fn remove_last_element_and_sift_down_after_removal() {
+        let mut heap = DeadlineHeap::default();
+        let root = JobId::new();
+        let left = JobId::new();
+        let right = JobId::new();
+        // Removing the root when it is the only entry takes the early-return
+        // path; the remaining removals exercise the sift-down replacement.
+        heap.upsert(root, ElapsedInstant::from_nanos(10));
+        assert!(heap.remove(root));
+        heap.upsert(left, ElapsedInstant::from_nanos(10));
+        heap.upsert(right, ElapsedInstant::from_nanos(20));
+        assert_eq!(
+            heap.pop_due(ElapsedInstant::from_nanos(20)),
+            vec![left, right]
+        );
+        assert!(heap.is_empty());
+    }
+
+    #[test]
     fn ten_thousand_jobs_batch_without_stale_entries() {
         let mut heap = DeadlineHeap::default();
         let mut jobs = Vec::with_capacity(10_000);
