@@ -481,6 +481,87 @@ mod tests {
         )
         .expect("valid execution");
         assert!(spec.set_shell_path(PathBuf::from("/bin/sh")).is_err());
+
+        // In shell mode the replacement must still be absolute.
+        let mut shell = ExecutionSpec::new(
+            ExecutionMode::Shell,
+            vec!["echo hi".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid shell execution");
+        assert!(shell.set_shell_path(PathBuf::from("relative/sh")).is_err());
+    }
+
+    #[test]
+    fn environment_key_value_and_empty_argv_edges_are_rejected() {
+        // A leading digit fails the first-byte branch; a hyphen after a valid
+        // start fails the remainder branch.
+        assert!(Environment::from_pairs([("9x", "value")]).is_err());
+        assert!(Environment::from_pairs([("A-B", "value")]).is_err());
+        assert!(matches!(
+            Environment::from_pairs([("TOKEN", "v\0")]),
+            Err(ExecutionError::ContainsNul("environment value"))
+        ));
+        assert!(matches!(
+            ExecutionSpec::new(
+                ExecutionMode::Direct,
+                Vec::new(),
+                "/tmp".to_owned(),
+                Environment::empty(),
+            ),
+            Err(ExecutionError::EmptyArguments)
+        ));
+    }
+
+    #[test]
+    fn notify_tty_nul_and_oversize_paths_are_rejected() {
+        let mut spec = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid execution");
+        assert!(spec.set_notify_tty(PathBuf::from("/dev/tty\0bad")).is_err());
+
+        // The base spec stays under the serialized-size cap on its own; the
+        // tty path alone pushes the total past it.
+        let oversize = format!("/dev/{}", "t".repeat(super::MAX_SERIALIZED_BYTES));
+        assert!(matches!(
+            spec.set_notify_tty(PathBuf::from(oversize)),
+            Err(ExecutionError::SerializedSizeExceeded)
+        ));
+    }
+
+    #[test]
+    fn persisted_shell_rows_require_an_absolute_shell_path() {
+        let shell_row = serde_json::json!({
+            "mode": "shell",
+            "argv": ["echo hi"],
+            "working_directory": "/tmp",
+            "environment": {},
+            "stdin": "null",
+            "stdout": "bounded_file",
+            "stderr": "bounded_file",
+            "shell_path": "/bin/bash"
+        });
+        let restored =
+            ExecutionSpec::from_persistence_json(&serde_json::to_string(&shell_row).expect("json"))
+                .expect("shell row with absolute path loads");
+        assert_eq!(
+            restored.shell_path(),
+            Some(std::path::Path::new("/bin/bash"))
+        );
+
+        let mut relative_shell = shell_row;
+        relative_shell["shell_path"] = serde_json::json!("sh");
+        assert!(
+            ExecutionSpec::from_persistence_json(
+                &serde_json::to_string(&relative_shell).expect("json")
+            )
+            .is_err()
+        );
     }
 
     #[test]
