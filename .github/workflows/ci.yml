@@ -145,16 +145,16 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Measured on main: lines 90.47%, regions 82.86%. Regions approximate the
+      # Measured on main: lines 95.5%, regions 86.1%. Regions approximate the
       # branch-level signal the project tracks; the remaining gap sits in
-      # job/run store edge paths and cli dispatch. Raise both floors as those
-      # gain tests.
+      # cli dispatch and platform/defensive failure arms. Raise both floors
+      # as those gain tests.
       - name: Coverage gate
         # +nightly overrides the repo's rust-toolchain.toml pin (stable);
         # --branch needs -Z coverage-options=branch.
         run: >-
           cargo +nightly llvm-cov --branch --all-targets --all-features --locked
-          --fail-under-lines 88 --fail-under-regions 82
+          --fail-under-lines 95 --fail-under-regions 85
 
   doc:
     name: doc
