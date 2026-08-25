@@ -206,8 +206,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PathEnvironment, Platform, create_new_private_file, ensure_private_dir, resolve_paths,
-        validate_private_dir_for_uid,
+        PathEnvironment, Platform, create_new_private_file, ensure_private_dir, open_private_file,
+        resolve_paths, validate_private_dir_for_uid,
     };
 
     #[test]
@@ -311,5 +311,97 @@ mod tests {
         assert!(create_new_private_file(&directory, "state.db").is_err());
         assert_eq!(fs::read(victim).expect("victim unchanged"), b"safe");
         assert!(create_new_private_file(&directory, "../escape").is_err());
+    }
+
+    #[test]
+    fn platform_paths_accessors_report_values() {
+        let environment = PathEnvironment {
+            home: Some("/home/juan".into()),
+            xdg_state_home: Some("/state".into()),
+            xdg_runtime_dir: Some("/run/user/1000".into()),
+            temporary_directory: Some("/tmp".into()),
+        };
+        let paths = resolve_paths(Platform::Linux, &environment, None, 1000).expect("paths");
+        assert_eq!(paths.state_dir(), std::path::Path::new("/state/atx"));
+        assert_eq!(
+            paths.runtime_dir(),
+            std::path::Path::new("/run/user/1000/atx")
+        );
+        assert!(!paths.runtime_uses_fallback());
+    }
+
+    #[test]
+    fn missing_home_and_runtime_root_fail_cleanly() {
+        let empty = PathEnvironment::default();
+        // Linux without an xdg state home or home yields MissingHome.
+        assert!(resolve_paths(Platform::Linux, &empty, None, 1000).is_err());
+        // macOS without a home yields MissingHome.
+        assert!(resolve_paths(Platform::MacOs, &empty, None, 1000).is_err());
+        // No temporary directory means the runtime fallback root is missing.
+        let no_tmp = PathEnvironment {
+            home: Some("/home/juan".into()),
+            xdg_state_home: Some("/state".into()),
+            xdg_runtime_dir: None,
+            temporary_directory: None,
+        };
+        assert!(resolve_paths(Platform::Linux, &no_tmp, None, 1000).is_err());
+    }
+
+    #[test]
+    fn relative_override_is_rejected() {
+        let environment = PathEnvironment {
+            home: Some("/home/juan".into()),
+            xdg_state_home: Some("/state".into()),
+            xdg_runtime_dir: Some("/run/user/1000".into()),
+            temporary_directory: Some("/tmp".into()),
+        };
+        assert!(
+            resolve_paths(
+                Platform::Linux,
+                &environment,
+                Some(std::path::Path::new("relative/state")),
+                1000,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn relative_leaf_names_are_rejected() {
+        let root = tempdir().expect("temp root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
+        ensure_private_dir(root.path()).expect("secure root");
+        let directory = fs::File::open(root.path()).expect("directory handle");
+        assert!(create_new_private_file(&directory, "").is_err());
+        assert!(create_new_private_file(&directory, "/absolute").is_err());
+        assert!(create_new_private_file(&directory, "dir/file").is_err());
+        assert!(create_new_private_file(&directory, "file.db").is_ok());
+    }
+
+    #[test]
+    fn open_private_file_validates_ownership_mode_and_type() {
+        let root = tempdir().expect("temp root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
+        ensure_private_dir(root.path()).expect("secure root");
+        let directory = fs::File::open(root.path()).expect("directory handle");
+        create_new_private_file(&directory, "data.db").expect("create");
+
+        // Opening the regular, owner-only file succeeds.
+        let file = open_private_file(&directory, "data.db").expect("open");
+        drop(file);
+
+        // A symlink to a private file is rejected by NOFOLLOW.
+        symlink(root.path().join("data.db"), root.path().join("link.db")).expect("symlink");
+        assert!(open_private_file(&directory, "link.db").is_err());
+
+        // A wrong-mode file is rejected.
+        let loose = root.path().join("loose.db");
+        fs::write(&loose, b"x").expect("write");
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).expect("loose mode");
+        assert!(open_private_file(&directory, "loose.db").is_err());
+
+        // A directory in place of the leaf is rejected.
+        fs::create_dir(root.path().join("dir.db")).expect("dir");
+        assert!(open_private_file(&directory, "dir.db").is_err());
     }
 }

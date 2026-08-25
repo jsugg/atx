@@ -216,15 +216,15 @@ pub(crate) enum ProcessError {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use crate::application::ElapsedClock;
+    use crate::application::{ElapsedClock, IdentityInspector};
     use crate::domain::ProcessIdentitySnapshot;
     use crate::infrastructure::time::NativeClock;
 
     #[cfg(target_os = "linux")]
     use super::parse_linux_stat;
     use super::{
-        IdentityStatus, NativeProcessInspector, classify_identity, map_inspection_error,
-        validate_snapshot,
+        IdentityStatus, NativeProcessInspector, ProcessError, RecoveryIdentityStatus,
+        classify_identity, map_inspection_error, validate_snapshot,
     };
 
     #[test]
@@ -287,5 +287,114 @@ mod tests {
         assert_eq!(parsed.process_group_id, 77);
         assert_eq!(parsed.start_token, 4242);
         assert!(parse_linux_stat("broken", "boot-a").is_err());
+    }
+
+    #[test]
+    fn inspect_rejects_pid_zero() {
+        let inspector = NativeProcessInspector::new("boot-a".to_owned());
+        assert!(inspector.inspect(0).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stat_parser_rejects_malformed_input() {
+        // no parentheses at all
+        assert!(parse_linux_stat("not-a-stat-line", "boot-a").is_err());
+        // empty before/after the comm field, or comm field missing close
+        assert!(parse_linux_stat("(orphan", "boot-a").is_err());
+        // too few fields after comm to reach pgid/start_time
+        assert!(parse_linux_stat("1 (init) S 0", "boot-a").is_err());
+        // pid is not numeric
+        assert!(
+            parse_linux_stat(
+                "abc (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                "boot-a"
+            )
+            .is_err()
+        );
+        // pgid is not numeric
+        assert!(
+            parse_linux_stat(
+                "1 (x) S 0 notanint 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+                "boot-a"
+            )
+            .is_err()
+        );
+        // start_time is not numeric
+        assert!(
+            parse_linux_stat(
+                "1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 notanint",
+                "boot-a"
+            )
+            .is_err()
+        );
+        // validated-away because pgid<=0
+        assert!(
+            parse_linux_stat("1 (x) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0", "boot-a").is_err()
+        );
+    }
+
+    #[test]
+    fn validate_snapshot_rejects_each_constraint() {
+        let base = ProcessIdentitySnapshot {
+            boot_identity: "boot-a".to_owned(),
+            pid: 42,
+            start_token: 100,
+            process_group_id: 42,
+        };
+        let mut variant = base.clone();
+        variant.boot_identity = String::new();
+        assert!(validate_snapshot(&variant).is_err());
+
+        variant = base.clone();
+        variant.boot_identity = "has\0nul".to_owned();
+        assert!(validate_snapshot(&variant).is_err());
+
+        variant = base.clone();
+        variant.pid = 0;
+        assert!(validate_snapshot(&variant).is_err());
+
+        variant = base.clone();
+        variant.start_token = 0;
+        assert!(validate_snapshot(&variant).is_err());
+
+        variant = base.clone();
+        variant.process_group_id = 0;
+        assert!(validate_snapshot(&variant).is_err());
+
+        assert!(validate_snapshot(&base).is_ok());
+    }
+
+    #[test]
+    fn map_inspection_error_maps_permission_denied_and_io() {
+        assert!(matches!(
+            map_inspection_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            ProcessError::PermissionDenied
+        ));
+        assert!(matches!(
+            map_inspection_error(std::io::Error::other("boom")),
+            ProcessError::Io(_)
+        ));
+    }
+
+    #[test]
+    fn identity_inspector_classify_maps_native_status() {
+        let clock = NativeClock;
+        let inspector = NativeProcessInspector::new(clock.boot_identity().expect("boot identity"));
+        let pid = std::process::id();
+        let identity = inspector.inspect(pid).expect("inspect").expect("alive");
+        assert!(matches!(
+            IdentityInspector::classify(&inspector, &identity),
+            Ok(RecoveryIdentityStatus::Alive)
+        ));
+
+        // An invalid snapshot (pid 0) fails validation before any inspection.
+        let invalid = ProcessIdentitySnapshot {
+            boot_identity: String::new(),
+            pid: 0,
+            start_token: 0,
+            process_group_id: 0,
+        };
+        assert!(IdentityInspector::classify(&inspector, &invalid).is_err());
     }
 }

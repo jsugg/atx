@@ -438,7 +438,10 @@ mod tests {
     use super::super::JobStore;
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, StoreError};
-    use crate::domain::{ProcessIdentitySnapshot, RunOutcome, RunState, UtcTimestamp};
+    use crate::domain::{
+        ClaimToken, ProcessIdentitySnapshot, RunId, RunOutcome, RunState, UtcTimestamp,
+    };
+    use rusqlite::params;
 
     fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {
         ProcessIdentitySnapshot {
@@ -594,5 +597,521 @@ mod tests {
             )
             .expect("natural completion");
         assert_eq!(completed.state(), RunState::Succeeded);
+    }
+
+    fn run_id(value: u128) -> RunId {
+        RunId::from_u128(value)
+    }
+
+    #[test]
+    fn load_run_returns_none_for_missing_id() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let store = JobStore::new(database);
+        assert!(store.load_run(run_id(99)).expect("load").is_none());
+    }
+
+    #[test]
+    fn wrong_claim_token_rejected_on_running_mark() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        assert!(matches!(
+            store.mark_run_running(
+                run.id(),
+                ClaimToken::from_bytes([9; 32]),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            ),
+            Err(StoreError::InvalidClaim)
+        ));
+    }
+
+    #[test]
+    fn wrong_claim_token_rejected_on_terminal_record() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        assert!(matches!(
+            store.record_run_terminal(
+                run.id(),
+                ClaimToken::from_bytes([9; 32]),
+                UtcTimestamp::from_second(1_002).expect("finished"),
+                RunOutcome::Exit(0),
+            ),
+            Err(StoreError::InvalidClaim)
+        ));
+    }
+
+    #[test]
+    fn wrong_claim_token_rejected_on_cancellation_request() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        assert!(matches!(
+            store.request_run_cancellation(run.id(), ClaimToken::from_bytes([9; 32]),),
+            Err(StoreError::InvalidClaim)
+        ));
+    }
+
+    #[test]
+    fn missing_run_is_not_found_on_every_path() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let missing = run_id(7);
+        // load_run reports absence as Ok(None), not an error.
+        assert!(store.load_run(missing).expect("load").is_none());
+        assert!(matches!(
+            store.mark_run_running(
+                missing,
+                ClaimToken::from_bytes([1; 32]),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.record_run_terminal(
+                missing,
+                ClaimToken::from_bytes([1; 32]),
+                UtcTimestamp::from_second(1_002).expect("finished"),
+                RunOutcome::Exit(0),
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.request_run_cancellation(missing, ClaimToken::from_bytes([1; 32]),),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn marking_running_fails_when_run_is_not_starting() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        let finished = UtcTimestamp::from_second(1_003).expect("finished");
+        store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Exit(0),
+            )
+            .expect("complete");
+        // Run is terminal: the domain guard rejects before any DB write, surfaced as Domain.
+        assert!(matches!(
+            store.mark_run_running(
+                running.id(),
+                running.claim_token(),
+                UtcTimestamp::from_second(1_004).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            ),
+            Err(StoreError::Domain(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_record_conflicts_when_outcome_differs_after_terminal() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        let finished = UtcTimestamp::from_second(1_003).expect("finished");
+        store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Exit(0),
+            )
+            .expect("complete");
+        // Same finished time but a different outcome: terminal run, so it conflicts rather than idempotently returning.
+        assert!(matches!(
+            store.record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Signal(9),
+            ),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn cancellation_conflicts_after_terminal_transition() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        let finished = UtcTimestamp::from_second(1_003).expect("finished");
+        store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Exit(0),
+            )
+            .expect("complete");
+        // Terminal run: request_cancellation leaves a terminal run untouched
+        // (idempotent no-op branch), returning the same run id.
+        let again = store
+            .request_run_cancellation(running.id(), running.claim_token())
+            .expect("already terminal");
+        assert_eq!(again.id(), running.id());
+        assert!(again.state().is_terminal());
+    }
+
+    #[test]
+    fn cancellation_requested_state_allows_natural_exit_then_conflicts_again() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let running = store
+            .mark_run_running(
+                run.id(),
+                run.claim_token(),
+                UtcTimestamp::from_second(1_002).expect("started"),
+                identity(10, 100, 20),
+                identity(11, 101, 20),
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("running");
+        store
+            .request_run_cancellation(running.id(), running.claim_token())
+            .expect("request");
+        // cancel_requested is a valid pre-terminal state for record_run_terminal.
+        let finished = UtcTimestamp::from_second(1_003).expect("finished");
+        let completed = store
+            .record_run_terminal(
+                running.id(),
+                running.claim_token(),
+                finished,
+                RunOutcome::Cancelled("user".to_owned()),
+            )
+            .expect("cancelled completion");
+        assert_eq!(completed.state(), RunState::Cancelled);
+        // Now terminal: request_cancellation leaves a terminal run untouched
+        // (idempotent no-op branch), returning the same run.
+        let again = store
+            .request_run_cancellation(running.id(), running.claim_token())
+            .expect("already terminal");
+        assert_eq!(again.id(), completed.id());
+        assert!(again.state().is_terminal());
+    }
+
+    #[test]
+    fn claim_reuses_existing_run_row_without_touching_job_state() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let first = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            )
+            .expect("claim");
+        let second = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_031).expect("scheduled"),
+                UtcTimestamp::from_second(1_002).expect("created"),
+            )
+            .expect("claim");
+        assert_ne!(first.id(), second.id());
+        assert_eq!(second.sequence().get(), 2);
+        assert_ne!(
+            first.claim_token().as_bytes(),
+            second.claim_token().as_bytes()
+        );
+        // Job itself remains untouched (never started/running).
+        assert_eq!(
+            store
+                .load_run(first.id())
+                .expect("load")
+                .expect("run")
+                .job_id(),
+            job.id()
+        );
+    }
+
+    // Seed a single corrupt runs row directly into the migrated schema so the
+    // decoder is exercised against a persisted-but-invalid record. FK enforcement
+    // stays on, so a real jobs parent row is inserted first via the store.
+    fn seed_corrupt_row(mut store: JobStore, id: RunId, corrupt: &str) {
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let job_id = job.id().to_string();
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'starting', ?3, '', '')",
+                    params![id.to_string(), job_id, vec![0_u8; 32]],
+                )
+                .expect("seed");
+            connection
+                .execute(
+                    &format!("UPDATE runs SET {corrupt} WHERE id = ?1"),
+                    [id.to_string()],
+                )
+                .expect("corrupt");
+        }
+        assert!(
+            matches!(store.load_run(id), Err(StoreError::Corrupt(_))),
+            "expected Corrupt decoding {corrupt}"
+        );
+    }
+
+    #[test]
+    fn corrupt_row_unknown_state() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        seed_corrupt_row(JobStore::new(database), run_id(1), "state = 'bogus'");
+    }
+
+    #[test]
+    fn corrupt_row_bad_created_timestamp() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        seed_corrupt_row(
+            JobStore::new(database),
+            run_id(2),
+            "created_at_utc = 'garbage'",
+        );
+    }
+
+    #[test]
+    fn corrupt_row_bad_scheduled_timestamp() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        seed_corrupt_row(
+            JobStore::new(database),
+            run_id(3),
+            "scheduled_for_utc = 'nope'",
+        );
+    }
+
+    #[test]
+    fn corrupt_row_short_claim_token() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'starting', ?3, '', '')",
+                    params![
+                        run_id(4).to_string(),
+                        job.id().to_string(),
+                        vec![1_u8, 2, 3]
+                    ],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(4)),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_row_process_group_mismatch() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, command_identity_json, process_group_id,
+                        stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'running', ?3, '{\"boot_identity\":\"b\",\"pid\":1,\"start_token\":1,\"process_group_id\":2}', 99, '', '')",
+                    params![run_id(5).to_string(), job.id().to_string(), vec![0_u8; 32]],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(5)),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_row_outcome_columns_disagree() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, outcome_json, exit_code, stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'succeeded', ?3, '{\"Exit\":0}', 7, '', '')",
+                    params![run_id(6).to_string(), job.id().to_string(), vec![0_u8; 32]],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(6)),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

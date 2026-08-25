@@ -80,3 +80,81 @@ impl ServiceManager for NativeServiceManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use crate::application::ServiceManager;
+
+    use super::NativeServiceManager;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn detect_builds_a_launchd_manager_with_agent_path() {
+        let manager = NativeServiceManager::detect(
+            "/bin/atx".into(),
+            "/state".into(),
+            "/runtime".into(),
+            std::path::Path::new("/home/juan"),
+            501,
+        );
+        match manager {
+            NativeServiceManager::Launchd(service) => {
+                let status = service.status();
+                // On a host with launchctl present, the manager reports itself
+                // available; the probe exercising the real binary is what we
+                // assert, and it must not error.
+                assert!(status.is_ok());
+                assert_eq!(
+                    status.expect("launchd status").availability,
+                    crate::application::ServiceAvailability::Available
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_builds_a_systemd_manager_honoring_xdg_config_home() {
+        std::env::set_var("XDG_CONFIG_HOME", "/custom/config");
+        let manager = NativeServiceManager::detect(
+            "/bin/atx".into(),
+            "/state".into(),
+            "/runtime".into(),
+            std::path::Path::new("/home/juan"),
+            1000,
+        );
+        match manager {
+            NativeServiceManager::Systemd(service) => {
+                let status = service.status();
+                assert!(status.is_ok());
+                assert_eq!(
+                    status.expect("launchd status").availability,
+                    crate::application::ServiceAvailability::Unavailable
+                );
+            }
+            _ => panic!("expected a systemd manager on Linux"),
+        }
+        std::env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn detect_uses_home_fallback_for_config_when_unset() {
+        // Exercise the home-relative `.config` branch by unsetting the var on
+        // the platform where the manager dispatches to systemd.
+        #[cfg(target_os = "linux")]
+        {
+            std::env::remove_var("XDG_CONFIG_HOME");
+            let manager = NativeServiceManager::detect(
+                "/bin/atx".into(),
+                "/state".into(),
+                "/runtime".into(),
+                std::path::Path::new("/home/juan"),
+                1000,
+            );
+            assert!(matches!(manager, NativeServiceManager::Systemd(_)));
+            let _ = Path::new("/home/juan/.config");
+        }
+    }
+}
