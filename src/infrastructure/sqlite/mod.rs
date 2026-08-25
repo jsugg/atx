@@ -272,6 +272,8 @@ mod tests {
 
     use std::time::Duration;
 
+    use std::os::unix::fs::PermissionsExt as _;
+
     use rusqlite::Connection;
     use rustix::fs::OpenOptionsExt as _;
     use tempfile::tempdir;
@@ -395,6 +397,80 @@ mod tests {
                 .query_row("SELECT count(*) FROM first", [], |row| row.get::<_, u32>(0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn insecure_preexisting_database_files_are_rejected() {
+        let root = tempdir().expect("temp root");
+
+        let link = root.path().join("link.db");
+        std::os::unix::fs::symlink("/tmp", &link).expect("symlink");
+        assert!(matches!(
+            Database::open(&link, Duration::from_secs(5)),
+            Err(super::StoreError::InsecureDatabaseFile)
+        ));
+
+        let loose = root.path().join("loose.db");
+        std::fs::write(&loose, []).expect("seed file");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644))
+            .expect("relax mode");
+        assert!(matches!(
+            Database::open(&loose, Duration::from_secs(5)),
+            Err(super::StoreError::InsecureDatabaseFile)
+        ));
+
+        let directory = root.path().join("dir.db");
+        std::fs::create_dir(&directory).expect("directory");
+        assert!(matches!(
+            Database::open(&directory, Duration::from_secs(5)),
+            Err(super::StoreError::InsecureDatabaseFile)
+        ));
+    }
+
+    #[test]
+    fn zero_busy_timeout_is_rejected() {
+        let root = tempdir().expect("temp root");
+        assert!(matches!(
+            Database::open(&root.path().join("atx.db"), Duration::ZERO),
+            Err(super::StoreError::InvalidBusyTimeout)
+        ));
+    }
+
+    #[test]
+    fn migrations_resume_from_a_partially_applied_schema() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        connection
+            .execute_batch("CREATE TABLE first(value INTEGER); PRAGMA user_version=1;")
+            .expect("seed schema");
+
+        apply_migrations(
+            &mut connection,
+            &[
+                (1, "SELECT 1;"),
+                (2, "CREATE TABLE second(value INTEGER);"),
+                (3, "CREATE TABLE third(value INTEGER);"),
+            ],
+            3,
+        )
+        .expect("resume migrations");
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 3);
+        for table in ["first", "second", "third"] {
+            assert!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name=?1",
+                        [table],
+                        |row| row.get::<_, u32>(0),
+                    )
+                    .expect("table query")
+                    == 1,
+                "{table}"
+            );
+        }
     }
 
     #[test]

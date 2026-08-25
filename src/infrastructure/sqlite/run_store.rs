@@ -453,6 +453,31 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_run_rows_surface_as_corrupt() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        let run_id = RunId::new();
+        store
+            .database()
+            .connection()
+            .execute(
+                "INSERT INTO runs(id, job_id, sequence, scheduled_for_utc, created_at_utc, state, claim_token)
+                 VALUES (?1, ?2, 1, '2026-01-01T00:00:00Z', 'not-a-timestamp', 'starting', zeroblob(32))",
+                params![run_id.to_string(), job.id().to_string()],
+            )
+            .expect("seed corrupt row");
+
+        let error = store
+            .load_run(run_id)
+            .expect_err("corrupt row must fail to decode");
+        assert!(matches!(error, StoreError::Corrupt(_)), "got {error:?}");
+    }
+
+    #[test]
     fn constraint_violation_at_claim_insert_maps_to_duplicate_claim() {
         let root = tempdir().expect("temp root");
         let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
