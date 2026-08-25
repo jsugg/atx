@@ -154,7 +154,7 @@ jobs:
         # --branch needs -Z coverage-options=branch.
         run: >-
           cargo +nightly llvm-cov --branch --all-targets --all-features --locked
-          --fail-under-lines 87 --fail-under-regions 80
+          --fail-under-lines 88 --fail-under-regions 82
 
   doc:
     name: doc
