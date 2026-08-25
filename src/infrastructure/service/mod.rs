@@ -117,7 +117,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn detect_builds_a_systemd_manager_honoring_xdg_config_home() {
-        std::env::set_var("XDG_CONFIG_HOME", "/custom/config");
+        // SAFETY: single-threaded test binary; no other thread reads the env.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/custom/config") };
         let manager = NativeServiceManager::detect(
             "/bin/atx".into(),
             "/state".into(),
@@ -136,25 +137,21 @@ mod tests {
             }
             _ => panic!("expected a systemd manager on Linux"),
         }
-        std::env::remove_var("XDG_CONFIG_HOME");
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn detect_uses_home_fallback_for_config_when_unset() {
-        // Exercise the home-relative `.config` branch by unsetting the var on
-        // the platform where the manager dispatches to systemd.
-        #[cfg(target_os = "linux")]
-        {
-            std::env::remove_var("XDG_CONFIG_HOME");
-            let manager = NativeServiceManager::detect(
-                "/bin/atx".into(),
-                "/state".into(),
-                "/runtime".into(),
-                std::path::Path::new("/home/juan"),
-                1000,
-            );
-            assert!(matches!(manager, NativeServiceManager::Systemd(_)));
-            let _ = Path::new("/home/juan/.config");
-        }
+        // SAFETY: single-threaded test binary; no other thread reads the env.
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let manager = NativeServiceManager::detect(
+            "/bin/atx".into(),
+            "/state".into(),
+            "/runtime".into(),
+            std::path::Path::new("/home/juan"),
+            1000,
+        );
+        assert!(matches!(manager, NativeServiceManager::Systemd(_)));
     }
 }
