@@ -453,6 +453,34 @@ mod tests {
     }
 
     #[test]
+    fn constraint_violation_at_claim_insert_maps_to_duplicate_claim() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        // Simulate a peer claiming the occurrence between the EXISTS pre-check
+        // and the INSERT: the unique constraint fires on the insert itself.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_run_insert BEFORE INSERT ON runs
+                 BEGIN SELECT RAISE(ABORT, 'duplicate run'); END;",
+            )
+            .expect("trigger");
+        assert!(matches!(
+            store.claim_run(
+                job.id(),
+                UtcTimestamp::from_second(1_030).expect("scheduled"),
+                UtcTimestamp::from_second(1_001).expect("created"),
+            ),
+            Err(StoreError::DuplicateClaim)
+        ));
+    }
+
+    #[test]
     fn claim_is_unique_per_occurrence_and_uses_random_token() {
         let root = tempdir().expect("temp root");
         let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
@@ -1081,6 +1109,100 @@ mod tests {
         }
         assert!(matches!(
             store.load_run(run_id(5)),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_row_signal_columns_disagree() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, outcome_json, terminating_signal, exit_code,
+                        stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'failed', ?3, '{\"Signal\":9}', 9, 0, '', '')",
+                    params![run_id(7).to_string(), job.id().to_string(), vec![0_u8; 32]],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(7)),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_row_failure_columns_disagree() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, outcome_json, failure, terminating_signal,
+                        stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'failed', ?3, '{\"Failure\":\"boom\"}',
+                        'different', 5, '', '')",
+                    params![run_id(8).to_string(), job.id().to_string(), vec![0_u8; 32]],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(8)),
+            Err(StoreError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn corrupt_row_success_without_outcome_json() {
+        let root = tempdir().expect("temp root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
+            .expect("database");
+        let mut store = JobStore::new(database);
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("job");
+        {
+            let connection = store.database().connection();
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON;")
+                .expect("disable checks");
+            // Terminal state carrying outcome columns but no outcome JSON.
+            connection
+                .execute(
+                    "INSERT INTO runs(
+                        id, job_id, sequence, scheduled_for_utc, created_at_utc, state,
+                        claim_token, exit_code, stdout_path, stderr_path
+                     ) VALUES (?1, ?2, 1, '1970-01-01T00:00:01Z',
+                        '1970-01-01T00:00:01Z', 'succeeded', ?3, 0, '', '')",
+                    params![run_id(9).to_string(), job.id().to_string(), vec![0_u8; 32]],
+                )
+                .expect("seed");
+        }
+        assert!(matches!(
+            store.load_run(run_id(9)),
             Err(StoreError::Corrupt(_))
         ));
     }
