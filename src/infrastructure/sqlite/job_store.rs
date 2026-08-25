@@ -544,6 +544,33 @@ pub(super) mod tests {
         job
     }
 
+    fn recurring_job(now: i64, anchor: i64) -> Job {
+        let schedule = Schedule::RecurringInterval {
+            interval: DurationSeconds::new(60).expect("interval"),
+            persisted_anchor_utc: UtcTimestamp::from_second(anchor).expect("anchor"),
+        };
+        assert!(
+            anchor > now,
+            "recurring anchor must postdate creation to satisfy the deadline check"
+        );
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["printf".to_owned(), "%s".to_owned(), "tick".to_owned()],
+            "/tmp".to_owned(),
+            Environment::from_pairs([("TOKEN", "stored-secret")]).expect("environment"),
+        )
+        .expect("execution");
+        Job::new(
+            UtcTimestamp::from_second(now).expect("now"),
+            schedule,
+            MissedPolicy::Skip,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("job")
+    }
+
     fn percentile(samples: &mut [Duration], fraction: u32) -> Duration {
         samples.sort_unstable();
         // fraction is per-mille: 950 means the 95th percentile.
@@ -611,5 +638,201 @@ pub(super) mod tests {
             filtered_elapsed <= LIST_PAGE_BUDGET,
             "filtered first page took {filtered_elapsed:?}, budget {LIST_PAGE_BUDGET:?}"
         );
+    }
+
+    #[test]
+    fn advance_recurring_job_returns_to_waiting_with_new_due_and_cas() {
+        let (_root, mut store) = store();
+        let job = recurring_job(1_000, 1_060);
+        store.create(&job).expect("create");
+        // Drive the recurring occurrence into Running; `advance_recurring_job`
+        // only re-enters Waiting from an active/terminal state (recurring flag).
+        let at = |second: i64| UtcTimestamp::from_second(second).expect("timestamp");
+        let mut current = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                true,
+                TransitionActor::Supervisor,
+                "queued recurring",
+                at(1_001),
+            )
+            .expect("schedule recurring");
+        current = store
+            .transition_job(
+                current.id(),
+                current.revision(),
+                JobState::Starting,
+                true,
+                TransitionActor::Supervisor,
+                "starting",
+                at(1_002),
+            )
+            .expect("starting");
+        current = store
+            .transition_job(
+                current.id(),
+                current.revision(),
+                JobState::Running,
+                true,
+                TransitionActor::Supervisor,
+                "running",
+                at(1_003),
+            )
+            .expect("running");
+        let scheduled = current;
+        let advanced = store
+            .advance_recurring_job(
+                scheduled.id(),
+                scheduled.revision(),
+                UtcTimestamp::from_second(1_061).expect("timestamp"),
+            )
+            .expect("advance recurring");
+        assert_eq!(advanced.revision().get(), scheduled.revision().get() + 1);
+        assert_eq!(advanced.state(), JobState::Waiting);
+        // Next anchor is computed forward from the persisted anchor + interval.
+        assert!(advanced.next_due_utc() > scheduled.next_due_utc());
+        assert_eq!(
+            store
+                .load(scheduled.id())
+                .expect("load")
+                .expect("job")
+                .revision(),
+            advanced.revision()
+        );
+
+        // A stale revision conflicts rather than double-advancing.
+        assert!(matches!(
+            store.advance_recurring_job(
+                scheduled.id(),
+                scheduled.revision(),
+                UtcTimestamp::from_second(1_062).expect("timestamp"),
+            ),
+            Err(StoreError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn advance_recurring_rejects_missing_job_with_not_found() {
+        let (_root, mut store) = store();
+        assert!(matches!(
+            store.advance_recurring_job(
+                JobId::new(),
+                crate::domain::Revision::new(1).expect("revision"),
+                UtcTimestamp::from_second(5_000).expect("timestamp"),
+            ),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn duplicate_id_insert_is_already_exists_not_corrupt() {
+        let (_root, mut store) = store();
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("first create");
+        // Re-inserting the same primary key trips the unique constraint path.
+        assert!(matches!(store.create(&job), Err(StoreError::AlreadyExists)));
+    }
+
+    #[test]
+    fn delete_requires_matching_revision_or_conflicts() {
+        let (_root, mut store) = store();
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create");
+        assert!(matches!(
+            store.delete(
+                job.id(),
+                crate::domain::Revision::new(99).expect("revision")
+            ),
+            Err(StoreError::Conflict)
+        ));
+        store.delete(job.id(), job.revision()).expect("delete");
+        assert!(store.load(job.id()).expect("load").is_none());
+    }
+
+    #[test]
+    fn transaction_rollback_leaves_job_and_history_consistent() {
+        let (_root, mut store) = store();
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create");
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER reject_job_update BEFORE UPDATE ON jobs
+                 BEGIN SELECT RAISE(ABORT, 'no job update'); END;",
+            )
+            .expect("trigger");
+        assert!(
+            store
+                .transition_job(
+                    job.id(),
+                    job.revision(),
+                    JobState::Waiting,
+                    false,
+                    TransitionActor::Supervisor,
+                    "must roll back",
+                    UtcTimestamp::from_second(1_001).expect("timestamp"),
+                )
+                .is_err()
+        );
+        // Neither the job nor its transition history was persisted.
+        let loaded = store.load(job.id()).expect("load").expect("job");
+        assert_eq!(loaded.revision(), job.revision());
+        let history: u32 = store
+            .database()
+            .connection()
+            .query_row("SELECT count(*) FROM transitions", [], |row| row.get(0))
+            .expect("history count");
+        assert_eq!(history, 0);
+    }
+
+    #[test]
+    fn corrupt_name_and_missing_tzdb_decode_as_corrupt() {
+        let (_root, mut store) = store();
+        let job = sample_job(1_000, 1_030);
+        store.create(&job).expect("create");
+        store
+            .database()
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("disable checks");
+        // A bogus timezone_database_version (decoded as empty) trips
+        // `rehydrate`'s invariants, and malformed schedule JSON trips decoding.
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE jobs SET timezone_database_version = '' WHERE id = ?1",
+                [job.id().to_string()],
+            )
+            .expect("corrupt tzdb");
+        assert!(matches!(store.load(job.id()), Err(StoreError::Corrupt(_))));
+
+        let job = sample_job(2_000, 2_030);
+        store.create(&job).expect("create second");
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE jobs SET schedule_json = 'not-json' WHERE id = ?1",
+                [job.id().to_string()],
+            )
+            .expect("corrupt schedule");
+        assert!(matches!(store.load(job.id()), Err(StoreError::Corrupt(_))));
+    }
+
+    #[test]
+    fn list_at_page_size_returns_full_page_in_debug() {
+        let (_root, mut store) = store();
+        for index in 0..MAX_PAGE_SIZE {
+            store
+                .create(&waiting_job(i64::try_from(index).expect("index")))
+                .expect("create");
+        }
+        let page = store.list(None, MAX_PAGE_SIZE).expect("full page");
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+        assert!(store.list(None, MAX_PAGE_SIZE + 1).is_err());
     }
 }
