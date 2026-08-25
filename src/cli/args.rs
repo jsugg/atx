@@ -663,7 +663,11 @@ mod completions_tests {
             assert!(script.contains(marker), "{shell:?} missing `{marker}`");
             // Fish emits flags as `-l state-dir`, so match the bare flag name.
             assert!(script.contains("state-dir"), "{shell:?} missing state-dir");
-            assert!(script.contains("completions") || script.contains("Completions"));
+            // Every shell emits the subcommand in lowercase.
+            assert!(
+                script.contains("completions"),
+                "{shell:?} missing completions"
+            );
         }
     }
 }
