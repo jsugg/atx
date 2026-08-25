@@ -102,9 +102,18 @@ fn inspect_platform(
     let path = format!("/proc/{pid}/stat");
     match std::fs::read_to_string(path) {
         Ok(stat) => parse_linux_stat(&stat, boot_identity).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if proc_entry_vanished(&error) => Ok(None),
         Err(error) => Err(map_inspection_error(error)),
     }
+}
+
+/// A vanished `/proc/<pid>` entry means the process is gone: ENOENT when the
+/// directory was never opened, ESRCH when the task died between open and
+/// read of an already-opened stat file (observed under concurrent
+/// cancellation). Both classify as `Dead`, never as an inspection failure.
+#[cfg(target_os = "linux")]
+fn proc_entry_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 fn map_inspection_error(error: io::Error) -> ProcessError {
@@ -299,10 +308,28 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::parse_linux_stat;
+    #[cfg(target_os = "linux")]
+    use super::proc_entry_vanished;
     use super::{
         IdentityStatus, NativeProcessInspector, ProcessError, RecoveryIdentityStatus,
         classify_identity, map_inspection_error, validate_snapshot,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vanished_proc_entries_map_to_dead_not_error() {
+        use std::io;
+        assert!(proc_entry_vanished(&io::Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+        assert!(proc_entry_vanished(&io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(!proc_entry_vanished(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!proc_entry_vanished(&io::Error::other("synthetic")));
+    }
 
     #[test]
     fn current_process_has_stable_full_identity() {
