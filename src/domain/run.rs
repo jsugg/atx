@@ -558,12 +558,12 @@ mod tests {
 
         // Cancelled outcomes require a prior cancel request; terminal runs
         // have no second outcome slot.
-        assert!(
+        assert!(matches!(
             running
                 .clone()
-                .with_outcome(created, RunOutcome::Cancelled("no request".to_owned()))
-                .is_err()
-        );
+                .with_outcome(created, RunOutcome::Cancelled("no request".to_owned())),
+            Err(RunError::InvalidState)
+        ));
         let finished = running
             .with_outcome(created, RunOutcome::Exit(0))
             .expect("finish");
@@ -690,6 +690,16 @@ mod tests {
         outcome_without_finish.outcome = Some(RunOutcome::Exit(1));
         assert!(matches!(
             Run::rehydrate(outcome_without_finish),
+            Err(RunError::InvalidOutcome)
+        ));
+
+        // A stored outcome whose mapped state disagrees with the stored state
+        // is inconsistent even when both are terminal.
+        let mut mismatched_terminal = snapshot(RunState::Succeeded, created);
+        mismatched_terminal.finished_at_utc = Some(created);
+        mismatched_terminal.outcome = Some(RunOutcome::Signal(9));
+        assert!(matches!(
+            Run::rehydrate(mismatched_terminal),
             Err(RunError::InvalidOutcome)
         ));
     }
