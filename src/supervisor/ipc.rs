@@ -326,6 +326,122 @@ mod tests {
     }
 
     #[test]
+    fn acknowledger_rejects_substituted_socket_paths() {
+        let root = tempdir().expect("root");
+        let plain = root.path().join("plain.sock");
+        fs::write(&plain, b"not a socket").expect("plain file");
+        let acknowledger = SocketAcknowledger::new(plain, Duration::from_secs(1));
+        let error = acknowledger
+            .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
+            .expect_err("regular file is not a socket");
+        assert!(
+            error.to_string().contains("socket was substituted"),
+            "{error}"
+        );
+
+        let link = root.path().join("link.sock");
+        symlink("/tmp", &link).expect("symlink");
+        let acknowledger = SocketAcknowledger::new(link, Duration::from_secs(1));
+        let error = acknowledger
+            .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
+            .expect_err("symlink is not a socket");
+        assert!(
+            error.to_string().contains("socket was substituted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn acknowledgement_with_wrong_identity_is_invalid() {
+        let root = tempdir().expect("root");
+        let socket = root.path().join("ack.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("permissions");
+        let job_id = JobId::new();
+        let revision = Revision::new(2).expect("revision");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_frame(&mut stream).expect("wake");
+            write_frame(
+                &mut stream,
+                &IpcMessage::Ack {
+                    protocol: 1,
+                    job_id,
+                    revision: Revision::new(revision.get() + 1).expect("other revision"),
+                },
+            )
+            .expect("ack");
+        });
+        let client = SocketAcknowledger::new(socket, Duration::from_secs(1));
+        let error = client
+            .acknowledge(job_id, revision)
+            .expect_err("mismatched ack must fail");
+        assert!(
+            error.to_string().contains("wrong acknowledgement"),
+            "{error}"
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn acquire_rejects_substituted_and_malformed_locks() {
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        fs::create_dir(root.path().join("supervisor.lock")).expect("directory lock");
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::LockSubstitution)
+        ));
+
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let lock = root.path().join("supervisor.lock");
+        fs::write(&lock, b"{}").expect("loose lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).expect("relax mode");
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::LockSubstitution)
+        ));
+
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let lock = root.path().join("supervisor.lock");
+        fs::write(&lock, b"{not json").expect("garbage payload");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).expect("mode");
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::MalformedLock)
+        ));
+    }
+
+    #[test]
+    fn regular_file_at_the_socket_path_is_a_substitution() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let socket = root.path().join("supervisor.sock");
+        fs::write(&socket, b"leftover").expect("stale file");
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+
+        // Only sockets may sit at the path; a plain file must abort the
+        // takeover and leave the lock behind for removal by the caller.
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::SocketSubstitution)
+        ));
+        assert!(!root.path().join("supervisor.lock").exists());
+    }
+
+    #[test]
     fn runtime_is_single_instance_and_cleans_up() {
         let root = tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
