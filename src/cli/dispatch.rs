@@ -1575,21 +1575,23 @@ mod tests {
     use super::{
         build_doctor_report, build_job, cancel_job, check_database, check_live_supervisor,
         check_private_directory, check_supervisor, doctor_exit, finish_job_cancellation,
-        parse_job_state, print_error, read_env_file, render_job, render_jobs, render_runs,
-        render_submission, resolve_submitting_tty, run, schedule, split_assignment,
+        parse_job_state, print_error, read_env_file, render_job, render_jobs, render_processes,
+        render_run_output, render_runs, render_submission, resolve_submitting_tty, run, schedule,
+        split_assignment,
     };
     use crate::application::{
-        DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, SubmissionOutcome,
-        SupervisorAckError, WallClock,
+        DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, ManagementStore,
+        RunOutput, RunStream, SubmissionOutcome, SupervisorAckError, WallClock,
     };
-    use crate::cli::args::{ColorArg, GlobalArgs, ParsedCli, parse_from};
+    use crate::cli::args::{ColorArg, GlobalArgs, ParsedCli, SchedulingArgs, parse_from};
     use crate::cli::exit;
     use crate::domain::{
-        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobState, MissedPolicy,
-        RunState, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
+        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
+        MissedPolicy, ProcessIdentitySnapshot, RunId, RunOutcome, RunState, RuntimeTier, Schedule,
+        TransitionActor, UtcTimestamp,
     };
     use crate::infrastructure::config::{ConfigOverrides, load_config};
-    use crate::infrastructure::process::NativeProcessInspector;
+    use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
     use crate::infrastructure::sqlite::{Database, JobStore};
     use crate::infrastructure::time::NativeClock;
 
@@ -1631,6 +1633,14 @@ mod tests {
             json,
             color: ColorArg::Never,
             state_dir: None,
+        }
+    }
+
+    /// Parse a schedule invocation, panicking on anything else.
+    fn parsed_schedule(args: &[&str]) -> SchedulingArgs {
+        match parse_from(cli(args)) {
+            Ok(ParsedCli::Schedule(args)) => args,
+            _ => panic!("expected a schedule invocation"),
         }
     }
 
@@ -1948,6 +1958,9 @@ mod tests {
         assert_eq!(doctor_exit(&healthy), ExitCode::SUCCESS);
 
         let mut storage = DoctorReportBuilder::default();
+        // A non-SQLite failure first forces the scan to reject a mismatching
+        // name before comparing statuses.
+        storage.push("state directory", DiagnosticStatus::Fail, "shared", None);
         storage.push("SQLite", DiagnosticStatus::Fail, "broken", None);
         assert_eq!(
             doctor_exit(&storage.finish("tz".to_owned(), None, false, serde_json::json!({}))),
@@ -1955,6 +1968,9 @@ mod tests {
         );
 
         let mut supervision = DoctorReportBuilder::default();
+        // Same shape: an unrelated failure precedes the supervisor check so
+        // both scans reject a mismatching name before matching.
+        supervision.push("miscellaneous", DiagnosticStatus::Fail, "other", None);
         supervision.push("supervisor", DiagnosticStatus::Fail, "unsafe", None);
         assert_eq!(
             doctor_exit(&supervision.finish("tz".to_owned(), None, false, serde_json::json!({}))),
@@ -2429,6 +2445,9 @@ mod tests {
         fs::write(runtime.path().join("supervisor.sock"), b"").expect("socket file");
 
         let mut builder = DoctorReportBuilder::default();
+        // A non-supervisor check first forces the scan to reject a mismatching
+        // name before comparing statuses.
+        builder.push("unrelated", DiagnosticStatus::Warning, "decoy entry", None);
         let inspector = NativeProcessInspector::new("boot".to_owned());
         check_supervisor(&mut builder, runtime.path(), &inspector, 501);
         let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
@@ -2452,5 +2471,583 @@ mod tests {
         );
         let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
         assert_eq!(doctor_exit(&report), exit::permission());
+    }
+
+    #[test]
+    fn json_parse_errors_report_through_the_json_channel() {
+        // `--json` before `--` must route clap's usage error through the
+        // JSON printer instead of clap's own human formatter.
+        assert_eq!(
+            run(cli(&["atx", "--json", "--definitely-not-a-flag"])),
+            exit::usage()
+        );
+        // A help request still succeeds even with `--json` present.
+        assert_eq!(run(cli(&["atx", "--json", "--help"])), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn service_status_reports_in_json_human_and_quiet_modes() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let base = [
+            "atx",
+            "--state-dir",
+            state.to_str().expect("utf8"),
+            "service",
+            "status",
+        ];
+        assert_eq!(run(cli(&base)), ExitCode::SUCCESS);
+        let mut json = vec!["atx", "--json"];
+        json.extend_from_slice(&base[1..]);
+        assert_eq!(run(cli(&json)), ExitCode::SUCCESS);
+        let mut quiet = vec!["atx", "--quiet"];
+        quiet.extend_from_slice(&base[1..]);
+        assert_eq!(run(cli(&quiet)), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn doctor_renders_in_every_output_mode_without_failures() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let base = [
+            "atx",
+            "--state-dir",
+            state.to_str().expect("utf8"),
+            "doctor",
+        ];
+        for args in [
+            base.to_vec(),
+            vec!["atx", "--json", &base[1], &base[2], &base[3]],
+            vec!["atx", "--quiet", &base[1], &base[2], &base[3]],
+        ] {
+            assert_eq!(run(cli(&args)), ExitCode::SUCCESS);
+        }
+    }
+
+    #[test]
+    fn unreadable_runtime_entries_warn_as_disagreeing() {
+        let runtime = tempdir().expect("runtime root");
+        fs::write(runtime.path().join("supervisor.lock"), b"").expect("lock");
+        fs::write(runtime.path().join("supervisor.sock"), b"").expect("socket file");
+        // An unsearchable directory makes both lookups fail with EACCES, so
+        // the NotFound guard short-circuits into the disagreement warning.
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o000))
+            .expect("hide directory");
+
+        let mut builder = DoctorReportBuilder::default();
+        // A passing supervisor entry first forces the scan to reject a
+        // mismatching status before accepting the warning below.
+        builder.push("supervisor", DiagnosticStatus::Pass, "decoy entry", None);
+        let inspector = NativeProcessInspector::new("boot".to_owned());
+        check_supervisor(
+            &mut builder,
+            runtime.path(),
+            &inspector,
+            rustix::process::geteuid().as_raw(),
+        );
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
+            .expect("restore directory");
+
+        let report = builder.finish("tz".to_owned(), None, false, serde_json::json!({}));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "supervisor" && check.status == DiagnosticStatus::Warning
+        }));
+    }
+
+    /// Bind a private Unix domain socket at `root/supervisor.sock`.
+    fn bind_secure_socket(root: &Path) -> UnixListener {
+        let socket = root.join("supervisor.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("socket mode");
+        listener
+    }
+
+    fn finished_report(builder: DoctorReportBuilder) -> crate::application::DoctorReport {
+        builder.finish("tz".to_owned(), None, false, serde_json::json!({}))
+    }
+
+    fn write_private_lock(lock: &Path, contents: &[u8]) {
+        fs::write(lock, contents).expect("lock");
+        fs::set_permissions(lock, fs::Permissions::from_mode(0o600)).expect("lock mode");
+    }
+
+    #[test]
+    fn live_supervisor_check_rejects_insecure_runtime_shapes() {
+        let boot = NativeClock.boot_identity().expect("boot identity");
+        let uid = rustix::process::geteuid().as_raw();
+
+        // A symlinked lock is not a regular file.
+        let root = tempdir().expect("root");
+        fs::write(root.path().join("target"), b"").expect("target");
+        std::os::unix::fs::symlink(
+            root.path().join("target"),
+            root.path().join("supervisor.lock"),
+        )
+        .expect("symlink lock");
+        let listener = bind_secure_socket(root.path());
+        let mut builder = DoctorReportBuilder::default();
+        check_live_supervisor(
+            &mut builder,
+            &root.path().join("supervisor.lock"),
+            &fs::symlink_metadata(root.path().join("supervisor.lock")).expect("lock metadata"),
+            &fs::symlink_metadata(root.path().join("supervisor.sock")).expect("socket metadata"),
+            &NativeProcessInspector::new(boot.clone()),
+            uid,
+        );
+        drop(listener);
+        assert!(!finished_report(builder).healthy);
+
+        // A world-readable lock fails the mode check.
+        let root = tempdir().expect("root");
+        let lock = root.path().join("supervisor.lock");
+        fs::write(&lock, b"").expect("lock");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).expect("lock mode");
+        let listener = bind_secure_socket(root.path());
+        let mut builder = DoctorReportBuilder::default();
+        check_live_supervisor(
+            &mut builder,
+            &lock,
+            &fs::symlink_metadata(&lock).expect("lock metadata"),
+            &fs::symlink_metadata(root.path().join("supervisor.sock")).expect("socket metadata"),
+            &NativeProcessInspector::new(boot.clone()),
+            uid,
+        );
+        drop(listener);
+        assert!(!finished_report(builder).healthy);
+
+        // A regular file standing in for the socket fails the type check.
+        let root = tempdir().expect("root");
+        let lock = root.path().join("supervisor.lock");
+        write_private_lock(&lock, b"");
+        let socket = root.path().join("supervisor.sock");
+        fs::write(&socket, b"").expect("socket file");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("socket mode");
+        let mut builder = DoctorReportBuilder::default();
+        check_live_supervisor(
+            &mut builder,
+            &lock,
+            &fs::symlink_metadata(&lock).expect("lock metadata"),
+            &fs::symlink_metadata(&socket).expect("socket metadata"),
+            &NativeProcessInspector::new(boot.clone()),
+            uid,
+        );
+        assert!(!finished_report(builder).healthy);
+    }
+
+    #[test]
+    fn live_supervisor_check_passes_secure_entries_with_a_live_identity() {
+        let boot = NativeClock.boot_identity().expect("boot identity");
+        let uid = rustix::process::geteuid().as_raw();
+
+        // Secure entries describing a live process pass the whole chain.
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["sleep".to_owned(), "30".to_owned()],
+            "/".to_owned(),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+        )
+        .expect("execution");
+        let runner = NativeProcessRunner::new(NativeProcessInspector::new(boot));
+        let mut spawned = runner.spawn(&execution).expect("spawn live child");
+
+        let root = tempdir().expect("root");
+        let lock = root.path().join("supervisor.lock");
+        write_private_lock(
+            &lock,
+            &serde_json::to_vec(spawned.identity()).expect("serialize identity"),
+        );
+        let listener = bind_secure_socket(root.path());
+
+        let mut builder = DoctorReportBuilder::default();
+        // A warning entry first forces the scan to reject a mismatching
+        // status before accepting the live pass below.
+        builder.push(
+            "supervisor",
+            DiagnosticStatus::Warning,
+            "stale decoy entry",
+            None,
+        );
+        let inspector =
+            NativeProcessInspector::new(NativeClock.boot_identity().expect("boot identity"));
+        check_live_supervisor(
+            &mut builder,
+            &lock,
+            &fs::symlink_metadata(&lock).expect("lock metadata"),
+            &fs::symlink_metadata(root.path().join("supervisor.sock")).expect("socket metadata"),
+            &inspector,
+            uid,
+        );
+
+        let child = spawned.child_mut();
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
+        drop(listener);
+
+        let report = finished_report(builder);
+        assert!(report.healthy);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "supervisor" && check.status == DiagnosticStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn completed_jobs_refuse_cancellation() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let mut current = fixture_job(6_000);
+        store.create(&current).expect("create");
+        for (state, second) in [
+            (JobState::Waiting, 6_010),
+            (JobState::Starting, 6_020),
+            (JobState::Running, 6_030),
+            (JobState::Succeeded, 6_040),
+        ] {
+            current = store
+                .transition_job(
+                    current.id(),
+                    current.revision(),
+                    state,
+                    false,
+                    TransitionActor::Supervisor,
+                    "advance fixture",
+                    UtcTimestamp::from_second(second).expect("timestamp"),
+                )
+                .expect("transition");
+        }
+        let error = cancel_job(
+            &mut store,
+            &current.id().to_string(),
+            DurationSeconds::new(1).expect("grace"),
+        )
+        .expect_err("terminal job");
+        assert!(matches!(error, ManagementError::StateConflict(_)));
+    }
+
+    #[test]
+    fn cancel_retries_exhaust_into_a_state_conflict() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        // RAISE(IGNORE) skips every UPDATE, so each retry observes a zero-row
+        // change and reloads instead of claiming the cancellation.
+        store
+            .database()
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER stall_job_updates BEFORE UPDATE ON jobs
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .expect("trigger");
+        let error = cancel_job(
+            &mut store,
+            &job.id().to_string(),
+            DurationSeconds::new(1).expect("grace"),
+        )
+        .expect_err("conflict");
+        assert!(matches!(error, ManagementError::StateConflict(_)));
+    }
+
+    #[test]
+    fn cancel_without_active_runs_transitions_straight_to_cancelled() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let cancelled = cancel_job(
+            &mut store,
+            &job.id().to_string(),
+            DurationSeconds::new(1).expect("grace"),
+        )
+        .expect("cancel without runs");
+        assert_eq!(cancelled.state(), JobState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_before_spawn_records_the_run_cancelled() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let claimed = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(6_030).expect("scheduled"),
+                UtcTimestamp::from_second(6_001).expect("created"),
+            )
+            .expect("claim");
+
+        let cancelled = cancel_job(
+            &mut store,
+            &job.id().to_string(),
+            DurationSeconds::new(1).expect("grace"),
+        )
+        .expect("cancel before spawn");
+        assert_eq!(cancelled.state(), JobState::Cancelled);
+
+        let run = store
+            .load_run(claimed.id())
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(run.state(), RunState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_deadline_reports_conflict_when_the_run_never_stops() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let claimed = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(6_030).expect("scheduled"),
+                UtcTimestamp::from_second(6_001).expect("created"),
+            )
+            .expect("claim");
+        // Identities that can never be observed alive leave the run in
+        // CancelRequested forever, so the wait loop must hit its deadline.
+        store
+            .mark_run_running(
+                claimed.id(),
+                claimed.claim_token(),
+                UtcTimestamp::from_second(6_002).expect("started"),
+                ProcessIdentitySnapshot {
+                    boot_identity: "boot".to_owned(),
+                    pid: 2_000_000_001,
+                    start_token: 1,
+                    process_group_id: 2_000_000_001,
+                },
+                ProcessIdentitySnapshot {
+                    boot_identity: "boot".to_owned(),
+                    pid: 2_000_000_002,
+                    start_token: 1,
+                    process_group_id: 2_000_000_002,
+                },
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("mark running");
+
+        let error = cancel_job(
+            &mut store,
+            &job.id().to_string(),
+            DurationSeconds::new(1).expect("grace"),
+        )
+        .expect_err("deadline exceeded");
+        assert!(matches!(error, ManagementError::StateConflict(_)));
+    }
+
+    #[test]
+    fn capture_env_and_shell_warnings_print_before_a_dry_run() {
+        let root = tempdir().expect("root");
+        let state = root.path().join("state");
+        let dir = state.to_str().expect("utf8").to_owned();
+        for args in [
+            vec![
+                "atx",
+                "--state-dir",
+                &dir,
+                "--capture-env",
+                "--dry-run",
+                "30s",
+                "--",
+                "true",
+            ],
+            vec![
+                "atx",
+                "--state-dir",
+                &dir,
+                "--shell",
+                "--dry-run",
+                "30s",
+                "--",
+                "echo done",
+            ],
+            // Quiet mode suppresses both submission warnings.
+            vec![
+                "atx",
+                "--state-dir",
+                &dir,
+                "--quiet",
+                "--capture-env",
+                "--dry-run",
+                "30s",
+                "--",
+                "true",
+            ],
+            vec![
+                "atx",
+                "--state-dir",
+                &dir,
+                "--quiet",
+                "--shell",
+                "--dry-run",
+                "30s",
+                "--",
+                "echo done",
+            ],
+        ] {
+            let (outcome, _, _) = schedule(&parsed_schedule(&args)).expect("dry run");
+            assert!(outcome.is_dry_run());
+        }
+    }
+
+    #[test]
+    fn calendar_flag_matrix_accepts_valid_combinations() {
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        for args in [
+            vec!["atx", "--utc", "23:59", "--", "true"],
+            // --no-rollover is valid with a time of day.
+            vec!["atx", "--no-rollover", "23:59", "--", "true"],
+            // The default local timezone resolves named calendar input.
+            vec!["atx", "23:59", "--", "true"],
+        ] {
+            let args = parsed_schedule(&args);
+            assert!(build_job(&args, &config, wall, elapsed).is_ok());
+        }
+    }
+
+    #[test]
+    fn env_file_seeds_the_submission_environment() {
+        let root = tempdir().expect("root");
+        let env_file = root.path().join("job.env");
+        fs::write(&env_file, "A=1\n").expect("write env file");
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        let env_path = env_file.to_str().expect("utf8").to_owned();
+        let args = parsed_schedule(&["atx", "--env-file", &env_path, "30s", "--", "true"]);
+        let job = build_job(&args, &config, wall, elapsed).expect("job");
+        let seeded = job
+            .execution()
+            .environment()
+            .iter()
+            .find(|&(key, _)| key == "A")
+            .map(|(_, value)| value.expose().to_owned());
+        assert_eq!(seeded.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn working_directory_must_be_a_directory() {
+        let root = tempdir().expect("root");
+        let file = root.path().join("plain-file");
+        fs::write(&file, b"").expect("write file");
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        let cwd = file.to_str().expect("utf8").to_owned();
+        let args = parsed_schedule(&["atx", "--cwd", &cwd, "30s", "--", "true"]);
+        let error = build_job(&args, &config, wall, elapsed).expect_err("file cwd");
+        assert!(error.contains("not a directory"));
+    }
+
+    #[test]
+    fn tty_submissions_require_terminal_stdout() {
+        // Test harnesses pipe stdout, so an explicit --tty must fail while
+        // building the execution spec rather than at spawn time.
+        let config = load_config(None, &[], ConfigOverrides::default()).expect("config");
+        let clock = NativeClock;
+        let wall = clock.now_utc().expect("wall");
+        let elapsed = clock.now_elapsed().expect("elapsed");
+        let args = parsed_schedule(&["atx", "--tty", "30s", "--", "true"]);
+        assert!(build_job(&args, &config, wall, elapsed).is_err());
+    }
+
+    #[test]
+    fn run_output_rendering_honors_json_and_quiet_modes() {
+        let output = RunOutput {
+            run_id: RunId::new(),
+            job_id: JobId::new(),
+            state: RunState::Succeeded,
+            outcome: Some(RunOutcome::Exit(0)),
+            stdout: RunStream::empty(),
+            stderr: RunStream::empty(),
+        };
+        for mode in [
+            global(true, false),
+            global(false, true),
+            global(false, false),
+        ] {
+            render_run_output(&output, &mode);
+        }
+    }
+
+    #[test]
+    fn process_listing_keeps_only_live_identities() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let claimed = store
+            .claim_run(
+                job.id(),
+                UtcTimestamp::from_second(6_030).expect("scheduled"),
+                UtcTimestamp::from_second(6_001).expect("created"),
+            )
+            .expect("claim");
+
+        let clock = NativeClock;
+        let boot = clock.boot_identity().expect("boot identity");
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["sleep".to_owned(), "30".to_owned()],
+            "/".to_owned(),
+            Environment::from_pairs([("PATH", "/usr/bin:/bin")]).expect("environment"),
+        )
+        .expect("execution");
+        let runner = NativeProcessRunner::new(NativeProcessInspector::new(boot));
+        let mut spawned = runner.spawn(&execution).expect("spawn live child");
+        let live_identity = spawned.identity().clone();
+        let dead_identity = ProcessIdentitySnapshot {
+            boot_identity: "boot".to_owned(),
+            pid: 2_000_000_009,
+            start_token: 1,
+            process_group_id: 2_000_000_009,
+        };
+        store
+            .mark_run_running(
+                claimed.id(),
+                claimed.claim_token(),
+                UtcTimestamp::from_second(6_002).expect("started"),
+                live_identity,
+                dead_identity,
+                "runs/out.log",
+                "runs/err.log",
+            )
+            .expect("mark running");
+
+        // A claimed-but-not-yet-spawned run carries no identities at all.
+        let pending = fixture_job(7_000);
+        store.create(&pending).expect("create");
+        store
+            .claim_run(
+                pending.id(),
+                UtcTimestamp::from_second(7_030).expect("scheduled"),
+                UtcTimestamp::from_second(7_001).expect("created"),
+            )
+            .expect("claim pending run");
+
+        let runs = store.active_runs().expect("active runs");
+        assert_eq!(runs.len(), 2);
+        for mode in [
+            global(true, false),
+            global(false, true),
+            global(false, false),
+        ] {
+            render_processes(&runs, &mode).expect("render processes");
+        }
+
+        let child = spawned.child_mut();
+        child.kill().expect("kill child");
+        child.wait().expect("reap child");
     }
 }
