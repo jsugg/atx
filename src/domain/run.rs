@@ -515,7 +515,7 @@ mod tests {
             created,
             token,
         );
-        let cancelled = fresh
+        fresh
             .request_cancellation()
             .and_then(|run| run.request_cancellation())
             .expect("idempotent cancel request");
@@ -567,7 +567,12 @@ mod tests {
         let finished = running
             .with_outcome(created, RunOutcome::Exit(0))
             .expect("finish");
-        assert!(finished.with_outcome(created, RunOutcome::Exit(1)).is_err());
+        assert!(
+            finished
+                .clone()
+                .with_outcome(created, RunOutcome::Exit(1))
+                .is_err()
+        );
         assert!(finished.request_cancellation().is_err());
     }
 
