@@ -437,6 +437,113 @@ mod tests {
     }
 
     #[test]
+    fn oversized_busy_timeout_is_rejected() {
+        let root = tempdir().expect("temp root");
+        // One millisecond past SQLite's 32-bit busy-handler ceiling.
+        assert!(matches!(
+            Database::open(
+                &root.path().join("atx.db"),
+                Duration::from_millis(2_147_483_648)
+            ),
+            Err(super::StoreError::InvalidBusyTimeout)
+        ));
+    }
+
+    #[test]
+    fn pragma_drift_is_detected_by_verification() {
+        let configured = || {
+            let connection = Connection::open_in_memory().expect("memory database");
+            connection
+                .busy_timeout(Duration::from_secs(5))
+                .expect("busy timeout");
+            connection
+                .pragma_update(None, "foreign_keys", true)
+                .expect("foreign keys");
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("journal mode");
+            connection
+                .pragma_update(None, "synchronous", "FULL")
+                .expect("synchronous");
+            connection
+        };
+
+        for tamper in [
+            "PRAGMA foreign_keys = OFF",
+            "PRAGMA journal_mode = DELETE",
+            "PRAGMA synchronous = NORMAL",
+        ] {
+            let connection = configured();
+            connection.execute_batch(tamper).expect("tamper");
+            assert!(
+                matches!(
+                    Database { connection }.verify_pragmas(Duration::from_secs(5)),
+                    Err(super::StoreError::PragmaMismatch)
+                ),
+                "{tamper}"
+            );
+        }
+
+        let connection = configured();
+        connection
+            .busy_timeout(Duration::from_millis(1_234))
+            .expect("busy timeout");
+        assert!(matches!(
+            Database { connection }.verify_pragmas(Duration::from_secs(5)),
+            Err(super::StoreError::PragmaMismatch)
+        ));
+    }
+
+    #[test]
+    fn unwritable_parent_directory_surfaces_as_io_error() {
+        let root = tempdir().expect("temp root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
+            .expect("lock directory");
+        let result = Database::open(&root.path().join("atx.db"), Duration::from_secs(5));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
+            .expect("unlock directory");
+        assert!(matches!(result, Err(super::StoreError::Io(_))));
+    }
+
+    #[test]
+    fn migrations_above_target_version_are_skipped() {
+        let mut connection = Connection::open_in_memory().expect("memory database");
+        apply_migrations(
+            &mut connection,
+            &[
+                (1, "CREATE TABLE kept(value INTEGER);"),
+                (2, "CREATE TABLE dropped(value INTEGER);"),
+            ],
+            1,
+        )
+        .expect("migrate to target");
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='kept'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("kept query"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='dropped'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("dropped query"),
+            0
+        );
+    }
+
+    #[test]
     fn migrations_resume_from_a_partially_applied_schema() {
         let mut connection = Connection::open_in_memory().expect("memory database");
         connection
@@ -477,13 +584,22 @@ mod tests {
     fn newer_schema_is_rejected_without_changes() {
         let root = tempdir().expect("temp root");
         let path = root.path().join("atx.db");
+        // Seed with owner-only mode so the file passes the security checks and
+        // open() actually reaches the migration version comparison.
         {
             let connection = Connection::open(&path).expect("seed database");
             connection
                 .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
                 .expect("newer version");
         }
-        assert!(Database::open(&path, Duration::from_secs(5)).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict mode");
+        assert!(matches!(
+            Database::open(&path, Duration::from_secs(5)),
+            Err(super::StoreError::NewerSchema { found, supported })
+                if found == CURRENT_SCHEMA_VERSION + 1
+                    && supported == CURRENT_SCHEMA_VERSION
+        ));
         let connection = Connection::open(path).expect("reopen");
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
