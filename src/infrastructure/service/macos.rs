@@ -664,7 +664,7 @@ mod tests {
             let success = !self
                 .failing_commands
                 .iter()
-                .any(|needle| args.contains(&needle));
+                .any(|needle| args.contains(needle));
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(i32::from(!success) << 8),
                 stdout: Vec::new(),
