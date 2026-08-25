@@ -322,4 +322,92 @@ mod tests {
             UtcTimestamp::from_second(115).expect("next")
         );
     }
+
+    fn valid_job(now: UtcTimestamp) -> Job {
+        let deadline = UtcTimestamp::from_jiff(now.as_jiff() + jiff::Span::new().seconds(30));
+        let schedule = Schedule::one_shot_relative(
+            DurationSeconds::new(30).expect("valid duration"),
+            deadline,
+        );
+        let execution = ExecutionSpec::new(
+            ExecutionMode::Direct,
+            vec!["true".to_owned()],
+            "/tmp".to_owned(),
+            Environment::empty(),
+        )
+        .expect("valid execution");
+        Job::new(
+            now,
+            schedule,
+            MissedPolicy::Hold,
+            RuntimeTier::Session,
+            execution,
+            501,
+        )
+        .expect("valid job")
+    }
+
+    #[test]
+    fn rehydrate_rejects_corrupt_snapshots() {
+        let now = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let mut job = valid_job(now);
+        job.transition(
+            JobState::Waiting,
+            false,
+            TransitionActor::Supervisor,
+            "ack",
+            now,
+        )
+        .expect("transition");
+
+        let mut snapshot = job.snapshot();
+        snapshot.created_at_utc = UtcTimestamp::from_second(200).expect("later");
+        assert!(Job::rehydrate(snapshot).is_err());
+
+        let mut snapshot = job.snapshot();
+        snapshot.timezone_database_version.clear();
+        assert!(Job::rehydrate(snapshot).is_err());
+
+        let mut snapshot = job.snapshot();
+        snapshot.timezone_database_version.push('\0');
+        assert!(Job::rehydrate(snapshot).is_err());
+
+        let snapshot = job.snapshot();
+        assert!(Job::rehydrate(snapshot).is_ok());
+    }
+
+    #[test]
+    fn transition_rejects_backwards_time() {
+        let now = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let mut job = valid_job(now);
+        let earlier = UtcTimestamp::from_second(90).expect("earlier");
+        assert!(
+            job.transition(
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "ack",
+                earlier
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn advance_recurring_rejects_non_recurring_schedule() {
+        let now = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let mut job = valid_job(now);
+        job.transition(
+            JobState::Waiting,
+            false,
+            TransitionActor::Supervisor,
+            "ack",
+            now,
+        )
+        .expect("transition");
+        assert!(
+            job.advance_recurring(TransitionActor::Monitor, "tick", now)
+                .is_err()
+        );
+    }
 }

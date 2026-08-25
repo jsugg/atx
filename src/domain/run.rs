@@ -346,9 +346,10 @@ pub(crate) enum RunError {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{ClaimToken, Run, RunOutcome};
-    use crate::domain::id::JobId;
+    use super::super::id::{JobId, RunId};
+    use super::{ClaimToken, Run, RunOutcome, RunSnapshot};
     use crate::domain::primitives::{Sequence, UtcTimestamp};
+    use crate::domain::state::RunState;
 
     #[test]
     fn new_run_has_one_outcome_slot() {
@@ -403,5 +404,77 @@ mod tests {
             serde_json::to_string(&token).expect("serialize token"),
             "\"[REDACTED]\""
         );
+    }
+
+    fn snapshot(state: RunState, created: UtcTimestamp) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::new(),
+            job_id: JobId::new(),
+            sequence: Sequence::new(1).expect("sequence"),
+            scheduled_for_utc: created,
+            created_at_utc: created,
+            started_at_utc: None,
+            finished_at_utc: None,
+            state,
+            claim_token: ClaimToken::from_bytes([1; 32]),
+            monitor_identity: None,
+            command_identity: None,
+            outcome: None,
+            stdout_path: None,
+            stderr_path: None,
+        }
+    }
+
+    #[test]
+    fn rehydrate_rejects_inconsistent_snapshots() {
+        let created = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let earlier = UtcTimestamp::from_second(90).expect("valid timestamp");
+        let later = UtcTimestamp::from_second(110).expect("valid timestamp");
+
+        let mut invalid_timeline = snapshot(RunState::Starting, created);
+        invalid_timeline.started_at_utc = Some(earlier);
+        assert!(Run::rehydrate(invalid_timeline).is_err());
+
+        let mut finished_before_created = snapshot(RunState::Failed, created);
+        finished_before_created.finished_at_utc = Some(earlier);
+        assert!(Run::rehydrate(finished_before_created).is_err());
+
+        let mut finished_before_started = snapshot(RunState::Running, created);
+        finished_before_started.started_at_utc = Some(later);
+        finished_before_started.finished_at_utc = Some(created);
+        assert!(Run::rehydrate(finished_before_started).is_err());
+
+        // A terminal state must carry an outcome and a finish time; a live
+        // state must carry neither.
+        let mut missing_outcome = snapshot(RunState::Succeeded, created);
+        missing_outcome.finished_at_utc = Some(later);
+        assert!(Run::rehydrate(missing_outcome).is_err());
+
+        let mut outcome_state_mismatch = snapshot(RunState::Cancelled, created);
+        outcome_state_mismatch.outcome = Some(RunOutcome::Exit(0));
+        assert!(Run::rehydrate(outcome_state_mismatch).is_err());
+
+        let mut live_with_outcome = snapshot(RunState::Running, created);
+        live_with_outcome.outcome = Some(RunOutcome::Exit(0));
+        live_with_outcome.started_at_utc = Some(later);
+        assert!(Run::rehydrate(live_with_outcome).is_err());
+    }
+
+    #[test]
+    fn rehydrate_accepts_consistent_running_and_terminal_snapshots() {
+        let created = UtcTimestamp::from_second(100).expect("valid timestamp");
+        let started = UtcTimestamp::from_second(105).expect("valid timestamp");
+        let finished = UtcTimestamp::from_second(110).expect("valid timestamp");
+
+        let running = snapshot(RunState::Running, created);
+        let mut running = running;
+        running.started_at_utc = Some(started);
+        assert!(Run::rehydrate(running).is_ok());
+
+        let mut terminal = snapshot(RunState::Failed, created);
+        terminal.started_at_utc = Some(started);
+        terminal.finished_at_utc = Some(finished);
+        terminal.outcome = Some(RunOutcome::Signal(9));
+        assert!(Run::rehydrate(terminal).is_ok());
     }
 }
