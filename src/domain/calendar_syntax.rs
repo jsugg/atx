@@ -143,4 +143,35 @@ mod tests {
             assert!(parse_time(input).is_err(), "{input}");
         }
     }
+
+    #[test]
+    fn rejects_empty_input_and_non_numeric_components() {
+        for input in ["", "   "] {
+            assert!(
+                matches!(
+                    parse_calendar(input),
+                    Err(super::CalendarSyntaxError::Empty)
+                ),
+                "{input}"
+            );
+        }
+        // A dash without a colon routes to the date parser, which enforces
+        // the exact 10-byte YYYY-MM-DD shape.
+        assert!(matches!(
+            parse_calendar("2026-8-1"),
+            Err(super::CalendarSyntaxError::InvalidDate)
+        ));
+        assert!(matches!(
+            parse_calendar("20a6-08-01"),
+            Err(super::CalendarSyntaxError::InvalidNumber)
+        ));
+        assert!(matches!(
+            parse_calendar("1a:30"),
+            Err(super::CalendarSyntaxError::InvalidNumber)
+        ));
+        assert!(matches!(
+            parse_calendar("2026-08-01Tab:30"),
+            Err(super::CalendarSyntaxError::InvalidNumber)
+        ));
+    }
 }

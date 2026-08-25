@@ -492,4 +492,137 @@ mod tests {
             .expect("identity");
         assert!(RuntimeGuard::acquire(root.path(), &identity, &inspector).is_err());
     }
+
+    #[test]
+    fn acknowledgement_from_another_job_is_invalid() {
+        let root = tempdir().expect("root");
+        let socket = root.path().join("ack.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("permissions");
+        let job_id = JobId::new();
+        let revision = Revision::new(3).expect("revision");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            read_frame(&mut stream).expect("wake");
+            write_frame(
+                &mut stream,
+                &IpcMessage::Ack {
+                    protocol: 1,
+                    job_id: JobId::new(),
+                    revision,
+                },
+            )
+            .expect("ack");
+        });
+        let client = SocketAcknowledger::new(socket, Duration::from_secs(1));
+        let error = client
+            .acknowledge(job_id, revision)
+            .expect_err("foreign job ack must fail");
+        assert!(
+            error.to_string().contains("wrong acknowledgement"),
+            "{error}"
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn acquire_adopts_a_stale_unbound_socket() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let socket = root.path().join("supervisor.sock");
+        // Dropping a bound listener leaves the socket file behind with no
+        // peer listening, so connect must fail and takeover must proceed.
+        drop(UnixListener::bind(&socket).expect("stale socket"));
+        assert!(socket.exists());
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        let guard = RuntimeGuard::acquire(root.path(), &identity, &inspector)
+            .expect("stale socket is replaceable");
+        assert_eq!(
+            guard
+                .listener()
+                .local_addr()
+                .expect("address")
+                .as_pathname(),
+            Some(socket.as_path())
+        );
+    }
+
+    #[test]
+    fn acquire_yields_while_another_supervisor_answers_the_socket() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let socket = root.path().join("supervisor.sock");
+        let live_listener = UnixListener::bind(&socket).expect("live socket");
+        let inspector = inspector();
+        // A lock owned by a dead identity is stale, so the lock step passes
+        // and the live socket must be what rejects the takeover.
+        let mut stale = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        stale.start_token += 1;
+        fs::write(
+            root.path().join("supervisor.lock"),
+            serde_json::to_vec(&stale).expect("serialize"),
+        )
+        .expect("lock");
+        fs::set_permissions(
+            root.path().join("supervisor.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("lock mode");
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::AlreadyRunning)
+        ));
+        assert!(!root.path().join("supervisor.lock").exists());
+        drop(live_listener);
+    }
+
+    #[test]
+    fn symlink_at_the_lock_path_is_a_substitution() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        symlink("/tmp", root.path().join("supervisor.lock")).expect("symlink");
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        assert!(matches!(
+            RuntimeGuard::acquire(root.path(), &identity, &inspector),
+            Err(super::IpcError::LockSubstitution)
+        ));
+    }
+
+    #[test]
+    fn drop_leaves_sockets_created_after_the_guard_alone() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        let guard = RuntimeGuard::acquire(root.path(), &identity, &inspector).expect("guard");
+        let socket = root.path().join("supervisor.sock");
+
+        // Replace the guarded socket with a different inode before dropping.
+        fs::remove_file(&socket).expect("drop old socket file");
+        let replacement = UnixListener::bind(&socket).expect("replacement socket");
+        drop(guard);
+
+        assert!(socket.exists(), "replacement socket must survive the drop");
+        assert!(!root.path().join("supervisor.lock").exists());
+        drop(replacement);
+        let _ = fs::remove_file(&socket);
+    }
 }

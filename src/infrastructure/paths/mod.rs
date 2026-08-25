@@ -198,6 +198,7 @@ pub(crate) enum PathError {
 mod tests {
     #![allow(clippy::expect_used)]
 
+    use std::ffi::CString;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::sync::Arc;
@@ -403,5 +404,30 @@ mod tests {
         // A directory in place of the leaf is rejected.
         fs::create_dir(root.path().join("dir.db")).expect("dir");
         assert!(open_private_file(&directory, "dir.db").is_err());
+
+        // A FIFO opens fine but is not a regular file.
+        let fifo = CString::new(root.path().join("pipe.db").as_os_str().as_encoded_bytes())
+            .expect("fifo path");
+        // SAFETY: `fifo` points at a valid C string naming a fresh path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        fs::set_permissions(
+            root.path().join("pipe.db"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("fifo mode");
+        assert!(open_private_file(&directory, "pipe.db").is_err());
+    }
+
+    #[test]
+    fn ensure_private_dir_surfaces_unrelated_creation_errors() {
+        let root = tempdir().expect("temp root");
+        // The parent of the target does not exist, so creation fails for a
+        // reason other than AlreadyExists and must not be swallowed.
+        let nested = root.path().join("missing").join("leaf");
+        let error = ensure_private_dir(&nested).expect_err("missing parent");
+        assert!(
+            error.to_string().contains("filesystem operation failed"),
+            "{error}"
+        );
     }
 }
