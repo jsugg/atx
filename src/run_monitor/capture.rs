@@ -320,4 +320,33 @@ mod tests {
             Ok(())
         }
     }
+
+    struct FailingFlushWriter;
+
+    impl Write for FailingFlushWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush refused"))
+        }
+    }
+
+    #[test]
+    fn flush_failure_is_surfaced_as_a_stream_error() {
+        let output = capture_streams(
+            Cursor::new(Vec::<u8>::new()),
+            Cursor::new(b"ignored".to_vec()),
+            FailingFlushWriter,
+            Vec::new(),
+            16,
+        )
+        .expect("capture threads");
+        assert!(output.stdout.error().is_some());
+        assert!(output.stderr.error().is_none());
+        // Every drained byte was accepted by the writer; only the flush lied.
+        assert_eq!(output.stdout.summary().written(), 0);
+        assert!(!output.stdout.summary().truncated());
+    }
 }

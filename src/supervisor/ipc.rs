@@ -625,4 +625,45 @@ mod tests {
         drop(replacement);
         let _ = fs::remove_file(&socket);
     }
+
+    #[test]
+    fn an_unopenable_lock_path_surfaces_the_io_error() {
+        const LOCK_NAME: usize = "supervisor.lock".len();
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+
+        // Grow a chain of directories until appending the lock name reaches
+        // PATH_MAX: create_new then fails with an error other than
+        // AlreadyExists, which must abort the takeover as a plain I/O failure
+        // instead of treating the path as a live lock.
+        let mut dir = root.path().to_path_buf();
+        while let Some(room) =
+            (libc::PATH_MAX as usize).checked_sub(dir.as_os_str().len() + 1 + LOCK_NAME)
+        {
+            if room == 0 {
+                break;
+            }
+            let candidate = dir.join("d".repeat(room.min(255)));
+            fs::create_dir(&candidate).expect("grow directory chain");
+            dir = candidate;
+        }
+        assert!(dir.join("supervisor.lock").as_os_str().len() >= libc::PATH_MAX as usize);
+        // The chain was built with the ambient umask; the takeover requires
+        // the private directory mode.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("deep dir mode");
+
+        let inspector = inspector();
+        let identity = inspector
+            .inspect(std::process::id())
+            .expect("inspect")
+            .expect("identity");
+        let error = match RuntimeGuard::acquire(&dir, &identity, &inspector) {
+            Err(error) => error,
+            Ok(_guard) => unreachable!("an over-long lock path cannot be created"),
+        };
+        assert!(
+            error.to_string().contains("I/O failed"),
+            "unexpected error: {error}"
+        );
+    }
 }
