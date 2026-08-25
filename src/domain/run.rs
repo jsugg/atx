@@ -347,7 +347,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::super::id::{JobId, RunId};
-    use super::{ClaimToken, Run, RunOutcome, RunSnapshot};
+    use super::{ClaimToken, Run, RunError, RunOutcome, RunSnapshot};
     use crate::domain::ProcessIdentitySnapshot;
     use crate::domain::primitives::{Sequence, UtcTimestamp};
     use crate::domain::state::RunState;
@@ -583,5 +583,114 @@ mod tests {
             start_token,
             process_group_id,
         }
+    }
+
+    fn started_run(created: UtcTimestamp) -> Run {
+        Run::new(
+            JobId::new(),
+            Sequence::new(1).expect("sequence"),
+            created,
+            created,
+            ClaimToken::from_bytes([1; 32]),
+        )
+        .mark_running(
+            created,
+            identity(10, 100, 10),
+            identity(11, 101, 20),
+            "runs/x/stdout.log".to_owned(),
+            "runs/x/stderr.log".to_owned(),
+        )
+        .expect("running")
+    }
+
+    #[test]
+    fn mark_running_rejects_every_incomplete_identity_field() {
+        let created = UtcTimestamp::from_second(300).expect("created");
+        let cases = [
+            (
+                "empty boot identity",
+                ProcessIdentitySnapshot {
+                    boot_identity: String::new(),
+                    ..identity(10, 100, 10)
+                },
+            ),
+            (
+                "nul boot identity",
+                ProcessIdentitySnapshot {
+                    boot_identity: "boot\0".to_owned(),
+                    ..identity(10, 100, 10)
+                },
+            ),
+            ("zero pid", identity(0, 100, 10)),
+            ("zero start token", identity(10, 0, 10)),
+            ("zero process group", identity(10, 100, 0)),
+            ("negative process group", identity(10, 100, -1)),
+        ];
+        for (label, broken) in cases {
+            assert!(
+                matches!(
+                    Run::new(
+                        JobId::new(),
+                        Sequence::new(1).expect("sequence"),
+                        created,
+                        created,
+                        ClaimToken::from_bytes([1; 32]),
+                    )
+                    .mark_running(
+                        created,
+                        broken.clone(),
+                        identity(11, 101, 20),
+                        "runs/x/stdout.log".to_owned(),
+                        "runs/x/stderr.log".to_owned(),
+                    ),
+                    Err(RunError::InvalidIdentity)
+                ),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn finish_before_creation_wins_over_state_checks_on_a_started_run() {
+        let created = UtcTimestamp::from_second(300).expect("created");
+        let earlier = UtcTimestamp::from_second(299).expect("earlier");
+        // The timeline check fires before the state check, so a running run
+        // finished before creation reports FinishBeforeCreation.
+        assert!(matches!(
+            started_run(created).with_outcome(earlier, RunOutcome::Exit(0)),
+            Err(RunError::FinishBeforeCreation)
+        ));
+    }
+
+    #[test]
+    fn rehydrate_rejects_invalid_identity_and_missing_finish() {
+        let created = UtcTimestamp::from_second(400).expect("created");
+
+        let mut bad_monitor = snapshot(RunState::Running, created);
+        bad_monitor.started_at_utc = Some(created);
+        bad_monitor.monitor_identity = Some(identity(0, 100, 10));
+        assert!(matches!(
+            Run::rehydrate(bad_monitor),
+            Err(RunError::InvalidIdentity)
+        ));
+
+        let mut bad_command = snapshot(RunState::Running, created);
+        bad_command.started_at_utc = Some(created);
+        bad_command.command_identity = Some(ProcessIdentitySnapshot {
+            boot_identity: String::new(),
+            ..identity(11, 101, 20)
+        });
+        assert!(matches!(
+            Run::rehydrate(bad_command),
+            Err(RunError::InvalidIdentity)
+        ));
+
+        // A terminal state with an outcome but no finish time is inconsistent.
+        let mut outcome_without_finish = snapshot(RunState::Failed, created);
+        outcome_without_finish.outcome = Some(RunOutcome::Exit(1));
+        assert!(matches!(
+            Run::rehydrate(outcome_without_finish),
+            Err(RunError::InvalidOutcome)
+        ));
     }
 }
