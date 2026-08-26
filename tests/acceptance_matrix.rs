@@ -342,18 +342,20 @@ fn s11_output_caps_bound_storage() {
         ["2s", "--", "/bin/sh", "-c", "yes flooded | head -c 4000000"].as_slice(),
     );
     let job_id = submission["job_id"].as_str().expect("id").to_owned();
+    // Wait for a TERMINAL state before reading artifacts: any-run-row waits
+    // raced the run directory into existence and failed the read_dir below.
     wait_for(
         || {
-            history_rows(&state)
-                .iter()
-                .any(|r| r["job_id"] == job_id.as_str())
+            history_rows(&state).iter().any(|r| {
+                r["job_id"] == job_id.as_str()
+                    && (r["state"] == "succeeded" || r["state"] == "failed")
+            })
         },
-        "flooded job to finish",
+        "flooded job to reach a terminal state",
     );
-    for entry in fs::read_dir(state.join("runs"))
-        .expect("runs dir")
-        .flatten()
-    {
+    let runs = fs::read_dir(state.join("runs"))
+        .expect("runs dir exists once a run reached a terminal state");
+    for entry in runs.flatten() {
         let total = walk_size(&entry.path());
         assert!(
             total < 64 * 1024 * 1024,
@@ -488,13 +490,17 @@ fn s16_s17_reconciliation_preserves_outcomes_exactly_once() {
     let state = root.path().join("state");
     let submission = json_run(&state, &["2s", "--", "/bin/true"]);
     let job_id = submission["job_id"].as_str().expect("id").to_owned();
+    // Wait for a TERMINAL state before snapshotting: comparing a Starting
+    // snapshot against the naturally completed Failed/Succeeded row raced
+    // into false "reconciliation mutated history" failures.
     wait_for(
         || {
-            history_rows(&state)
-                .iter()
-                .any(|r| r["job_id"] == job_id.as_str())
+            history_rows(&state).iter().any(|r| {
+                r["job_id"] == job_id.as_str()
+                    && (r["state"] == "succeeded" || r["state"] == "failed")
+            })
         },
-        "completion",
+        "job to reach a terminal state",
     );
     let before = history_rows(&state);
     for _ in 0..3 {
