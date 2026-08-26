@@ -15,7 +15,7 @@ use super::ipc::{IpcMessage, RuntimeGuard, read_frame, write_frame};
 use super::loop_driver::{SupervisorEvent, reconcile_wall_schedule, run_loop};
 use super::recovery::rebuild_deadline_heap;
 use crate::application::{ElapsedClock, WallClock, reconcile_startup};
-use crate::domain::{JobState, RunOutcome, TransitionActor};
+use crate::domain::{ElapsedInstant, JobState, RunOutcome, TransitionActor};
 use crate::infrastructure::paths::ensure_private_dir;
 use crate::infrastructure::process::NativeProcessInspector;
 use crate::infrastructure::sqlite::{Database, JobStore, RetentionPolicy, StartupStore};
@@ -105,6 +105,7 @@ pub(crate) fn run_session_supervisor(
 
     let execution_database = database_path;
     let execution_state = state_directory.to_owned();
+    let mut retries = DueFailureRetries::default();
     run_loop(
         &receiver,
         &mut heap,
@@ -117,13 +118,35 @@ pub(crate) fn run_session_supervisor(
             }
         },
         |jobs| {
-            if let Err(error) = execute_due_jobs(
+            for &job_id in &jobs {
+                retries.forget(job_id);
+            }
+            let failures = execute_due_jobs(
                 &execution_database,
                 &execution_state,
                 runtime_directory,
                 &jobs,
-            ) {
-                eprintln!("atx supervisor: {error}");
+            );
+            let now_elapsed = clock.now_elapsed().unwrap_or(elapsed_now);
+            for (job_id, error) in failures {
+                match retries.record_failure(job_id) {
+                    Some(backoff) => {
+                        eprintln!(
+                            "atx supervisor: job {job_id} due execution failed \
+                             ({backoff}); requeueing with backoff: {error}"
+                        );
+                        let backoff_nanos =
+                            u64::from(backoff.attempt).saturating_mul(2_000_000_000);
+                        let deadline = ElapsedInstant::from_nanos(
+                            now_elapsed.as_nanos() + u128::from(backoff_nanos),
+                        );
+                        let _ = sender.send(SupervisorEvent::Schedule { job_id, deadline });
+                    }
+                    None => eprintln!(
+                        "atx supervisor: job {job_id} exhausted its due-execution \
+                         retries without executing; leaving it for recovery: {error}"
+                    ),
+                }
             }
         },
     );
@@ -225,72 +248,143 @@ fn load_deadline(
         .map_err(|error| DaemonError::Recovery(error.to_string()))
 }
 
+/// Bounded requeue policy for due-batch failures (see `execute_due_jobs`):
+/// each failing job is rescheduled with linear backoff up to
+/// [`DueFailureRetries::MAX_ATTEMPTS`] times; a job that keeps failing stays
+/// nonterminal in `SQLite` and is left to startup reconciliation or the
+/// operator.
+#[derive(Default)]
+struct DueFailureRetries {
+    attempts: std::collections::HashMap<crate::domain::JobId, u32>,
+}
+
+impl DueFailureRetries {
+    const MAX_ATTEMPTS: u32 = 3;
+
+    /// Record one failure for the job; returns the retry attempt with its
+    /// linear backoff, or `None` once retries are exhausted.
+    fn record_failure(&mut self, job_id: crate::domain::JobId) -> Option<Backoff> {
+        let attempt = self
+            .attempts
+            .entry(job_id)
+            .and_modify(|a| *a += 1)
+            .or_insert(1);
+        if *attempt > Self::MAX_ATTEMPTS {
+            return None;
+        }
+        Some(Backoff {
+            attempt: *attempt,
+            seconds: u64::from(*attempt) * 2,
+        })
+    }
+
+    fn forget(&mut self, job_id: crate::domain::JobId) {
+        self.attempts.remove(&job_id);
+    }
+}
+
+struct Backoff {
+    attempt: u32,
+    seconds: u64,
+}
+
+impl std::fmt::Display for Backoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "attempt {}/{}, backoff {}s",
+            self.attempt,
+            DueFailureRetries::MAX_ATTEMPTS,
+            self.seconds
+        )
+    }
+}
+
+/// Execute every due job, containing failures per job.
+///
+/// The loop driver surrenders the whole due batch before this runs, so a
+/// single broken job must never abort its batch-mates: each job is driven to
+/// completion independently and any failure is reported to the caller for
+/// bounded requeueing instead of short-circuiting the loop.
 fn execute_due_jobs(
     database_path: &Path,
     state_directory: &Path,
     runtime_directory: &Path,
     jobs: &[crate::domain::JobId],
+) -> Vec<(crate::domain::JobId, DaemonError)> {
+    let mut failures = Vec::new();
+    for &job_id in jobs {
+        if let Err(error) =
+            execute_single_due_job(database_path, state_directory, runtime_directory, job_id)
+        {
+            failures.push((job_id, error));
+        }
+    }
+    failures
+}
+
+fn execute_single_due_job(
+    database_path: &Path,
+    state_directory: &Path,
+    runtime_directory: &Path,
+    job_id: crate::domain::JobId,
 ) -> Result<(), DaemonError> {
     let clock = NativeClock;
-    for &job_id in jobs {
-        let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
-        let Some(mut job) = store.load(job_id)? else {
-            continue;
-        };
-        let now = clock.now_utc()?;
-        if job.state() == JobState::Scheduled {
-            job = store.transition_job(
-                job.id(),
-                job.revision(),
-                JobState::Waiting,
-                false,
-                TransitionActor::Supervisor,
-                "supervisor loaded deadline",
-                now,
-            )?;
-        }
-        if job.state() != JobState::Waiting {
-            continue;
-        }
+    let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
+    let Some(mut job) = store.load(job_id)? else {
+        return Ok(());
+    };
+    let now = clock.now_utc()?;
+    if job.state() == JobState::Scheduled {
         job = store.transition_job(
             job.id(),
             job.revision(),
-            JobState::Starting,
+            JobState::Waiting,
             false,
             TransitionActor::Supervisor,
-            "deadline became due",
+            "supervisor loaded deadline",
             now,
         )?;
-        let run = store.claim_run(job.id(), job.next_due_utc(), now)?;
-        job = store.transition_job(
+    }
+    if job.state() != JobState::Waiting {
+        return Ok(());
+    }
+    job = store.transition_job(
+        job.id(),
+        job.revision(),
+        JobState::Starting,
+        false,
+        TransitionActor::Supervisor,
+        "deadline became due",
+        now,
+    )?;
+    let run = store.claim_run(job.id(), job.next_due_utc(), now)?;
+    job = store.transition_job(
+        job.id(),
+        job.revision(),
+        JobState::Running,
+        false,
+        TransitionActor::Supervisor,
+        "run monitor claimed command",
+        now,
+    )?;
+    if let Err(error) = spawn_run_monitor(state_directory, runtime_directory, job.id(), run.id()) {
+        let finished = clock.now_utc()?;
+        store.record_run_terminal(
+            run.id(),
+            run.claim_token(),
+            finished,
+            RunOutcome::Failure(format!("monitor spawn failed: {error}")),
+        )?;
+        store.transition_job(
             job.id(),
             job.revision(),
-            JobState::Running,
+            JobState::Failed,
             false,
             TransitionActor::Supervisor,
-            "run monitor claimed command",
-            now,
+            "run monitor could not start",
+            finished,
         )?;
-        if let Err(error) =
-            spawn_run_monitor(state_directory, runtime_directory, job.id(), run.id())
-        {
-            let finished = clock.now_utc()?;
-            store.record_run_terminal(
-                run.id(),
-                run.claim_token(),
-                finished,
-                RunOutcome::Failure(format!("monitor spawn failed: {error}")),
-            )?;
-            store.transition_job(
-                job.id(),
-                job.revision(),
-                JobState::Failed,
-                false,
-                TransitionActor::Supervisor,
-                "run monitor could not start",
-                finished,
-            )?;
-        }
     }
     Ok(())
 }
@@ -752,13 +846,13 @@ mod tests {
             )
             .expect("mark terminal");
         let db_path = root.path().join("atx.db");
-        let result = execute_due_jobs(
+        let failures = execute_due_jobs(
             &db_path,
             root.path(),
             &runtime,
             &[JobId::new(), terminal.id()],
         );
-        assert!(result.is_ok());
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
@@ -769,8 +863,8 @@ mod tests {
         fs::create_dir_all(&runtime).expect("runtime dir");
         let _store = store_in(root.path());
         let db_path = root.path().join("atx.db");
-        let result = execute_due_jobs(&db_path, root.path(), &runtime, &[]);
-        assert!(result.is_ok());
+        let failures = execute_due_jobs(&db_path, root.path(), &runtime, &[]);
+        assert!(failures.is_empty());
     }
 
     #[test]
@@ -803,7 +897,11 @@ mod tests {
         // The failure arm runs inside run_loop's due-callback; drive it
         // directly with one due job.
         let db_path = root.path().join("atx.db");
-        execute_due_jobs(&db_path, root.path(), &runtime, &[job.id()]).expect("handled failure");
+        let failures = execute_due_jobs(&db_path, root.path(), &runtime, &[job.id()]);
+        assert!(
+            failures.is_empty(),
+            "spawn failures are contained: {failures:?}"
+        );
 
         let mut statement = store
             .database()
@@ -828,5 +926,69 @@ mod tests {
             store.load(job.id()).expect("reload").expect("job").state(),
             JobState::Failed
         );
+    }
+
+    /// Regression: one broken due job must not drop its batch-mates. The loop
+    /// driver surrenders the whole due batch before execution, so an early
+    /// `?` used to discard every later job until the next supervisor restart.
+    #[test]
+    fn a_failing_due_job_does_not_drop_the_rest_of_its_batch() {
+        let root = tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("mode");
+        let runtime = root.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime dir");
+        // Block the monitor spawn log path so the valid jobs fail
+        // deterministically at spawn (recorded terminal runs) instead of
+        // launching real monitors from the test process.
+        fs::create_dir(root.path().join("supervisor.log")).expect("block the log path");
+
+        let mut store = store_in(root.path());
+        let corrupt = scheduled_job(1000, 1030);
+        let healthy_a = scheduled_job(1000, 1030);
+        let healthy_b = scheduled_job(1000, 1030);
+        for job in [&corrupt, &healthy_a, &healthy_b] {
+            store.create(job).expect("create job");
+        }
+        // Corrupt the first job past deserialization: valid JSON (the
+        // schema enforces json_valid) with an unknown mode so decode fails.
+        store
+            .database()
+            .connection()
+            .execute(
+                "UPDATE jobs SET execution_json = '{\"mode\": \"nonexistent\"}' WHERE id = ?1",
+                [corrupt.id().to_string()],
+            )
+            .expect("corrupt first job");
+
+        let db_path = root.path().join("atx.db");
+        let mut failures = execute_due_jobs(
+            &db_path,
+            root.path(),
+            &runtime,
+            &[corrupt.id(), healthy_a.id(), healthy_b.id()],
+        );
+        assert_eq!(
+            failures.len(),
+            1,
+            "only the corrupt job fails: {failures:?}"
+        );
+        assert_eq!(failures.remove(0).0, corrupt.id());
+
+        for job in [&healthy_a, &healthy_b] {
+            let reloaded = store
+                .load(job.id())
+                .expect("load")
+                .unwrap_or_else(|| panic!("job {} vanished", job.id()));
+            assert_eq!(reloaded.state(), JobState::Failed, "{}", job.id());
+            let mut statement = store
+                .database()
+                .connection()
+                .prepare("SELECT COUNT(*) FROM runs WHERE job_id = ?1")
+                .expect("prepare run count");
+            let runs: i64 = statement
+                .query_row([job.id().to_string()], |row| row.get(0))
+                .expect("count runs");
+            assert_eq!(runs, 1, "job {} must execute exactly once", job.id());
+        }
     }
 }
