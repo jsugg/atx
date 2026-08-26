@@ -1,5 +1,6 @@
 //! Configuration adapter.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use jiff::tz::TimeZone;
@@ -192,6 +193,46 @@ pub(crate) fn load_config(
     validate(raw)
 }
 
+/// Load the effective configuration for a background process (supervisor or
+/// run monitor): file layer plus environment layer, no CLI overrides.
+///
+/// Every documented resource control must reach these processes through this
+/// boundary; hardcoding defaults here silently discards operator settings.
+pub(crate) fn load_process_config(state_directory: &Path) -> Result<Config, ConfigError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let config_path = state_directory.join("config.toml");
+    let file = match fs::read_to_string(&config_path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ConfigError::Read(format!(
+                "cannot read {}: {error}",
+                config_path.display()
+            )));
+        }
+    };
+    // vars_os + explicit validation: std::env::vars() panics on non-UTF-8
+    // entries. Only ATX_* names cross the configuration boundary.
+    let mut environment = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        if !key.as_os_str().as_bytes().starts_with(b"ATX_") {
+            continue;
+        }
+        let key = key.into_string().map_err(|invalid| {
+            ConfigError::Read(format!(
+                "environment variable name is not valid UTF-8: {}",
+                invalid.to_string_lossy()
+            ))
+        })?;
+        let value = value.into_string().map_err(|_| {
+            ConfigError::Read(format!("environment variable {key} is not valid UTF-8"))
+        })?;
+        environment.push((key, value));
+    }
+    load_config(file.as_deref(), &environment, ConfigOverrides::default())
+}
+
 fn environment_layer(environment: &[(String, String)]) -> Result<RawConfig, ConfigError> {
     let mut raw = RawConfig::default();
     for (key, value) in environment {
@@ -312,6 +353,8 @@ fn checked_days(value: u16) -> Result<u16, ConfigError> {
 pub(crate) enum ConfigError {
     #[error("invalid TOML configuration: {0}")]
     Toml(String),
+    #[error("{0}")]
+    Read(String),
     #[error("unknown ATX environment variable {0}")]
     UnknownEnvironment(String),
     #[error("invalid value for environment variable {name}")]

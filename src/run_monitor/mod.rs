@@ -48,13 +48,19 @@ pub(crate) fn run_monitor_process(
     let clock = NativeClock;
     let inspector = NativeProcessInspector::new(clock.boot_identity()?);
     let runner = NativeProcessRunner::new(inspector.clone());
+    // Operator-configured log caps reach the monitor only through the shared
+    // config boundary; the fallback constant only guards a 16-bit platform.
+    let config = crate::infrastructure::config::load_process_config(state_directory)
+        .map_err(MonitorProcessError::Config)?;
+    let max_log_bytes =
+        usize::try_from(config.max_log_bytes_per_stream()).unwrap_or(DEFAULT_MAX_LOG_BYTES);
     let completed = RunMonitor::new(
         &mut store,
         runner,
         inspector,
         clock,
         state_directory,
-        DEFAULT_MAX_LOG_BYTES,
+        max_log_bytes,
     )
     .execute(&run, job.execution())?;
     finish_job(&mut store, &job, completed.state(), clock)?;
@@ -126,6 +132,8 @@ fn finish_job(
 pub(crate) enum MonitorProcessError {
     #[error("invalid job or run identifier")]
     InvalidIdentity,
+    #[error(transparent)]
+    Config(#[from] crate::infrastructure::config::ConfigError),
     #[error("claimed job was not found")]
     MissingJob,
     #[error("claimed run was not found")]

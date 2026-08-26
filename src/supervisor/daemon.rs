@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use super::heap::DeadlineHeap;
 use super::ipc::{IpcMessage, RuntimeGuard, read_frame, write_frame};
 use super::loop_driver::{SupervisorEvent, reconcile_wall_schedule, run_loop};
 use super::recovery::rebuild_deadline_heap;
@@ -38,6 +39,37 @@ fn stop_signal_set() -> libc::sigset_t {
     set
 }
 
+/// Startup recovery: open the store, apply operator-configured retention,
+/// and reconcile interrupted work into a deadline heap.
+fn recover_startup_state(
+    store: &mut JobStore,
+    state_directory: &Path,
+    clock: NativeClock,
+    inspector: &NativeProcessInspector,
+    boot_identity: &str,
+) -> Result<DeadlineHeap, DaemonError> {
+    // Operator-configured retention reaches the supervisor only through the
+    // shared config boundary; hardcoding defaults here discards settings.
+    let config = crate::infrastructure::config::load_process_config(state_directory)
+        .map_err(|error| DaemonError::Recovery(error.to_string()))?;
+    let retention = RetentionPolicy::new(config.history_days(), config.terminal_job_days())
+        .map_err(|error| DaemonError::Recovery(error.to_string()))?;
+    let wall_now = clock.now_utc()?;
+    let elapsed_now = clock.now_elapsed()?;
+    let plan = {
+        let mut startup = StartupStore::new(store, retention);
+        reconcile_startup(
+            &mut startup,
+            inspector,
+            wall_now,
+            elapsed_now,
+            boot_identity,
+        )
+        .map_err(|error| DaemonError::Recovery(error.to_string()))?
+    };
+    Ok(rebuild_deadline_heap(&plan))
+}
+
 pub(crate) fn run_session_supervisor(
     state_directory: &Path,
     runtime_directory: &Path,
@@ -55,22 +87,13 @@ pub(crate) fn run_session_supervisor(
         .ok_or(DaemonError::MissingIdentity)?;
     let runtime = RuntimeGuard::acquire(runtime_directory, &identity, &inspector)?;
     let mut store = JobStore::new(Database::open(&database_path, DATABASE_TIMEOUT)?);
-    let retention =
-        RetentionPolicy::new(30, 30).map_err(|error| DaemonError::Recovery(error.to_string()))?;
-    let wall_now = clock.now_utc()?;
-    let elapsed_now = clock.now_elapsed()?;
-    let plan = {
-        let mut startup = StartupStore::new(&mut store, retention);
-        reconcile_startup(
-            &mut startup,
-            &inspector,
-            wall_now,
-            elapsed_now,
-            &boot_identity,
-        )
-        .map_err(|error| DaemonError::Recovery(error.to_string()))?
-    };
-    let mut heap = rebuild_deadline_heap(&plan);
+    let mut heap = recover_startup_state(
+        &mut store,
+        state_directory,
+        clock,
+        &inspector,
+        &boot_identity,
+    )?;
     // launchd/systemd stop units with SIGTERM. Block the stop signals before
     // any helper thread inherits the mask, then consume them in a sigwait
     // thread so the loop unwinds cleanly: the IPC thread is joined and the
@@ -106,6 +129,8 @@ pub(crate) fn run_session_supervisor(
     let execution_database = database_path;
     let execution_state = state_directory.to_owned();
     let mut retries = DueFailureRetries::default();
+    // Fallback clock reading if the elapsed clock fails mid-loop.
+    let fallback_elapsed = clock.now_elapsed()?;
     run_loop(
         &receiver,
         &mut heap,
@@ -114,7 +139,7 @@ pub(crate) fn run_session_supervisor(
             Ok(now) => now,
             Err(error) => {
                 eprintln!("atx supervisor: elapsed clock failed: {error}");
-                elapsed_now
+                fallback_elapsed
             }
         },
         |jobs| {
@@ -127,7 +152,7 @@ pub(crate) fn run_session_supervisor(
                 runtime_directory,
                 &jobs,
             );
-            let now_elapsed = clock.now_elapsed().unwrap_or(elapsed_now);
+            let now_elapsed = clock.now_elapsed().unwrap_or(fallback_elapsed);
             for (job_id, error) in failures {
                 match retries.record_failure(job_id) {
                     Some(backoff) => {
