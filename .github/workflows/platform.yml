@@ -4,21 +4,19 @@ on:
   push:
     branches: [main]
     paths:
-      - "src/infrastructure/**"
-      - "src/run_monitor/**"
-      - "src/supervisor/**"
-      - "src/main.rs"
+      - "src/**"
+      - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/platform.yml"
   pull_request:
     paths:
-      - "src/infrastructure/**"
-      - "src/run_monitor/**"
-      - "src/supervisor/**"
-      - "src/main.rs"
+      - "src/**"
+      - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
       - ".github/workflows/platform.yml"
   schedule:
     # Nightly, after the main CI window.
@@ -129,3 +127,33 @@ jobs:
           --target ${{ matrix.target }}
           --config "target.aarch64-unknown-linux-gnu.linker='aarch64-linux-gnu-gcc'"
           --config "target.aarch64-unknown-linux-musl.linker='aarch64-linux-gnu-gcc'"
+
+  busybox:
+    # BusyBox is the minimal supported Linux userspace: a static musl binary
+    # must run there (no glibc, no coreutils assumptions).
+    name: busybox smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: 1.97.0
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: musl-busybox
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build static musl binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Smoke inside BusyBox
+        run: >
+          docker run --rm
+          -v "$PWD/target/x86_64-unknown-linux-musl/release/atx:/atx:ro"
+          -v "$PWD/.busybox-home:/home/smoke"
+          --env HOME=/home/smoke --env TMPDIR=/tmp
+          busybox:1.36.1-musl
+          sh -c '/atx --version && /atx --state-dir /home/smoke/state doctor'

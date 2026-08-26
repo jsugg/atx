@@ -154,7 +154,13 @@ jobs:
         # --branch needs -Z coverage-options=branch.
         run: >-
           cargo +nightly llvm-cov --branch --all-targets --all-features --locked
-          --fail-under-lines 95 --fail-under-regions 85
+          --fail-under-lines 95 --fail-under-regions 85 --html
+      - name: Publish reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html
+          retention-days: 14
 
   doc:
     name: doc
