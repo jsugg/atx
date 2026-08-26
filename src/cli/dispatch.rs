@@ -595,11 +595,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
     let (mut store, paths, config) = open_management(global)?;
     match command {
         ManagementCommand::List { state, limit } => {
-            let state = state
-                .as_deref()
-                .map(parse_job_state)
-                .transpose()
-                .map_err(|error| CliError::usage(global.json, error))?;
+            let state = state.map(crate::domain::JobState::from);
             let jobs = list_jobs(&store, state, None, *limit)
                 .map_err(|error| management_cli_error(global.json, error))?;
             render_jobs(&jobs, global);
@@ -607,7 +603,14 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
         ManagementCommand::Show { job } => {
             let job = resolve_job(&store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_job(&job, global);
+            // The human renderer promises the job's last outcome; the JSON
+            // contract keeps it on `history`/`output` instead.
+            let outcome = store
+                .list_runs(Some(job.id()), 1)
+                .ok()
+                .and_then(|runs| runs.first().cloned())
+                .and_then(|run| run.snapshot().outcome);
+            render_job(&job, outcome, global);
         }
         ManagementCommand::History { job, limit } => {
             let job_id = job
@@ -639,7 +642,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .unwrap_or(config.cancel_grace());
             let cancelled = cancel_job(&mut store, job, grace)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_job(&cancelled, global);
+            render_job(&cancelled, None, global);
         }
         ManagementCommand::Remove {
             job,
@@ -654,7 +657,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             }
             let removed = remove_job(&mut store, job, *keep_history)
                 .map_err(|error| management_cli_error(global.json, error))?;
-            render_job(&removed, global);
+            render_job(&removed, None, global);
         }
         ManagementCommand::Run { job, yes } => {
             let clock = NativeClock;
@@ -670,7 +673,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             SessionAcknowledger::new(paths.state_dir().to_owned(), paths.runtime_dir().to_owned())
                 .acknowledge(rerun.id(), rerun.revision())
                 .map_err(|error| CliError::supervision(global.json, error))?;
-            render_job(&rerun, global);
+            render_job(&rerun, None, global);
         }
         ManagementCommand::Service { .. }
         | ManagementCommand::Version
@@ -891,22 +894,6 @@ fn finish_job_cancellation(
 
 fn management_store_error(error: impl std::fmt::Display) -> ManagementError {
     ManagementError::Store(crate::application::ManagementStoreError(error.to_string()))
-}
-
-fn parse_job_state(value: &str) -> Result<JobState, &'static str> {
-    match value {
-        "scheduled" => Ok(JobState::Scheduled),
-        "waiting" => Ok(JobState::Waiting),
-        "starting" => Ok(JobState::Starting),
-        "running" => Ok(JobState::Running),
-        "cancel_requested" => Ok(JobState::CancelRequested),
-        "succeeded" => Ok(JobState::Succeeded),
-        "failed" => Ok(JobState::Failed),
-        "cancelled" => Ok(JobState::Cancelled),
-        "interrupted" => Ok(JobState::Interrupted),
-        "missed" => Ok(JobState::Missed),
-        _ => Err("unknown job state"),
-    }
 }
 
 fn run_schedule(args: &SchedulingArgs) -> ExitCode {
@@ -1415,14 +1402,17 @@ fn render_run_output(output: &RunOutput, global: &GlobalArgs) {
     }
 }
 
-fn render_job(job: &Job, global: &GlobalArgs) {
+/// `last_outcome` is only set by `show`: the human renderer promises it,
+/// while JSON consumers get outcomes from `history`/`output`.
+fn render_job(job: &Job, last_outcome: Option<crate::domain::RunOutcome>, global: &GlobalArgs) {
     let view = JobView::from_job(job, UtcTimestamp::from_jiff(jiff::Timestamp::now()));
     if global.json {
         print_json_success(&view);
     } else if !global.quiet {
         println!(
             "{}",
-            HumanRenderer::new(global.color.unwrap_or(ColorArg::Auto)).job(&view)
+            HumanRenderer::new(global.color.unwrap_or(ColorArg::Auto))
+                .job_with_outcome(&view, last_outcome)
         );
     }
 }
@@ -1668,9 +1658,9 @@ mod tests {
     use super::{
         SUPERVISOR_READY_TIMEOUT, SessionAcknowledger, build_doctor_report, build_job, cancel_job,
         check_database, check_live_supervisor, check_private_directory, check_supervisor,
-        doctor_exit, finish_job_cancellation, parse_job_state, print_error, read_env_file,
-        render_job, render_jobs, render_processes, render_run_output, render_runs,
-        render_submission, resolve_submitting_tty, run, schedule, split_assignment,
+        doctor_exit, finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
+        render_processes, render_run_output, render_runs, render_submission,
+        resolve_submitting_tty, run, schedule, split_assignment,
     };
     use crate::application::{
         DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, ManagementStore,
@@ -2080,26 +2070,6 @@ mod tests {
     }
 
     #[test]
-    fn job_state_parsing_accepts_known_states_only() {
-        for (value, expected) in [
-            ("scheduled", JobState::Scheduled),
-            ("waiting", JobState::Waiting),
-            ("starting", JobState::Starting),
-            ("running", JobState::Running),
-            ("cancel_requested", JobState::CancelRequested),
-            ("succeeded", JobState::Succeeded),
-            ("failed", JobState::Failed),
-            ("cancelled", JobState::Cancelled),
-            ("interrupted", JobState::Interrupted),
-            ("missed", JobState::Missed),
-        ] {
-            assert_eq!(parse_job_state(value), Ok(expected));
-        }
-        assert!(parse_job_state("").is_err());
-        assert!(parse_job_state("bogus").is_err());
-    }
-
-    #[test]
     fn cancel_paths_are_idempotent_or_conflicting() {
         let root = tempdir().expect("root");
         let mut store = opened_store(root.path());
@@ -2430,7 +2400,7 @@ mod tests {
         ] {
             render_jobs(std::slice::from_ref(&job), &mode);
             render_runs(&runs, &mode);
-            render_job(&job, &mode);
+            render_job(&job, None, &mode);
         }
     }
 

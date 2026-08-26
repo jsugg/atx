@@ -17,7 +17,7 @@
 ATX schedules commands for later without making you write a cron entry.
 
 ```console
-atx 30s -- notify-send "coffee is ready"
+atx 30s -- say "coffee is ready"        # macOS; use notify-send on Linux
 atx 2m30s -- make check
 atx 15:00 -- ./backup-home
 atx 5h -- tmux send-keys -t coding-agent "continue" C-m
@@ -64,10 +64,25 @@ for the less-short version.
 
 ## Platforms
 
-The release target is macOS 13+ and Linux 5.4+. Static musl builds are intended
-for BusyBox systems. Current details live in
+The release target is macOS 13+ and Linux glibc/musl builds for x86-64 and
+AArch64; static musl builds are smoke-tested inside BusyBox in CI.
+Durability guarantees per platform live in
 [platform
 support](https://github.com/jsugg/atx/blob/main/docs/platform-support.md).
+
+## Upgrading and uninstalling
+
+- **Cargo installs:** `cargo install --force atx` (or `--path .` from a
+  checkout) replaces the binary; `cargo uninstall atx` removes it.
+- **Archive installs:** replace the old binary on your `PATH` with the new
+  one, then restart the service so the running supervisor is the new build:
+  `atx service uninstall && atx service install` (see `atx service --help`).
+  Moving or upgrading the binary without restarting leaves the old image
+  running until logout or reboot.
+- Uninstalling does not delete your state directory (history, config, logs).
+  Delete `$XDG_STATE_HOME/atx` (Linux) or
+  `~/Library/Application Support/atx` (macOS) yourself if you want history
+  gone.
 
 ## Hacking on it
 

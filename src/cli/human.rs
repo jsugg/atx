@@ -47,14 +47,23 @@ impl HumanRenderer {
         lines.join("\n")
     }
 
-    pub(crate) fn job(&self, job: &JobView) -> String {
+    /// `show` adds the most recent run's outcome; callers without a run to
+    /// show pass `None`.
+    pub(crate) fn job_with_outcome(
+        &self,
+        job: &JobView,
+        last_outcome: Option<crate::domain::RunOutcome>,
+    ) -> String {
         let environment = if job.execution.environment_keys.is_empty() {
             "-".to_owned()
         } else {
             job.execution.environment_keys.join(", ")
         };
+        let name = job.name.as_deref().unwrap_or("-");
+        let description = job.description.as_deref().unwrap_or("-");
+        let outcome = last_outcome.map_or_else(|| "-".to_owned(), |outcome| format!("{outcome:?}"));
         format!(
-            "Job: {}\nState: {}\nDue: {}\nRemaining: {}\nSchedule: {}\nRuntime: {:?}\nCommand: {}\nWorking directory: {}\nEnvironment keys: {}",
+            "Job: {}\nName: {name}\nDescription: {description}\nState: {}\nDue: {}\nRemaining: {}\nSchedule: {}\nRuntime: {:?}\nLast outcome: {outcome}\nCommand: {}\nWorking directory: {}\nEnvironment keys: {}",
             job.job_id,
             self.state(job.state),
             job.next_due_utc,
@@ -301,7 +310,7 @@ mod tests {
         )
         .expect("job");
         let view = JobView::from_job(&job, UtcTimestamp::from_second(1_000).expect("now"));
-        let rendered = HumanRenderer::new(ColorArg::Never).job(&view);
+        let rendered = HumanRenderer::new(ColorArg::Never).job_with_outcome(&view, None);
         assert!(rendered.contains("Environment keys: -"), "{rendered}");
     }
 

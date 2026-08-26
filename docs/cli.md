@@ -57,6 +57,13 @@ never shown by `show`, JSON output, or `doctor`.
 ```console
 atx list
 atx list --state running --limit 20
+```
+
+`--state` accepts one job state: `scheduled`, `waiting`, `starting`,
+`running`, `cancel-requested`, `succeeded`, `failed`, `cancelled`,
+`interrupted`, or `missed`.
+
+```console
 atx show JOB
 atx ps
 atx history
@@ -93,7 +100,8 @@ atx show --json 019...
 
 Successful output has `schema_version`, `ok: true`, and `data`. Errors use the
 same envelope with `ok: false` and an error code. Existing version 1 fields and
-their meanings stay compatible; later releases may add fields.
+their meanings stay compatible; later releases may add fields. Every field is
+listed in the [JSON output reference](json-api.md).
 
 `--quiet` hides successful human output. `--color` accepts `auto`, `always`, or
 `never` and controls color. Data goes to stdout and diagnostics go to stderr.

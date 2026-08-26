@@ -31,9 +31,9 @@ next ATX command reconciles saved work and applies its missed-job policy.
 `interrupted` means the command may have started but ATX cannot prove its
 outcome; it will not retry that run by itself.
 
-Run output lives below the private state directory. The job detail and history
-views show the relevant paths. Output is bounded, so a noisy command may have
-truncated logs.
+Run output lives below the private state directory at `runs/<run-id>/stdout.log`
+and `stderr.log`. The history and output views show the relevant paths. Output
+is bounded, so a noisy command may have truncated logs.
 
 ## State or supervisor errors
 

@@ -191,12 +191,224 @@ fn human_errors_report_exit_codes_on_stderr() {
         .expect("unknown job");
     assert_eq!(unknown.status.code(), Some(3));
 
-    // Usage errors exit 2 with a human explanation (needs an open store,
-    // which happens before argument validation).
+    // Unknown --state values are rejected by the typed enum before any
+    // store access, so this exits with clap's usage code.
     let usage = tools(root.path())
         .args(["list", "--state", "bogus"])
         .output()
         .expect("usage");
     assert_eq!(usage.status.code(), Some(2));
     assert!(!usage.stderr.is_empty());
+
+    // The typed enum accepts exactly the documented state names.
+    for state in [
+        "scheduled",
+        "waiting",
+        "starting",
+        "running",
+        "cancel-requested",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "missed",
+    ] {
+        let listed = tools(root.path())
+            .args(["--json", "list", "--state", state])
+            .output()
+            .expect("filtered list");
+        assert!(
+            listed.status.success(),
+            "--state {state}: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+    }
+}
+
+/// Submits a 1s touch-job plus a pending 30m job, waits until the short job
+/// has a terminal outcome, and returns its `(job_id, run_id)`.
+fn finished_job(root: &std::path::Path) -> (String, String) {
+    let marker = root.join("marker");
+    let script = format!("'/usr/bin/touch' '{}'", marker.display());
+    let submitted = tools(root)
+        .args(["--json", "1s", "--", "/bin/sh", "-c", script.as_str()])
+        .output()
+        .expect("submit");
+    assert!(submitted.status.success(), "{submitted:?}");
+    tools(root)
+        .args(["--json", "30m", "--", "/bin/true"])
+        .output()
+        .expect("pending submit");
+
+    wait_for(|| marker.exists(), "the job to execute");
+    wait_for(
+        || {
+            let (value, _) = json_output(tools(root).args(["--json", "history"]));
+            value["data"]
+                .as_array()
+                .is_some_and(|runs| runs.iter().any(|run| run["outcome"] != Value::Null))
+        },
+        "the run to finish",
+    );
+    let (history, _) = json_output(tools(root).args(["--json", "history"]));
+    let data = history["data"].as_array().expect("runs");
+    let run = data
+        .iter()
+        .find(|run| run["outcome"] != Value::Null)
+        .expect("finished run");
+    (
+        run["job_id"].as_str().expect("job id").to_owned(),
+        run["run_id"].as_str().expect("run id").to_owned(),
+    )
+}
+
+/// Golden key-set contract: every `data` payload exposes exactly the fields
+/// docs/json-api.md promises. A new field must land in both places.
+#[test]
+fn json_job_payloads_expose_the_documented_key_sets() {
+    fn expect_keys(value: &Value, expected: &[&str]) {
+        let mut actual: Vec<&str> = value
+            .as_object()
+            .expect("payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    let root = tempdir().expect("root");
+    let (submission, _) =
+        json_output(tools(root.path()).args(["--json", "30m", "--", "/bin/true"]));
+    expect_keys(
+        &submission["data"],
+        &[
+            "dry_run",
+            "job_id",
+            "next_due_utc",
+            "runtime_tier",
+            "schedule",
+            "state",
+            "supervised",
+        ],
+    );
+
+    let _ = finished_job(root.path());
+    let (listing, _) = json_output(tools(root.path()).args(["--json", "list"]));
+    expect_keys(&listing, &["data", "ok", "schema_version"]);
+    let job = listing["data"][0].clone();
+    let job_id = job["job_id"].as_str().expect("job id").to_owned();
+    expect_keys(
+        &job,
+        &[
+            "active_run_id",
+            "description",
+            "execution",
+            "job_id",
+            "name",
+            "next_due_utc",
+            "remaining_seconds",
+            "runtime_tier",
+            "schedule",
+            "state",
+        ],
+    );
+    expect_keys(
+        &job["execution"],
+        &[
+            "argv",
+            "environment_keys",
+            "mode",
+            "shell_path",
+            "working_directory",
+        ],
+    );
+
+    // show renders the same job object shape as list.
+    let (shown, _) = json_output(tools(root.path()).args(["--json", "show", &job_id]));
+    let shown_keys: Vec<String> = shown["data"]
+        .as_object()
+        .expect("job payload")
+        .keys()
+        .cloned()
+        .collect();
+    let listed_keys: Vec<String> = job
+        .as_object()
+        .expect("job payload")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(shown_keys, listed_keys);
+}
+
+#[test]
+fn json_run_payloads_expose_the_documented_key_sets() {
+    fn expect_keys(value: &Value, expected: &[&str]) {
+        let mut actual: Vec<&str> = value
+            .as_object()
+            .expect("payload")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    let root = tempdir().expect("root");
+    let (job_id, run_id) = finished_job(root.path());
+
+    let (history, _) = json_output(tools(root.path()).args(["--json", "history"]));
+    let run = history["data"][0].clone();
+    expect_keys(
+        &run,
+        &[
+            "finished_at_utc",
+            "job_id",
+            "outcome",
+            "run_id",
+            "scheduled_for_utc",
+            "sequence",
+            "started_at_utc",
+            "state",
+            "stderr_path",
+            "stdout_path",
+        ],
+    );
+
+    let (output, _) = json_output(tools(root.path()).args(["--json", "output", &run_id]));
+    expect_keys(
+        &output["data"],
+        &[
+            "job_id",
+            "outcome",
+            "run_id",
+            "state",
+            "stderr",
+            "stderr_truncated",
+            "stdout",
+            "stdout_truncated",
+        ],
+    );
+
+    let (processes, _) = json_output(tools(root.path()).args(["--json", "ps"]));
+    if let Some(process) = processes["data"].as_array().and_then(|p| p.first()) {
+        expect_keys(
+            process,
+            &[
+                "job_id",
+                "pid",
+                "process_group_id",
+                "role",
+                "run_id",
+                "state",
+            ],
+        );
+    }
+    assert!(
+        history["data"]
+            .as_array()
+            .expect("runs")
+            .iter()
+            .all(|run| run["job_id"] == job_id)
+    );
 }

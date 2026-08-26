@@ -126,6 +126,37 @@ pub(crate) struct ScheduleOptions {
     pub(crate) tty: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum StateFilter {
+    Scheduled,
+    Waiting,
+    Starting,
+    Running,
+    CancelRequested,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Missed,
+}
+
+impl From<StateFilter> for crate::domain::JobState {
+    fn from(filter: StateFilter) -> Self {
+        match filter {
+            StateFilter::Scheduled => Self::Scheduled,
+            StateFilter::Waiting => Self::Waiting,
+            StateFilter::Starting => Self::Starting,
+            StateFilter::Running => Self::Running,
+            StateFilter::CancelRequested => Self::CancelRequested,
+            StateFilter::Succeeded => Self::Succeeded,
+            StateFilter::Failed => Self::Failed,
+            StateFilter::Cancelled => Self::Cancelled,
+            StateFilter::Interrupted => Self::Interrupted,
+            StateFilter::Missed => Self::Missed,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ColorArg {
     #[default]
@@ -171,8 +202,8 @@ pub(crate) enum ManagementCommand {
     /// List saved jobs.
     #[command(alias = "ls", after_long_help = LIST_EXAMPLES)]
     List {
-        #[arg(long)]
-        state: Option<String>,
+        #[arg(long, value_enum)]
+        state: Option<StateFilter>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
@@ -200,6 +231,7 @@ pub(crate) enum ManagementCommand {
     #[command(after_long_help = RUN_EXAMPLES)]
     Run {
         job: String,
+        /// Confirm running an interrupted job again.
         #[arg(long)]
         yes: bool,
     },
@@ -407,11 +439,12 @@ EXAMPLES:
 const RUN_EXAMPLES: &str = "\
 EXAMPLES:
   atx run <job>
-      Run a saved job again right now; asks for confirmation when the
-      job is already waiting or running.
+      Run a terminal job again; refuses while the job is waiting or
+      running, and asks for confirmation when its last outcome was
+      interrupted.
 
   atx run <job> --yes
-      Skip the confirmation prompt.
+      Skip the interrupted-outcome confirmation prompt.
 ";
 
 const PS_EXAMPLES: &str = "\

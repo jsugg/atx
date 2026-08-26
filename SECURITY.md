@@ -12,8 +12,11 @@ updated while checking it.
 
 ## Supported versions
 
-No public version is supported yet. Once 1.0 ships, the newest minor release
-will receive security fixes. Older releases may be asked to upgrade.
+No public version is supported yet. From the first published release onward,
+the newest 0.x release receives security fixes; once 1.0 ships, the newest
+stable minor release does. Older releases are asked to upgrade. Fixes ship as
+patch releases and are announced in the repository's Security tab advisories
+and the changelog.
 
 ## Scope
 
