@@ -2,7 +2,7 @@
 
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/atx-harness.XXXXXX")

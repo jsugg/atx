@@ -1,6 +1,5 @@
 # Production readiness
 
-> [!WARNING]
 > **SUPERSEDED.** This snapshot predates a pre-release audit that found
 > release-blocking defects (red acceptance suite, production panics on
 > malformed environments, unwired configuration controls). Do not treat any

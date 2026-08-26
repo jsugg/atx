@@ -2,7 +2,7 @@
 
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
 mode=${1:-quick}
@@ -31,6 +31,8 @@ require_version() {
     esac
 }
 
+# Deterministic pre-merge gate: build, tests, lint. This is what CI runs per
+# push; it is deliberately NOT the release gate.
 quick() {
     cargo fmt --check
     cargo check --all-targets --all-features --locked
@@ -38,8 +40,10 @@ quick() {
     cargo clippy --all-targets --all-features --locked -- -D warnings
 }
 
-full() {
-    quick
+# Extended static evidence on top of quick. Still not the release gate:
+# coverage floors, mutation, fuzz budgets, and performance evidence run as
+# dedicated scheduled/release workflows (see .github/workflows).
+static() {
     cargo +1.85.0 check --all-targets --all-features --locked
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
@@ -64,9 +68,14 @@ full() {
 
 case "$mode" in
     quick) quick ;;
-    full) full ;;
+    # Historical alias for CI compatibility; identical to `static`.
+    full) quick && static ;;
+    static) static ;;
     *)
-        printf 'usage: %s quick|full\n' "$0" >&2
+        printf 'usage: %s quick|static|full\n' "$0" >&2
+        printf '  quick  fmt+check+test+clippy (pre-merge)\n' >&2
+        printf '  static MSRV+doc+audit+deny+mdlint+lychee+package (extended)\n' >&2
+        printf '  full   quick+static (kept as an alias)\n' >&2
         exit 2
         ;;
 esac

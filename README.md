@@ -5,7 +5,6 @@
 [![security](https://github.com/jsugg/atx/actions/workflows/security.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/security.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
 
-> [!WARNING]
 > **Pre-release.** ATX is not yet published: there is no crates.io crate, no
 > GitHub release, and no prebuilt binaries yet. The install instructions and
 > badges below activate when the first release ships.
