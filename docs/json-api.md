@@ -90,8 +90,11 @@ Run object (`history`):
 | `scheduled_for_utc` | string | RFC 3339 UTC timestamp |
 | `started_at_utc` | string \| null | |
 | `finished_at_utc` | string \| null | |
-| `state` | string | `starting`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`, `interrupted` |
+| `state` | string | see run states below |
 | `outcome` | string \| null | terminal runs only |
+
+Run states: `starting`, `running`, `cancel_requested`, `succeeded`,
+`failed`, `cancelled`, `interrupted`.
 | `stdout_path` / `stderr_path` | string \| null | paths under the state directory |
 
 Run-output object (`output RUN --json`):
