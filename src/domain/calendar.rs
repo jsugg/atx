@@ -316,11 +316,14 @@ mod tests {
     #[test]
     fn rejects_malformed_timezone_selections() {
         let now = UtcTimestamp::from_str("2026-01-01T00:00:00Z").expect("valid timestamp");
+        let over_cap = "A/".repeat(128);
+        let past_cap = "A/".repeat(127) + "AB";
         let zones = [
             "",                      // empty
             "America/N\u{e9}w_York", // non-ASCII
             "America/New_York\0",    // embedded NUL
-            &"A/".repeat(128),       // over the 255-byte cap
+            over_cap.as_str(),       // over the 255-byte cap
+            past_cap.as_str(),       // exactly 256 bytes: one past the cap
         ];
         for zone in zones {
             assert!(
@@ -337,6 +340,21 @@ mod tests {
                 "{zone}"
             );
         }
+
+        // Exactly 255 bytes passes the length gate (it fails lookup later,
+        // with a different error) — this pins the >/>= boundary.
+        let at_cap = "A/".repeat(127) + "B";
+        assert_eq!(at_cap.len(), 255);
+        assert!(matches!(
+            resolve_calendar(
+                "2027-01-01T09:30",
+                &TimeZoneSelection::Named(at_cap),
+                DstResolution::Reject,
+                false,
+                now,
+            ),
+            Err(super::CalendarError::TimeZoneNotFound)
+        ));
     }
 
     proptest::proptest! {

@@ -1,0 +1,68 @@
+name: mutation
+
+# Mutation evidence for the critical pure modules (domain parsing, calendar
+# math, config/env-file handling). Pinned cargo-mutants and a time budget so
+# runs stay reproducible; the report artifact is the evidence, a nonzero exit
+# means new survivors appeared and must be triaged before release.
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly, before the performance window.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mutants:
+    name: cargo-mutants critical modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install pinned cargo-mutants
+        run: cargo install --locked --version 25.3.1 cargo-mutants
+      # Shell timeout bounds the whole run; --timeout-multiplier keeps slow
+      # integration-adjacent tests from being misreported as caught-by-hang.
+      - name: Mutate critical modules under a time budget
+        run: >-
+          timeout 45m
+          cargo mutants --no-shuffle --timeout-multiplier 4
+          -C '--locked'
+          --file 'src/domain/*.rs'
+          --file 'src/infrastructure/config/*.rs'
+          -v
+      - name: Record machine-readable evidence
+        if: always()
+        run: |
+          {
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'tool=cargo-mutants 25.3.1\n'
+            printf 'scope=domain/, infrastructure/config/\n'
+            date -u +"timestamp=%Y-%m-%dT%H:%M:%SZ"
+          } | tee mutant-evidence.txt
+          test ! -d out || tar czf mutants-report.tgz out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mutation-evidence
+          path: |
+            mutant-evidence.txt
+            mutants-report.tgz
+          retention-days: 90
+          if-no-files-found: error
