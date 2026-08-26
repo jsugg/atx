@@ -49,9 +49,9 @@ pub(crate) struct GlobalArgs {
     #[arg(long, global = true)]
     pub(crate) json: bool,
 
-    /// Control colored output.
-    #[arg(long, global = true, value_enum, default_value_t = ColorArg::Auto)]
-    pub(crate) color: ColorArg,
+    /// Control colored output. Defaults to the configured color mode.
+    #[arg(long, global = true, value_enum)]
+    pub(crate) color: Option<ColorArg>,
 
     /// Use a different state directory.
     #[arg(long, global = true, value_name = "PATH")]

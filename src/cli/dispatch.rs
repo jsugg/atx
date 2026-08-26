@@ -71,8 +71,17 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
     };
     match parsed {
-        ParsedCli::Schedule(args) => run_schedule(&args),
-        ParsedCli::Management { global, command } => run_management(&global, &command),
+        ParsedCli::Schedule(mut args) => {
+            resolve_output_policy(&mut args.global);
+            run_schedule(&args)
+        }
+        ParsedCli::Management {
+            mut global,
+            command,
+        } => {
+            resolve_output_policy(&mut global);
+            run_management(&global, &command)
+        }
     }
 }
 
@@ -275,7 +284,10 @@ fn run_doctor(global: &GlobalArgs) -> ExitCode {
             if global.json {
                 print_json_success(&report);
             } else if !global.quiet {
-                println!("{}", HumanRenderer::new(global.color).doctor(&report));
+                println!(
+                    "{}",
+                    HumanRenderer::new(global.color.unwrap_or(ColorArg::Auto)).doctor(&report)
+                );
             }
             doctor_exit(&report)
         }
@@ -900,7 +912,12 @@ fn parse_job_state(value: &str) -> Result<JobState, &'static str> {
 fn run_schedule(args: &SchedulingArgs) -> ExitCode {
     match schedule(args) {
         Ok((outcome, json, quiet)) => {
-            render_submission(&outcome, json, quiet, args.global.color);
+            render_submission(
+                &outcome,
+                json,
+                quiet,
+                args.global.color.unwrap_or(ColorArg::Auto),
+            );
             if matches!(outcome, SubmissionOutcome::CommittedUnsupervised { .. }) {
                 exit::supervision()
             } else {
@@ -917,14 +934,16 @@ fn run_schedule(args: &SchedulingArgs) -> ExitCode {
 fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), CliError> {
     let json = args.global.json;
     let quiet = args.global.quiet;
-    if args.options.capture_env && !quiet {
+    // Safety diagnostics stay on stderr even in quiet mode: --quiet suppresses
+    // successful human output, never security warnings.
+    if args.options.capture_env {
         eprintln!("Warning: --capture-env may save credentials in the state database.");
     }
     let paths = platform_paths(args.global.state_dir.as_deref())
         .map_err(|error| CliError::permission(json, error))?;
     let config = load_effective_config(&paths, &args.global, args.options.durable)
         .map_err(|error| CliError::usage(json, error))?;
-    if args.options.shell && !quiet {
+    if args.options.shell {
         eprintln!(
             "Warning: --shell runs the command string through {}; \
              shell metacharacters are interpreted.",
@@ -1049,23 +1068,50 @@ fn load_effective_config(
         Err(error) => return Err(format!("cannot read {}: {error}", config_path.display())),
     };
     let environment = collect_process_environment(config_key)?;
+    // Only explicit CLI flags become overrides; absent flags fall through to
+    // the environment and file layers (file < ATX_* < explicit CLI).
     let overrides = ConfigOverrides {
         default_runtime: durable.then_some(RuntimeTier::Durable),
-        color: Some(match global.color {
+        color: global.color.map(|color| match color {
             ColorArg::Auto => ColorMode::Auto,
             ColorArg::Always => ColorMode::Always,
             ColorArg::Never => ColorMode::Never,
         }),
-        verbosity: Some(if global.quiet {
-            Verbosity::Quiet
+        verbosity: if global.quiet {
+            Some(Verbosity::Quiet)
         } else if global.verbose > 0 {
-            Verbosity::Verbose
+            Some(Verbosity::Verbose)
         } else {
-            Verbosity::Normal
-        }),
+            None
+        },
         ..ConfigOverrides::default()
     };
     load_config(file.as_deref(), &environment, overrides).map_err(|error| error.to_string())
+}
+
+/// Resolve one effective output policy for the whole process.
+///
+/// Explicit `--quiet`/`-v`/`--color` win over the configured verbosity and
+/// color mode. Config load failures are ignored here on purpose: the real
+/// command path surfaces them, this pass only picks rendering defaults.
+///
+/// NOTE: mutates `global` in place so every downstream renderer and warning
+/// site observes a single policy without threading a second struct through
+/// dispatch.
+fn resolve_output_policy(global: &mut GlobalArgs) {
+    let Ok(paths) = platform_paths(global.state_dir.as_deref()) else {
+        return;
+    };
+    let Ok(config) = load_effective_config(&paths, global, false) else {
+        return;
+    };
+    global.quiet = config.verbosity() == Verbosity::Quiet;
+    global.verbose = u8::from(config.verbosity() == Verbosity::Verbose);
+    global.color = Some(match config.color() {
+        ColorMode::Auto => ColorArg::Auto,
+        ColorMode::Always => ColorArg::Always,
+        ColorMode::Never => ColorArg::Never,
+    });
 }
 
 fn build_job(
@@ -1345,7 +1391,10 @@ fn render_jobs(jobs: &[Job], global: &GlobalArgs) {
     if global.json {
         print_json_success(&views);
     } else if !global.quiet {
-        println!("{}", HumanRenderer::new(global.color).jobs(&views));
+        println!(
+            "{}",
+            HumanRenderer::new(global.color.unwrap_or(ColorArg::Auto)).jobs(&views)
+        );
     }
 }
 
@@ -1371,7 +1420,10 @@ fn render_job(job: &Job, global: &GlobalArgs) {
     if global.json {
         print_json_success(&view);
     } else if !global.quiet {
-        println!("{}", HumanRenderer::new(global.color).job(&view));
+        println!(
+            "{}",
+            HumanRenderer::new(global.color.unwrap_or(ColorArg::Auto)).job(&view)
+        );
     }
 }
 
@@ -1673,7 +1725,7 @@ mod tests {
             quiet,
             verbose: 0,
             json,
-            color: ColorArg::Never,
+            color: Some(ColorArg::Never),
             state_dir: None,
         }
     }
@@ -3369,7 +3421,7 @@ mod tests {
             quiet: false,
             verbose: 0,
             json: true,
-            color: ColorArg::Never,
+            color: Some(ColorArg::Never),
             state_dir: Some(state.clone()),
         };
         let report = build_doctor_report(&global).expect("doctor report");

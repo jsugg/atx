@@ -64,7 +64,7 @@ fn shell_submission_warns_unless_quiet() {
         "expected shell warning, got: {stderr}"
     );
 
-    // --quiet suppresses the warning.
+    // Safety warnings stay on stderr even in --quiet mode.
     let quiet = atx()
         .arg("--state-dir")
         .arg(&state)
@@ -72,9 +72,15 @@ fn shell_submission_warns_unless_quiet() {
         .output()
         .expect("run quiet shell dry-run");
     assert!(quiet.status.success(), "{quiet:?}");
+    let stderr = String::from_utf8_lossy(&quiet.stderr);
     assert!(
-        String::from_utf8_lossy(&quiet.stderr).is_empty(),
-        "quiet mode must not warn"
+        stderr.contains("Warning: --shell"),
+        "quiet mode must keep the safety warning, got: {stderr}"
+    );
+    // Quiet still suppresses the successful submission line on stdout.
+    assert!(
+        quiet.stdout.is_empty(),
+        "quiet mode must suppress success output"
     );
 }
 
@@ -975,8 +981,6 @@ fn malformed_environment_is_rejected_not_panicked() {
 
     // A retained variable (PATH) with a non-UTF-8 value crosses the
     // persistence boundary and must fail as a typed usage error, not a panic.
-    // A retained variable (PATH) with a non-UTF-8 value crosses the
-    // persistence boundary and must fail as a typed usage error, not a panic.
     let bad_value = std::ffi::OsStr::from_bytes(b"/bin:\xFF");
     let retained = atx()
         .arg("--state-dir")
@@ -1007,5 +1011,113 @@ fn malformed_environment_is_rejected_not_panicked() {
     assert!(
         String::from_utf8_lossy(&unknown.stderr).contains("not valid UTF-8"),
         "{unknown:?}"
+    );
+}
+
+/// `--quiet` suppresses successful output, never the safety warnings.
+#[test]
+fn quiet_mode_keeps_safety_warnings_on_stderr() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    fs::create_dir_all(&state).expect("state dir");
+    let warned = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args([
+            "--quiet",
+            "--dry-run",
+            "--capture-env",
+            "30s",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("run quiet capture-env submission");
+    assert!(warned.status.success(), "{warned:?}");
+    let stderr = String::from_utf8_lossy(&warned.stderr);
+    assert!(
+        stderr.contains("--capture-env"),
+        "warning suppressed: {stderr:?}"
+    );
+
+    let shelled = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--quiet", "--dry-run", "--shell", "30s", "--", "echo hi"])
+        .output()
+        .expect("run quiet shell submission");
+    assert!(shelled.status.success(), "{shelled:?}");
+    let stderr = String::from_utf8_lossy(&shelled.stderr);
+    assert!(stderr.contains("--shell"), "warning suppressed: {stderr:?}");
+}
+
+/// Output policy precedence: file < ATX_* environment < explicit CLI flag.
+#[test]
+fn color_and_verbosity_follow_config_precedence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    fs::create_dir_all(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    fs::write(state.join("config.toml"), "verbosity = \"quiet\"\n").expect("write config");
+
+    // Seed a terminal job so `list` has something to render or suppress.
+    let seeded = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--json", "--dry-run", "30s", "--", "/bin/true"])
+        .output()
+        .expect("seed dry run");
+    assert!(seeded.status.success(), "{seeded:?}");
+    let submitted = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--", "/bin/true"])
+        .output()
+        .expect("seed submission");
+    assert!(submitted.status.success(), "{submitted:?}");
+
+    // File layer alone: configured quiet suppresses human list output.
+    let listed = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .arg("list")
+        .output()
+        .expect("run list with quiet config");
+    assert!(listed.status.success(), "{listed:?}");
+    assert!(
+        listed.stdout.is_empty(),
+        "configured quiet did not apply: {:?}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // Environment beats file: ATX_VERBOSITY=verbose overrides the quiet file.
+    let from_env = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .env("ATX_VERBOSITY", "verbose")
+        .arg("list")
+        .output()
+        .expect("run list with env override");
+    assert!(from_env.status.success(), "{from_env:?}");
+    assert!(
+        !from_env.stdout.is_empty(),
+        "ATX_VERBOSITY=verbose did not beat the file layer"
+    );
+
+    // Explicit CLI beats environment: --quiet wins over ATX_VERBOSITY.
+    let from_cli = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .env("ATX_VERBOSITY", "verbose")
+        .args(["--quiet", "list"])
+        .output()
+        .expect("run list with cli override");
+    assert!(from_cli.status.success(), "{from_cli:?}");
+    assert!(
+        from_cli.stdout.is_empty(),
+        "--quiet did not beat ATX_VERBOSITY: {:?}",
+        String::from_utf8_lossy(&from_cli.stdout)
     );
 }
