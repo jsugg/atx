@@ -333,13 +333,28 @@ fn s9_missing_executable_fails_deterministically() {
 }
 
 /// S11: Output caps bound stored artifacts without blocking completion.
+///
+/// Emits past the documented 10 MiB per-stream cap on BOTH streams and
+/// asserts exact retained sizes, truncation metadata in `atx output`, and a
+/// completion bound proving simultaneous drain does not deadlock.
 #[test]
 fn s11_output_caps_bound_storage() {
+    const CAP: u64 = 10 * 1024 * 1024;
+    // 12 MiB per stream: comfortably past the default cap on both streams
+    // at once, so the assertion exercises real truncation, not slack.
     let root = tempdir().expect("root");
     let state = root.path().join("state");
+    let started = Instant::now();
     let submission = json_run(
         &state,
-        ["2s", "--", "/bin/sh", "-c", "yes flooded | head -c 4000000"].as_slice(),
+        [
+            "2s",
+            "--",
+            "/bin/sh",
+            "-c",
+            "yes flooded | head -c 12582912; yes noisy | head -c 12582912 >&2",
+        ]
+        .as_slice(),
     );
     let job_id = submission["job_id"].as_str().expect("id").to_owned();
     // Wait for a TERMINAL state before reading artifacts: any-run-row waits
@@ -353,6 +368,14 @@ fn s11_output_caps_bound_storage() {
         },
         "flooded job to reach a terminal state",
     );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "dual-stream flood took {:?}; drain may be serializing or deadlocking",
+        started.elapsed()
+    );
+
+    let mut saw_stdout = false;
+    let mut saw_stderr = false;
     let runs = fs::read_dir(state.join("runs"))
         .expect("runs dir exists once a run reached a terminal state");
     for entry in runs.flatten() {
@@ -361,7 +384,38 @@ fn s11_output_caps_bound_storage() {
             total < 64 * 1024 * 1024,
             "run artifacts exceeded sane bound: {total}"
         );
+        for (stream, seen) in [
+            ("stdout.log", &mut saw_stdout),
+            ("stderr.log", &mut saw_stderr),
+        ] {
+            let path = entry.path().join(stream);
+            if !path.exists() {
+                continue;
+            }
+            let len = fs::metadata(&path).expect("stream metadata").len();
+            assert!(
+                len <= CAP,
+                "{stream} retained {len} bytes despite the {CAP}-byte cap"
+            );
+            *seen = true;
+        }
+        // Truncation must be observable through the public surface, not just
+        // inferred from file sizes.
+        let run_id = entry.file_name().into_string().expect("run id");
+        let reported = json_run(&state, &["output", &run_id]);
+        assert_eq!(
+            reported["stdout_truncated"], true,
+            "stdout truncation not reported: {reported}"
+        );
+        assert_eq!(
+            reported["stderr_truncated"], true,
+            "stderr truncation not reported: {reported}"
+        );
     }
+    assert!(
+        saw_stdout && saw_stderr,
+        "expected both captured streams (stdout={saw_stdout} stderr={saw_stderr})"
+    );
 }
 
 fn walk_size(path: &std::path::Path) -> u64 {
