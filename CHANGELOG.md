@@ -8,6 +8,10 @@ versioning.
 
 ### Added
 
+## [0.1.0] - 2026-08-26
+
+### Added
+
 - One-shot and fixed-rate job scheduling with relative times, calendar
   times, UTC, and explicit IANA timezones.
 - Direct argv execution by default; opt-in `--shell` mode with an

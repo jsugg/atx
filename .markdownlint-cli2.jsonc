@@ -1,10 +1,8 @@
 {
   "config": {
-    "default": true,
-    "MD013": { "line_length": 100, "code_blocks": false },
-    "MD041": false,
-    "MD036": false
+    "MD013": { "line_length": 100, "heading_line_length": 100 },
+    "MD024": { "siblings_only": true }
   },
-  "globs": ["**/*.md"],
-  "ignores": ["target/**", ".local/**", ".serena/**"]
+  "globs": ["**/*.md", "!target/**", "!.local/**", "!.serena/**"],
+  "ignores": [".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
 }

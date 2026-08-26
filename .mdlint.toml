@@ -1,3 +1,10 @@
 [rules.MD013]
 line_length = 100
 heading_line_length = 100
+
+[rules.MD024]
+# Keep-a-Changelog repeats section names under every version heading.
+siblings_only = true
+
+[rules.MD052]
+enabled = false
