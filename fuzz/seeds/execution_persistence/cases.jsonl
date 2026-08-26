@@ -1,0 +1,3 @@
+{"mode":"direct","argv":["/bin/true"],"cwd":"/tmp","env":{}}
+{"mode":"shell","command":"echo hi"}
+not-json-at-all

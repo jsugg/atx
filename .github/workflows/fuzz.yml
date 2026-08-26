@@ -15,7 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
-  FUZZ_RUNS: "20000"
+  # Fixed time budget per target instead of a run count: wall-clock budgets
+  # are comparable across machines and libFuzzer versions.
+  FUZZ_SECONDS: "300"
 
 defaults:
   run:
@@ -24,7 +26,7 @@ defaults:
 jobs:
   fuzz:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -34,12 +36,15 @@ jobs:
           - env_file
           - execution_persistence
           - ipc_frame
+        # fuzz_targets/domain_shim.rs is a support module included by other
+        # targets, not a runnable fuzz target: it has no fuzz_target! entry.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Dated nightly pin: floating nightly made runs irreproducible.
       - name: Install nightly toolchain
         run: |
-          rustup toolchain install nightly --profile minimal
-          rustup default nightly
+          rustup toolchain install nightly-2026-08-01 --profile minimal
+          rustup default nightly-2026-08-01
       # Prebuilt binary instead of a from-source `cargo install`, and the
       # fuzz workspace's build artifacts cached per target.
       - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
@@ -54,11 +59,14 @@ jobs:
         # overrides the `rustup default nightly` above. cargo-fuzz's default
         # musl target needs a musl std that the minimal profile lacks and is
         # incompatible with ASAN's crt-static requirement.
+        #
+        # The committed fuzz/seeds/<target> corpus gives every run a common
+        # deterministic starting point instead of an empty dictionary.
         run: >-
-          cargo +nightly fuzz run
+          cargo +nightly-2026-08-01 fuzz run
           --target x86_64-unknown-linux-gnu
-          "${{ matrix.target }}"
-          -- -runs="${FUZZ_RUNS}" -rss_limit_mb=4096
+          "${{ matrix.target }}" "fuzz/seeds/${{ matrix.target }}"
+          -- -max_total_time="${FUZZ_SECONDS}" -rss_limit_mb=4096
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

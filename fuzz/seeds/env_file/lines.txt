@@ -1,0 +1,4 @@
+KEY=value
+export QUOTED="hello world"
+BAD line without equals
+PATH=/usr/bin:/bin
