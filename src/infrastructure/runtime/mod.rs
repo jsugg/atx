@@ -1,8 +1,7 @@
 //! Session runtime adapter.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,13 +13,15 @@ pub(crate) fn start_session_supervisor(
     state_directory: &Path,
     runtime_directory: &Path,
 ) -> Result<(), io::Error> {
+    use crate::infrastructure::paths::open_or_create_private_append_log;
+
     ensure_private_dir(state_directory).map_err(io::Error::other)?;
     ensure_private_dir(runtime_directory).map_err(io::Error::other)?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(state_directory.join("supervisor.log"))?;
+    // Secure directory-relative open: never follow a planted symlink and
+    // reject wrong owner/mode/type instead of appending to it.
+    let state_handle = File::open(state_directory)?;
+    let log = open_or_create_private_append_log(&state_handle, "supervisor.log")
+        .map_err(io::Error::other)?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(std::env::current_exe()?);
     command

@@ -168,6 +168,41 @@ pub(crate) fn open_private_file(directory: &File, name: &str) -> Result<File, Pa
     Ok(File::from(file))
 }
 
+/// Create-or-open an append log inside a validated private directory.
+///
+/// Like the run-log helpers, this never follows symlinks and rejects any
+/// existing entry that is not a regular owner-only 0600 file, so a planted
+/// `supervisor.log` cannot redirect supervisor diagnostics.
+pub(crate) fn open_or_create_private_append_log(
+    directory: &File,
+    name: &str,
+) -> Result<File, PathError> {
+    validate_leaf_name(name)?;
+    // NOENT means no entry exists yet, so the create path races nothing; a
+    // FIFO or symlink at the leaf fails validation below instead of blocking
+    // on open (O_NONBLOCK would mask that distinction).
+    let file = match openat(
+        directory,
+        name,
+        OFlags::WRONLY | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(file) => file,
+        Err(rustix::io::Errno::NOENT) => return create_new_private_file(directory, name),
+        Err(errno) => return Err(errno.into()),
+    };
+    let metadata = fstat(&file)?;
+    if metadata.st_uid != geteuid().as_raw()
+        || metadata.st_mode & 0o777 != 0o600
+        || !FileType::from_raw_mode(metadata.st_mode).is_file()
+    {
+        return Err(PathError::Insecure(
+            "log must be a regular, owner-only file owned by this user",
+        ));
+    }
+    Ok(File::from(file))
+}
+
 fn validate_leaf_name(name: &str) -> Result<(), PathError> {
     let mut components = Path::new(name).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -207,8 +242,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PathEnvironment, Platform, create_new_private_file, ensure_private_dir, open_private_file,
-        resolve_paths, validate_private_dir_for_uid,
+        PathEnvironment, Platform, create_new_private_file, ensure_private_dir,
+        open_or_create_private_append_log, open_private_file, resolve_paths,
+        validate_private_dir_for_uid,
     };
 
     #[test]
@@ -416,6 +452,51 @@ mod tests {
         )
         .expect("fifo mode");
         assert!(open_private_file(&directory, "pipe.db").is_err());
+    }
+
+    #[test]
+    fn private_append_log_rejects_substituted_entries() {
+        let root = tempdir().expect("temp root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
+        ensure_private_dir(root.path()).expect("secure root");
+        let directory = fs::File::open(root.path()).expect("directory handle");
+
+        // Fresh creation yields a regular owner-only file.
+        let log = open_or_create_private_append_log(&directory, "supervisor.log")
+            .expect("create fresh log");
+        drop(log);
+
+        // Reopening an existing valid log succeeds.
+        open_or_create_private_append_log(&directory, "supervisor.log").expect("reopen log");
+
+        // A symlink planted over the log path is rejected by NOFOLLOW.
+        symlink(root.path().join("victim"), root.path().join("planted.log")).expect("symlink");
+        assert!(open_or_create_private_append_log(&directory, "planted.log").is_err());
+
+        // A loose-mode existing log is rejected instead of appended to.
+        fs::write(root.path().join("loose.log"), b"x").expect("write");
+        fs::set_permissions(
+            root.path().join("loose.log"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("loose mode");
+        assert!(open_or_create_private_append_log(&directory, "loose.log").is_err());
+
+        // A directory in place of the log is rejected.
+        fs::create_dir(root.path().join("dir.log")).expect("dir");
+        assert!(open_or_create_private_append_log(&directory, "dir.log").is_err());
+
+        // A FIFO opens but is not a regular file, so it must be rejected.
+        let fifo = CString::new(root.path().join("pipe.log").as_os_str().as_encoded_bytes())
+            .expect("fifo path");
+        // SAFETY: `fifo` points at a valid C string naming a fresh path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        fs::set_permissions(
+            root.path().join("pipe.log"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("fifo mode");
+        assert!(open_or_create_private_append_log(&directory, "pipe.log").is_err());
     }
 
     #[test]

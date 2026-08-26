@@ -1,7 +1,5 @@
 //! Detached session supervisor.
 
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -420,11 +418,14 @@ fn spawn_run_monitor(
     job_id: crate::domain::JobId,
     run_id: crate::domain::RunId,
 ) -> Result<(), std::io::Error> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(state_directory.join("supervisor.log"))?;
+    use crate::infrastructure::paths::open_or_create_private_append_log;
+
+    // Same secure open as the session-supervisor spawn: no symlink following
+    // and strict owner/mode/type validation on any existing log.
+    ensure_private_dir(state_directory).map_err(std::io::Error::other)?;
+    let state_handle = std::fs::File::open(state_directory)?;
+    let log = open_or_create_private_append_log(&state_handle, "supervisor.log")
+        .map_err(std::io::Error::other)?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(std::env::current_exe()?);
     command
