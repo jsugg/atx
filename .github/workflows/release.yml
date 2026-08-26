@@ -69,8 +69,13 @@ jobs:
         run: |
           ref="$TAG_REF"
           version="${ref#v}"
-          awk -v section="## [$version]" '
-            $0 ~ section, /^## \[/ { if ($0 != section && !/^## \[/) print }
+          # index() with a literal match: the section text goes through a
+          # regex engine otherwise, and '[' there starts a character class,
+          # so the old range pattern never matched and produced empty notes.
+          awk -v version="$version" 'BEGIN { section = "## [" version "]" }
+            index($0, section) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || {
             echo "::error::empty release notes for $version"; exit 1;
