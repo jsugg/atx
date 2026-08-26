@@ -1,9 +1,16 @@
 # Production readiness
 
+> [!WARNING]
+> **SUPERSEDED.** This snapshot predates a pre-release audit that found
+> release-blocking defects (red acceptance suite, production panics on
+> malformed environments, unwired configuration controls). Do not treat any
+> claim below as current evidence. It will be regenerated at the final
+> release candidate commit.
+
 A dated snapshot of what was checked before calling this crate
 release-ready. Re-run the relevant pieces if you change anything big.
 
-Checked against commit `35b6b4d` on 2026-08-23.
+Originally checked against commit `35b6b4d` on 2026-08-23.
 
 ## Build and tests
 

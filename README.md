@@ -3,9 +3,17 @@
 [![quality gates](https://github.com/jsugg/atx/actions/workflows/ci.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/ci.yml)
 [![tests](https://github.com/jsugg/atx/actions/workflows/platform.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/platform.yml)
 [![security](https://github.com/jsugg/atx/actions/workflows/security.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/security.yml)
-[![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx)
-[![Documentation](https://docs.rs/atx/badge.svg)](https://docs.rs/atx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
+
+> [!WARNING]
+> **Pre-release.** ATX is not yet published: there is no crates.io crate, no
+> GitHub release, and no prebuilt binaries yet. The install instructions and
+> badges below activate when the first release ships.
+
+<!-- RELEASE: remove this notice and enable the two badges below once the
+     first release exists on crates.io. -->
+<!-- [![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx) -->
+<!-- [![Documentation](https://docs.rs/atx/badge.svg)](https://docs.rs/atx) -->
 
 ATX schedules commands for later without making you write a cron entry.
 
@@ -22,16 +30,18 @@ running across supervisor crashes.
 
 ## Install
 
-From crates.io (recommended; the binary is self-contained):
+Not published yet. Until the first release, build from source:
 
 ```console
-cargo install atx
+git clone https://github.com/jsugg/atx
+cd atx
+cargo install --path .
 ```
 
-Prebuilt static musl binaries for Linux (`x86_64`, `aarch64`) and macOS
-builds are attached to each [release](https://github.com/jsugg/atx/releases).
-Download the archive for your platform, verify the SHA-256 checksum, and put
-the `atx` binary on your `PATH`.
+Once released: `cargo install atx` (recommended; the binary is
+self-contained), or grab a prebuilt archive from the
+[releases page](https://github.com/jsugg/atx/releases) — static musl binaries
+for Linux (`x86_64`, `aarch64`) plus macOS builds, with SHA-256 checksums.
 
 ## What it promises
 
