@@ -952,3 +952,60 @@ fn ps_lists_monitor_and_command_roles_while_job_runs() {
         .expect("cancel ps candidate");
     assert!(cancelled.status.success(), "{cancelled:?}");
 }
+
+/// Regression: non-UTF-8 environment entries must never abort the process.
+/// `std::env::vars()` used to panic (exit 101) even when the offending
+/// variable was neither captured nor inspected.
+#[test]
+fn malformed_environment_is_rejected_not_panicked() {
+    // Non-UTF-8 variable unrelated to ATX: submission proceeds normally.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let unrelated = atx()
+        .env(OsStr::from_bytes(b"BAD_\xFF"), "x")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--dry-run", "30s", "--", "/bin/true"])
+        .output()
+        .expect("run with unrelated environment entry");
+    assert!(unrelated.status.success(), "{unrelated:?}");
+
+    // A retained variable (PATH) with a non-UTF-8 value crosses the
+    // persistence boundary and must fail as a typed usage error, not a panic.
+    // A retained variable (PATH) with a non-UTF-8 value crosses the
+    // persistence boundary and must fail as a typed usage error, not a panic.
+    let bad_value = std::ffi::OsStr::from_bytes(b"/bin:\xFF");
+    let retained = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--dry-run", "30s", "--", "/bin/true"])
+        .env("PATH", bad_value)
+        .output()
+        .expect("run with non-UTF-8 PATH");
+    assert_eq!(
+        retained.status.code(),
+        Some(2),
+        "expected usage error: {retained:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&retained.stderr).contains("not valid UTF-8"),
+        "{retained:?}"
+    );
+
+    // An unknown ATX_* name that is not valid UTF-8 is rejected the same way.
+    let unknown = atx()
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--dry-run", "30s", "--", "/bin/true"])
+        .env(std::ffi::OsStr::from_bytes(b"ATX_\xFF"), "1")
+        .output()
+        .expect("run with non-UTF-8 ATX_ key");
+    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("not valid UTF-8"),
+        "{unknown:?}"
+    );
+}

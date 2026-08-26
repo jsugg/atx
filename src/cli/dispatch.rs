@@ -992,6 +992,51 @@ fn platform_paths(
     )
 }
 
+/// Collect process environment variables without panicking on non-UTF-8
+/// entries. Only keys matched by `retain` cross the UTF-8 persistence or
+/// configuration boundary; those must be valid UTF-8 and are rejected as a
+/// typed error otherwise. Everything else is skipped regardless of encoding.
+///
+/// Unlike `std::env::vars()`, which unwraps every key/value, this tolerates
+/// foreign-encoding variables that would never be read anyway.
+fn collect_process_environment(
+    retain: impl Fn(&std::ffi::OsStr) -> bool,
+) -> Result<Vec<(String, String)>, String> {
+    std::env::vars_os()
+        .filter(|(key, _)| retain(key))
+        .map(|(key, value)| {
+            let key = key.into_string().map_err(|invalid| {
+                format!(
+                    "environment variable name is not valid UTF-8: {}",
+                    invalid.to_string_lossy()
+                )
+            })?;
+            let value = value.into_string().map_err(|_| {
+                format!("environment variable {key} has a value that is not valid UTF-8")
+            })?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
+/// Keys inherited into job environments by default.
+fn default_retained_key(key: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = key.as_bytes();
+    matches!(
+        bytes,
+        b"HOME" | b"USER" | b"LOGNAME" | b"PATH" | b"LANG" | b"TMPDIR"
+    ) || bytes.starts_with(b"LC_")
+}
+
+/// Keys inspected for configuration overrides.
+fn config_key(key: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    key.as_bytes().starts_with(b"ATX_")
+}
+
 fn load_effective_config(
     paths: &crate::infrastructure::paths::PlatformPaths,
     global: &GlobalArgs,
@@ -1003,7 +1048,7 @@ fn load_effective_config(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("cannot read {}: {error}", config_path.display())),
     };
-    let environment = std::env::vars().collect::<Vec<_>>();
+    let environment = collect_process_environment(config_key)?;
     let overrides = ConfigOverrides {
         default_runtime: durable.then_some(RuntimeTier::Durable),
         color: Some(match global.color {
@@ -1226,17 +1271,9 @@ fn resolve_submitting_tty() -> Result<PathBuf, String> {
 fn build_environment(args: &SchedulingArgs) -> Result<Environment, String> {
     let mut values = BTreeMap::<String, String>::new();
     if args.options.capture_env {
-        values.extend(std::env::vars());
+        values.extend(collect_process_environment(|_| true)?);
     } else {
-        for (key, value) in std::env::vars() {
-            if matches!(
-                key.as_str(),
-                "HOME" | "USER" | "LOGNAME" | "PATH" | "LANG" | "TMPDIR"
-            ) || key.starts_with("LC_")
-            {
-                values.insert(key, value);
-            }
-        }
+        values.extend(collect_process_environment(default_retained_key)?);
     }
     if let Some(path) = &args.options.env_file {
         values.extend(read_env_file(path)?);
