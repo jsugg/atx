@@ -192,6 +192,7 @@ pub(crate) enum ManagementCommand {
         job: String,
         #[arg(long)]
         cancel: bool,
+        /// Keep completed-run history instead of deleting it with the job.
         #[arg(long)]
         keep_history: bool,
     },

@@ -71,9 +71,10 @@ atx run JOB
 atx run JOB --yes
 ```
 
-`JOB` may be a complete ID or any unique prefix. Removing a job hides it but
-keeps its run history. `run --yes` is required when the last outcome was
-interrupted because ATX cannot know whether that command took effect.
+`JOB` may be a complete ID or any unique prefix. Removing a job also deletes
+its completed-run history unless `--keep-history` is given. `run --yes` is
+required when the last outcome was interrupted because ATX cannot know
+whether that command took effect.
 
 `atx output RUN` prints the stdout and stderr captured for one run, labeling
 any stream shortened at the capture cap (10 MiB by default). A job ID resolves
