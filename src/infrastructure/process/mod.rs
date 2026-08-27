@@ -51,8 +51,16 @@ impl NativeProcessInspector {
         expected: &ProcessIdentitySnapshot,
     ) -> Result<IdentityStatus, ProcessError> {
         validate_snapshot(expected)?;
-        let current = self.inspect(expected.pid)?;
-        Ok(classify_identity(expected, current.as_ref()))
+        #[cfg(target_os = "linux")]
+        {
+            let current = inspect_linux_process(expected.pid, &self.boot_identity)?;
+            Ok(classify_linux_process(expected, current.as_ref()))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let current = self.inspect(expected.pid)?;
+            Ok(classify_identity(expected, current.as_ref()))
+        }
     }
 }
 
@@ -99,11 +107,37 @@ fn inspect_platform(
     pid: u32,
     boot_identity: &str,
 ) -> Result<Option<ProcessIdentitySnapshot>, ProcessError> {
+    inspect_linux_process(pid, boot_identity).map(|process| process.map(|process| process.identity))
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxProcess {
+    identity: ProcessIdentitySnapshot,
+    state: u8,
+}
+
+#[cfg(target_os = "linux")]
+fn inspect_linux_process(
+    pid: u32,
+    boot_identity: &str,
+) -> Result<Option<LinuxProcess>, ProcessError> {
     let path = format!("/proc/{pid}/stat");
     match std::fs::read_to_string(path) {
-        Ok(stat) => parse_linux_stat(&stat, boot_identity).map(Some),
+        Ok(stat) => parse_linux_process(&stat, boot_identity).map(Some),
         Err(error) if proc_entry_vanished(&error) => Ok(None),
         Err(error) => Err(map_inspection_error(error)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn classify_linux_process(
+    expected: &ProcessIdentitySnapshot,
+    current: Option<&LinuxProcess>,
+) -> IdentityStatus {
+    match current {
+        None => IdentityStatus::Dead,
+        Some(process) if matches!(process.state, b'Z' | b'X' | b'x') => IdentityStatus::Dead,
+        Some(process) => classify_identity(expected, Some(&process.identity)),
     }
 }
 
@@ -126,10 +160,7 @@ fn map_inspection_error(error: io::Error) -> ProcessError {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_stat(
-    stat: &str,
-    boot_identity: &str,
-) -> Result<ProcessIdentitySnapshot, ProcessError> {
+fn parse_linux_process(stat: &str, boot_identity: &str) -> Result<LinuxProcess, ProcessError> {
     let opening = stat.find('(').ok_or(ProcessError::Malformed)?;
     let closing = stat.rfind(')').ok_or(ProcessError::Malformed)?;
     if opening == 0 || closing <= opening {
@@ -139,14 +170,20 @@ fn parse_linux_stat(
         .trim()
         .parse::<u32>()
         .map_err(|_| ProcessError::Malformed)?;
-    let fields: Vec<&str> = stat[closing + 1..].split_whitespace().collect();
-    if fields.len() < 20 {
+    let mut fields = stat[closing + 1..].split_whitespace();
+    let state = fields.next().ok_or(ProcessError::Malformed)?.as_bytes();
+    if state.len() != 1 {
         return Err(ProcessError::Malformed);
     }
-    let process_group_id = fields[2]
+    let _parent_pid = fields.next().ok_or(ProcessError::Malformed)?;
+    let process_group_id = fields
+        .next()
+        .ok_or(ProcessError::Malformed)?
         .parse::<i32>()
         .map_err(|_| ProcessError::Malformed)?;
-    let start_token = fields[19]
+    let start_token = fields
+        .nth(16)
+        .ok_or(ProcessError::Malformed)?
         .parse::<u64>()
         .map_err(|_| ProcessError::Malformed)?;
     let snapshot = ProcessIdentitySnapshot {
@@ -156,7 +193,18 @@ fn parse_linux_stat(
         process_group_id,
     };
     validate_snapshot(&snapshot)?;
-    Ok(snapshot)
+    Ok(LinuxProcess {
+        identity: snapshot,
+        state: state[0],
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn parse_linux_stat(
+    stat: &str,
+    boot_identity: &str,
+) -> Result<ProcessIdentitySnapshot, ProcessError> {
+    parse_linux_process(stat, boot_identity).map(|process| process.identity)
 }
 
 #[cfg(target_os = "macos")]
@@ -311,13 +359,13 @@ mod tests {
     use crate::infrastructure::time::NativeClock;
 
     #[cfg(target_os = "linux")]
-    use super::parse_linux_stat;
-    #[cfg(target_os = "linux")]
     use super::proc_entry_vanished;
     use super::{
         IdentityStatus, NativeProcessInspector, ProcessError, RecoveryIdentityStatus,
         classify_identity, map_inspection_error, validate_snapshot,
     };
+    #[cfg(target_os = "linux")]
+    use super::{classify_linux_process, parse_linux_process, parse_linux_stat};
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -395,6 +443,16 @@ mod tests {
         assert_eq!(parsed.process_group_id, 77);
         assert_eq!(parsed.start_token, 4242);
         assert!(parse_linux_stat("broken", "boot-a").is_err());
+
+        let zombie = parse_linux_process(
+            "123 (odd ) name) Z 1 77 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242",
+            "boot-a",
+        )
+        .expect("zombie");
+        assert_eq!(
+            classify_linux_process(&zombie.identity, Some(&zombie)),
+            IdentityStatus::Dead
+        );
     }
 
     #[test]
