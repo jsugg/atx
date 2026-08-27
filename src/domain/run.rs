@@ -8,6 +8,7 @@ use thiserror::Error;
 use super::id::{JobId, RunId};
 use super::primitives::{Sequence, UtcTimestamp};
 use super::state::RunState;
+use super::transition::{Completion, TransitionActor, complete_run, run_transition};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ClaimToken([u8; 32]);
@@ -111,6 +112,7 @@ impl Run {
         self.job_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn sequence(&self) -> Sequence {
         self.sequence
     }
@@ -136,14 +138,18 @@ impl Run {
     }
 
     pub(crate) fn request_cancellation(mut self) -> Result<Self, RunError> {
-        match self.state {
-            RunState::Starting | RunState::Running => {
-                self.state = RunState::CancelRequested;
-                Ok(self)
-            }
-            RunState::CancelRequested => Ok(self),
-            _ => Err(RunError::InvalidState),
+        if self.state == RunState::CancelRequested {
+            return Ok(self);
         }
+        self.state = run_transition(
+            self.state,
+            RunState::CancelRequested,
+            TransitionActor::Cli,
+            "cancellation requested",
+        )
+        .map_err(|_| RunError::InvalidState)?
+        .to();
+        Ok(self)
     }
 
     pub(crate) fn mark_running(
@@ -154,9 +160,6 @@ impl Run {
         stdout_path: String,
         stderr_path: String,
     ) -> Result<Self, RunError> {
-        if self.state != RunState::Starting {
-            return Err(RunError::InvalidState);
-        }
         if started_at_utc < self.created_at_utc {
             return Err(RunError::StartBeforeCreation);
         }
@@ -164,8 +167,15 @@ impl Run {
         validate_identity(&command_identity)?;
         validate_log_path(&stdout_path)?;
         validate_log_path(&stderr_path)?;
+        self.state = run_transition(
+            self.state,
+            RunState::Running,
+            TransitionActor::Monitor,
+            "command started",
+        )
+        .map_err(|_| RunError::InvalidState)?
+        .to();
         self.started_at_utc = Some(started_at_utc);
-        self.state = RunState::Running;
         self.monitor_identity = Some(monitor_identity);
         self.command_identity = Some(command_identity);
         self.stdout_path = Some(stdout_path);
@@ -184,14 +194,8 @@ impl Run {
         if finished_at_utc < self.created_at_utc {
             return Err(RunError::FinishBeforeCreation);
         }
-        if self.state.is_terminal()
-            || (matches!(&outcome, RunOutcome::Cancelled(_))
-                && self.state != RunState::CancelRequested)
-        {
-            return Err(RunError::InvalidState);
-        }
-
-        self.state = outcome_state(&outcome);
+        self.state =
+            complete_run(self.state, completion(&outcome)).map_err(|_| RunError::InvalidState)?;
         self.finished_at_utc = Some(finished_at_utc);
         self.outcome = Some(outcome);
         Ok(self)
@@ -280,6 +284,16 @@ fn outcome_state(outcome: &RunOutcome) -> RunState {
     }
 }
 
+fn completion(outcome: &RunOutcome) -> Completion {
+    match outcome {
+        RunOutcome::Exit(code) => Completion::Exit(*code),
+        RunOutcome::Signal(signal) => Completion::Signal(*signal),
+        RunOutcome::Failure(_) => Completion::Failure,
+        RunOutcome::Interrupted(_) => Completion::Interrupted,
+        RunOutcome::Cancelled(_) => Completion::TerminatedByCancellation,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunSnapshot {
     pub(crate) id: RunId,
@@ -364,10 +378,17 @@ mod tests {
         );
         assert!(run.outcome().is_none());
 
+        assert!(matches!(
+            run.clone().with_outcome(timestamp, RunOutcome::Exit(0)),
+            Err(RunError::InvalidState)
+        ));
         let completed = run
-            .with_outcome(timestamp, RunOutcome::Exit(0))
-            .expect("first outcome is valid");
-        assert_eq!(completed.outcome(), Some(&RunOutcome::Exit(0)));
+            .with_outcome(timestamp, RunOutcome::Failure("spawn failed".to_owned()))
+            .expect("starting runs may record a spawn failure");
+        assert_eq!(
+            completed.outcome(),
+            Some(&RunOutcome::Failure("spawn failed".to_owned()))
+        );
         assert!(
             completed
                 .with_outcome(timestamp, RunOutcome::Signal(15))

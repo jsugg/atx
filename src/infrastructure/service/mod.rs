@@ -1,15 +1,17 @@
 //! Durable service adapters.
 
+#[cfg(any(target_os = "macos", test))]
 mod macos;
+#[cfg(any(target_os = "linux", test))]
 mod systemd;
 
 use std::path::{Path, PathBuf};
 
 use crate::application::{ServiceManager, ServiceManagerError, ServiceStatus};
 
-#[allow(unused_imports)]
+#[cfg(target_os = "macos")]
 pub(crate) use macos::LaunchdService;
-#[allow(unused_imports)]
+#[cfg(target_os = "linux")]
 pub(crate) use systemd::SystemdUserService;
 
 pub(crate) enum NativeServiceManager {

@@ -8,6 +8,29 @@ versioning.
 
 ### Added
 
+## [0.1.1] - 2026-08-26
+
+### Changed
+
+- Human-readable job and run output now uses local timestamps with a numeric
+  offset, clearer outcome text, and short messages for empty lists.
+- `-v` is a single verbose switch; repeated `-vv` is rejected instead of
+  implying additional undocumented verbosity levels.
+
+### Fixed
+
+- Run updates now use the same checked transition table as the rest of the
+  scheduler, including cancellation precedence.
+- Late cancellation no longer races against an unfinished history row in the
+  acceptance test.
+- `list`, `history`, and `ps` return an empty result on a fresh install instead
+  of reporting a missing database.
+- Invalid relative durations keep their duration-specific error messages.
+- Cancellation update conflicts return the documented state-conflict status,
+  and `show` no longer hides run-history storage errors.
+- Release archives now include checked SBOMs, checksums, and provenance, and
+  both protected release environments accept version tags.
+
 ## [0.1.0] - 2026-08-26
 
 ### Added

@@ -3,12 +3,12 @@
 mod cancel;
 mod spawn;
 
-#[allow(unused_imports)]
 pub(crate) use cancel::NativeGroupCanceller;
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use cancel::{CancellationResult, cancel_validated_group};
-#[allow(unused_imports)]
-pub(crate) use spawn::{NativeProcessRunner, SpawnedChild};
+pub(crate) use spawn::NativeProcessRunner;
+#[cfg(test)]
+pub(crate) use spawn::SpawnedChild;
 
 use std::io;
 
@@ -116,6 +116,7 @@ fn proc_entry_vanished(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn map_inspection_error(error: io::Error) -> ProcessError {
     if error.kind() == io::ErrorKind::PermissionDenied {
         ProcessError::PermissionDenied
@@ -294,6 +295,7 @@ pub(crate) enum ProcessError {
     Unsupported,
     #[error("process inspection is unavailable")]
     Unavailable,
+    #[cfg(any(target_os = "linux", test))]
     #[error("process inspection failed: {0}")]
     Io(io::Error),
 }

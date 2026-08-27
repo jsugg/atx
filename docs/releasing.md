@@ -1,6 +1,6 @@
 # Releasing
 
-There is no public release yet.
+There is no published release yet.
 
 Release work is deliberately split:
 
@@ -15,19 +15,19 @@ package file-list check, unpacked-package build, and
 
 ## Binary archives
 
-Tagging a commit with a `v*` tag runs the release workflow: it checks the tag
-against the crate version, builds macOS arm64 and Linux x86_64/aarch64 musl
-binaries, packs each into a reproducible `.tar.gz` (fixed mtime, root
-ownership, so rebuilding the same commit gives identical bytes), and attaches
-them to a draft GitHub release together with a `SHA256SUMS` file and a
-CycloneDX SBOM for every archive. Publishing the draft is a manual click.
+Tagging a commit with a `v*` tag runs the release workflow. It checks the tag
+against the crate version and builds six binaries: Apple Silicon and Intel
+macOS, plus x86_64 and arm64 Linux with GNU libc and musl. Each binary goes into
+a reproducible `.tar.gz` with fixed timestamps and ownership. The workflow adds
+a `SHA256SUMS` file and a CycloneDX SBOM for every archive, then creates a draft
+GitHub release. Publishing the draft is a manual click.
 
-The workflow also signs build-provenance attestations for each archive and
-SBOM, so anyone can check that a given file really came from this
-repository's release workflow:
+The workflow also signs build attestations for each archive, SBOM, and the
+checksum file, so anyone can check that a file came from this repository's
+release workflow:
 
 ```console
-gh attestation verify atx-v0.1.0-x86_64-unknown-linux-musl.tar.gz -R jsugg/atx
+gh attestation verify atx-v0.1.1-x86_64-unknown-linux-musl.tar.gz -R jsugg/atx
 ```
 
 And check the checksums against the manifest:
@@ -37,8 +37,9 @@ sha256sum --check --ignore-missing SHA256SUMS
 ```
 
 You can rehearse without cutting a tag: run the workflow by hand from the
-Actions tab and give it the tag name you have in mind. It builds everything,
-attests it, verifies the attestations, but publishes nothing.
+Actions tab and give it an existing tag. It builds and checks everything,
+including the SBOMs and checksum file, but skips attestations and creates no
+release.
 
 ## Publishing the crate
 
@@ -102,6 +103,13 @@ Repository protection worth knowing about: `main` is covered by the
 `protect-main` ruleset (PRs required, no force-push, no deletion), and
 the `release` and `crates-io` GitHub environments gate anything that
 touches published artifacts or the registry.
+
+## Before publishing the draft
+
+The archive jobs show that the archives built and verified. Before publishing a
+draft, also check that the tagged commit's required checks passed, inspect the
+assets and `SHA256SUMS`, and verify the attestations. Archive jobs alone are not
+enough.
 
 ## Rolling back
 

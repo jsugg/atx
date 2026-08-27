@@ -517,9 +517,13 @@ fn s15_late_cancellation_is_idempotent_never_signals() {
     let job_id = first["job_id"].as_str().expect("id").to_owned();
     wait_for(
         || {
-            history_rows(&state)
-                .iter()
-                .any(|r| r["job_id"] == job_id.as_str())
+            history_rows(&state).iter().any(|r| {
+                r["job_id"] == job_id.as_str()
+                    && matches!(
+                        r["state"].as_str(),
+                        Some("succeeded" | "failed" | "cancelled" | "interrupted")
+                    )
+            })
         },
         "completion",
     );

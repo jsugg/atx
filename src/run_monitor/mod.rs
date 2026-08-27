@@ -6,12 +6,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-#[allow(dead_code)]
 mod capture;
-#[allow(dead_code)]
 mod lifecycle;
 
-#[allow(unused_imports)]
 pub(crate) use lifecycle::RunMonitor;
 
 use crate::application::{ElapsedClock, SupervisorAcknowledger, WallClock};

@@ -8,3 +8,5 @@ fuzz/coverage/
 .local/
 mutants.out/
 .DS_Store
+.smoke-*
+.cargo/

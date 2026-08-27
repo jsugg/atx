@@ -1,6 +1,5 @@
 {
   "success": 0,
-  "negative_outcome": 1,
   "usage": 2,
   "not_found": 3,
   "conflict": 4,

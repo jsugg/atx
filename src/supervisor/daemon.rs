@@ -668,7 +668,7 @@ mod tests {
         .expect("write wake");
         match receiver.recv().expect("event") {
             SupervisorEvent::Schedule { job_id, .. } => assert_eq!(job_id, job.id()),
-            _ => panic!("unexpected event variant"),
+            SupervisorEvent::Shutdown => panic!("unexpected shutdown event"),
         }
         let ack = read_frame(&mut client).expect("ack");
         assert_eq!(

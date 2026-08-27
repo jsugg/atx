@@ -200,8 +200,6 @@ pub(crate) enum IpcError {
     SocketSubstitution,
     #[error("runtime lock is malformed")]
     MalformedLock,
-    #[error("IPC frame is empty or too large")]
-    FrameTooLarge,
     #[error("supervisor returned the wrong acknowledgement")]
     InvalidAcknowledgement,
     #[error("supervisor rejected the wake: {0}")]

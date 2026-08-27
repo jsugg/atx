@@ -1382,7 +1382,7 @@ mod tests {
                 claimed[1].id(),
                 claimed[1].claim_token(),
                 UtcTimestamp::from_second(1_003).expect("finished"),
-                RunOutcome::Exit(0),
+                RunOutcome::Exit(1),
             ),
             Err(StoreError::Conflict)
         ));

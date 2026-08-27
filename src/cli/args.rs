@@ -41,9 +41,9 @@ pub(crate) struct GlobalArgs {
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     pub(crate) quiet: bool,
 
-    /// Print extra diagnostics. Repeat for more detail.
-    #[arg(short, long, global = true, action = ArgAction::Count)]
-    pub(crate) verbose: u8,
+    /// Print extra diagnostics.
+    #[arg(short, long, global = true, action = ArgAction::SetTrue)]
+    pub(crate) verbose: bool,
 
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
@@ -376,7 +376,6 @@ EXAMPLES:
 
 EXIT STATUS:
   0    success
-  1    operation finished with a negative job outcome
   2    invalid command line
   3    missing or ambiguous job ID
   4    job state conflict
@@ -503,6 +502,7 @@ fn normalize_management_order(args: &mut Vec<OsString>) {
     if args.len() < 3 || args.get(1).is_some_and(|value| is_management_name(value)) {
         return;
     }
+    let command = RawCli::command();
     let mut skip_value = false;
     for index in 1..args.len() {
         if skip_value {
@@ -513,7 +513,7 @@ fn normalize_management_order(args: &mut Vec<OsString>) {
         if value == "--" {
             return;
         }
-        if option_takes_value(&value) {
+        if option_takes_value(&command, &value) {
             skip_value = !value.contains('=');
             continue;
         }
@@ -550,22 +550,14 @@ fn is_management_name(value: &std::ffi::OsStr) -> bool {
     )
 }
 
-fn option_takes_value(value: &str) -> bool {
+fn option_takes_value(command: &clap::Command, value: &str) -> bool {
     let name = value.split_once('=').map_or(value, |(name, _)| name);
-    matches!(
-        name,
-        "--color"
-            | "--state-dir"
-            | "--tz"
-            | "--dst"
-            | "--cwd"
-            | "--name"
-            | "--description"
-            | "--env"
-            | "--env-file"
-            | "--missed"
-            | "--every"
-    )
+    let Some(long) = name.strip_prefix("--") else {
+        return false;
+    };
+    command
+        .get_arguments()
+        .any(|argument| argument.get_long() == Some(long) && argument.get_action().takes_values())
 }
 
 #[cfg(test)]
@@ -624,6 +616,7 @@ mod tests {
                 "echo",
             ],
             vec!["atx", "-q", "-v", "30s", "--", "echo"],
+            vec!["atx", "-vv", "30s", "--", "echo"],
         ] {
             assert!(parse_from(args.into_iter().map(Into::into)).is_err());
         }
@@ -641,6 +634,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn option_values_named_like_commands_are_not_reordered() {
+        let parsed = parse_from(
+            [
+                "atx",
+                "--name",
+                "list",
+                "--description=show",
+                "30s",
+                "--",
+                "true",
+            ]
+            .map(Into::into),
+        )
+        .expect("schedule with reserved words as values");
+        let ParsedCli::Schedule(schedule) = parsed else {
+            unreachable!("schedule expected");
+        };
+        assert_eq!(schedule.options.name.as_deref(), Some("list"));
+        assert_eq!(schedule.options.description.as_deref(), Some("show"));
     }
 }
 

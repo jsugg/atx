@@ -19,8 +19,6 @@ pub(crate) enum SupervisorEvent {
         job_id: JobId,
         deadline: ElapsedInstant,
     },
-    Cancel(JobId),
-    RunFinished(JobId),
     Shutdown,
 }
 
@@ -48,9 +46,6 @@ pub(crate) fn run_loop<Now, Due>(
         };
         match event {
             Ok(SupervisorEvent::Schedule { job_id, deadline }) => heap.upsert(job_id, deadline),
-            Ok(SupervisorEvent::Cancel(job_id) | SupervisorEvent::RunFinished(job_id)) => {
-                heap.remove(job_id);
-            }
             Ok(SupervisorEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if empty => break,
             Err(RecvTimeoutError::Timeout) => {}

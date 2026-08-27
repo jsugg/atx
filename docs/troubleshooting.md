@@ -45,6 +45,22 @@ Keep a suspect database for diagnosis. Deleting it destroys useful recovery
 evidence and history. A stale supervisor warning normally clears on the next
 submission, which replaces stale runtime files after validating their owner.
 
+For a durable service, check `launchd` or systemd as well as `atx`:
+
+```console
+# Linux
+systemctl --user status atx.service
+journalctl --user -u atx.service --since today
+
+# macOS
+launchctl print "gui/$(id -u)/io.github.jsugg.atx"
+```
+
+The installed files are `~/.config/systemd/user/atx.service` on Linux and
+`~/Library/LaunchAgents/io.github.jsugg.atx.plist` on macOS. Use
+`atx service status` first when possible: it uses the active state directory and
+also reports whether the service manager is available.
+
 ## Shell jobs
 
 Direct mode is safer and is the default. With `--shell`, quoting, expansion,

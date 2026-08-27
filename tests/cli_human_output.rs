@@ -107,7 +107,7 @@ fn lifecycle_commands_render_human_envelopes() {
 
     let processes = tools(root.path()).args(["ps"]).output().expect("ps");
     let process_lines = String::from_utf8_lossy(&processes.stdout);
-    assert!(process_lines.starts_with("JOB\tRUN\tROLE\tPID\tPGID\tSTATE"));
+    assert_eq!(process_lines.trim(), "No live ATX processes.");
 
     let printed = tools(root.path())
         .args(["output", &run_id])
@@ -170,14 +170,24 @@ fn doctor_service_version_and_completions_render() {
 fn human_errors_report_exit_codes_on_stderr() {
     let root = tempdir().expect("root");
 
-    // No database yet: management commands fail with not_found (3).
+    // No database yet: collection reads are empty successes in every mode.
     let missing = tools(root.path())
         .arg("list")
         .output()
         .expect("list without state");
-    assert_eq!(missing.status.code(), Some(3));
-    let message = String::from_utf8_lossy(&missing.stderr);
-    assert!(message.contains("no state database"), "{message}");
+    assert!(missing.status.success(), "{missing:?}");
+    assert_eq!(String::from_utf8_lossy(&missing.stdout).trim(), "No jobs.");
+    assert!(missing.stderr.is_empty(), "{missing:?}");
+    for command in ["list", "history", "ps"] {
+        let empty = tools(root.path())
+            .args(["--json", command])
+            .output()
+            .expect("empty JSON read");
+        assert!(empty.status.success(), "{command}: {empty:?}");
+        let value: serde_json::Value =
+            serde_json::from_slice(&empty.stdout).expect("JSON empty result");
+        assert_eq!(value["data"], serde_json::json!([]), "{command}");
+    }
 
     // With a database present, an unknown prefix is still not_found.
     let submitted = tools(root.path())

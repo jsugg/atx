@@ -16,9 +16,13 @@ permissions:
 
 jobs:
   analyze:
-    name: analyze
-    runs-on: ubuntu-24.04
+    name: analyze (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
     permissions:
       contents: read
       security-events: write
@@ -30,4 +34,4 @@ jobs:
           build-mode: none
       - uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
-          category: "/language:rust"
+          category: "/language:rust-${{ matrix.os }}"

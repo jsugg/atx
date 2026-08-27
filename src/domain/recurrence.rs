@@ -43,6 +43,7 @@ pub(crate) struct RelativeDeadline {
 }
 
 impl RelativeDeadline {
+    #[cfg(test)]
     pub(crate) const fn elapsed_due(self) -> ElapsedInstant {
         self.elapsed_due
     }
@@ -51,6 +52,7 @@ impl RelativeDeadline {
         self.persisted_due_utc
     }
 
+    #[cfg(test)]
     pub(crate) const fn is_due(self, now: ElapsedInstant) -> bool {
         now.0 >= self.elapsed_due.0
     }
@@ -74,6 +76,7 @@ pub(crate) fn relative_deadline(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn next_fixed_rate(
     anchor: ElapsedInstant,
     now: ElapsedInstant,

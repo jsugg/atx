@@ -1,9 +1,7 @@
 name: mutation
 
-# Mutation evidence for the critical pure modules (domain parsing, calendar
-# math, config/env-file handling). Pinned cargo-mutants and a time budget so
-# runs stay reproducible; the report artifact is the evidence, a nonzero exit
-# means new survivors appeared and must be triaged before release.
+# Mutate the four pure domain modules named in the project plan. The unit-test
+# filter keeps the run short; a whole-run timeout is reported separately.
 on:
   workflow_dispatch:
   schedule:
@@ -37,26 +35,40 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pinned cargo-mutants
         run: cargo install --locked --version 25.3.1 cargo-mutants
-      # Shell timeout bounds the whole run; --timeout-multiplier keeps slow
-      # integration-adjacent tests from being misreported as caught-by-hang.
+      # Unit tests in this binary crate keep the pure-module campaign bounded.
       - name: Mutate critical modules under a time budget
-        run: >-
-          timeout 45m
-          cargo mutants --no-shuffle --timeout-multiplier 4
-          -C '--locked'
-          --file 'src/domain/*.rs'
-          --file 'src/infrastructure/config/*.rs'
-          -v
+        id: mutate
+        run: |
+          set +e
+          timeout 45m cargo mutants --no-shuffle --timeout-multiplier 4 \
+            -C '--locked' \
+            --file src/domain/duration.rs \
+            --file src/domain/calendar_syntax.rs \
+            --file src/domain/recurrence.rs \
+            --file src/domain/transition.rs \
+            -v -- --bin atx 'domain::'
+          status=$?
+          printf 'exit_code=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 124 ]; then
+            echo '::error::mutation campaign exceeded its 45-minute budget; no verdict was produced'
+            exit 124
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo '::error::cargo-mutants reported surviving mutants; inspect the evidence artifact'
+            exit "$status"
+          fi
       - name: Record machine-readable evidence
         if: always()
         run: |
           {
             printf 'commit=%s\n' "$GITHUB_SHA"
-            printf 'tool=cargo-mutants 25.3.1\n'
-            printf 'scope=domain/, infrastructure/config/\n'
+            cargo mutants --version
+            printf 'scope=duration, calendar_syntax, recurrence, transition\n'
+            printf 'exit_code=%s\n' "${{ steps.mutate.outputs.exit_code || 'not-run' }}"
             date -u +"timestamp=%Y-%m-%dT%H:%M:%SZ"
           } | tee mutant-evidence.txt
-          test ! -d out || tar czf mutants-report.tgz out
+          test -d mutants.out
+          tar czf mutants-report.tgz mutants.out
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

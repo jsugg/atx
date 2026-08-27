@@ -1,23 +1,9 @@
-name: tests
+name: platform
 
 on:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/platform.yml"
   pull_request:
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/platform.yml"
   schedule:
     # Nightly, after the main CI window.
     - cron: "3 4 * * *"
@@ -39,6 +25,16 @@ defaults:
     shell: bash
 
 jobs:
+  linux-root:
+    name: linux-x86_64-root
+    runs-on: ubuntu-24.04
+    container: rust:1.97-bookworm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Full test suite as root
+        run: cargo test --all-targets --all-features --locked
+
   native:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

@@ -19,6 +19,7 @@ pub(super) const JOB_COLUMNS: &str = "
     runtime_tier, schedule_json, missed_policy, execution_json, next_due_utc,
     timezone_database_version, owner_uid
 ";
+#[cfg(test)]
 const MAX_PAGE_SIZE: usize = 100;
 
 pub(crate) struct JobStore {
@@ -30,6 +31,7 @@ impl JobStore {
         Self { database }
     }
 
+    #[cfg(test)]
     pub(crate) const fn database(&self) -> &Database {
         &self.database
     }
@@ -79,6 +81,7 @@ impl JobStore {
         load_job(self.database.connection(), id)
     }
 
+    #[cfg(test)]
     pub(crate) fn list(&self, after: Option<JobId>, limit: usize) -> Result<Vec<Job>, StoreError> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             return Err(StoreError::InvalidPageSize);
@@ -100,6 +103,7 @@ impl JobStore {
         rows.map(|row| row.map_err(map_read_error)).collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn delete(
         &mut self,
         id: JobId,

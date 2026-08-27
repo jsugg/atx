@@ -20,6 +20,7 @@ pub(crate) struct SystemdUserService<R = NativeCommandRunner> {
 }
 
 impl SystemdUserService {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(
         executable: PathBuf,
         state_directory: PathBuf,

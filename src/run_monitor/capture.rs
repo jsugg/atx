@@ -26,6 +26,7 @@ impl CaptureBudget {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn consume(&mut self, bytes: usize) -> (usize, usize) {
         let written = self.remaining().min(bytes);
         let discarded = bytes.saturating_sub(written);
@@ -53,6 +54,7 @@ impl CaptureBudget {
         self.discarded
     }
 
+    #[cfg(test)]
     pub(crate) const fn truncated(self) -> bool {
         self.discarded > 0
     }
@@ -68,10 +70,12 @@ pub(crate) struct StreamCaptureSummary {
 }
 
 impl StreamCaptureSummary {
+    #[cfg(test)]
     pub(crate) const fn written(self) -> usize {
         self.written
     }
 
+    #[cfg(test)]
     pub(crate) const fn discarded(self) -> usize {
         self.discarded
     }
@@ -82,14 +86,16 @@ impl StreamCaptureSummary {
 }
 
 pub(crate) struct CapturedStream<W> {
-    writer: W,
+    _writer: W,
     summary: StreamCaptureSummary,
     error: Option<io::Error>,
 }
 
 impl<W> CapturedStream<W> {
+    #[cfg(test)]
+    #[allow(clippy::used_underscore_binding)]
     pub(crate) const fn writer(&self) -> &W {
-        &self.writer
+        &self._writer
     }
 
     pub(crate) const fn summary(&self) -> StreamCaptureSummary {
@@ -174,7 +180,7 @@ fn drain_stream<R: Read, W: Write>(
         }
     }
     CapturedStream {
-        writer,
+        _writer: writer,
         summary: StreamCaptureSummary {
             written: budget.written(),
             discarded: budget.discarded(),

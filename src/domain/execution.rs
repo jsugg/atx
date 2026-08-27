@@ -59,6 +59,7 @@ impl Serialize for SecretString {
 pub(crate) struct Environment(BTreeMap<String, SecretString>);
 
 impl Environment {
+    #[cfg(test)]
     pub(crate) const fn empty() -> Self {
         Self(BTreeMap::new())
     }
@@ -260,13 +261,13 @@ impl ExecutionSpec {
         }
         let environment =
             Environment::from_pairs(stored.environment).map_err(ExecutionStorageError::Invalid)?;
-        let mut execution = Self::new(
-            stored.mode,
-            stored.argv,
-            stored.working_directory.to_string_lossy().into_owned(),
-            environment,
-        )
-        .map_err(ExecutionStorageError::Invalid)?;
+        let working_directory = stored
+            .working_directory
+            .into_os_string()
+            .into_string()
+            .map_err(|_| ExecutionStorageError::InvalidWorkingDirectoryEncoding)?;
+        let mut execution = Self::new(stored.mode, stored.argv, working_directory, environment)
+            .map_err(ExecutionStorageError::Invalid)?;
         match (stored.mode, stored.shell_path) {
             (ExecutionMode::Direct, None) => {}
             (ExecutionMode::Shell, Some(path)) if path.is_absolute() => {
@@ -333,6 +334,8 @@ pub(crate) enum ExecutionStorageError {
     InvalidShell,
     #[error("stored terminal device path is invalid")]
     InvalidNotifyTty,
+    #[error("stored working directory is not valid UTF-8")]
+    InvalidWorkingDirectoryEncoding,
 }
 
 #[cfg(test)]

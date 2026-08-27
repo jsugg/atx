@@ -16,8 +16,21 @@ Session mode survives terminal closure but not necessarily logout or reboot.
 Durable mode asks the user's service manager to restart the supervisor. It
 never silently falls back to session mode.
 
+After its database transaction commits, a job is stored, but the supervisor
+still needs to be woken. If ATX saves a job and cannot reach the supervisor, it
+reports the saved job and exits 11. Inspect it with `atx show JOB` or repair the
+service; do not assume the command ran.
+
 One-shot jobs missed while no supervisor is available are held by default.
 Recurring jobs skip old occurrences and continue at the next anchored time.
+
+## Output retention
+
+Each run captures stdout and stderr separately in private files. The default
+limit is 10 MiB per stream. When a stream reaches its cap, ATX keeps the head,
+discards the rest, and marks the stream as truncated in `atx output` and JSON.
+This keeps one stream from filling the disk; it does not make the output safe
+to share.
 
 ## Resource budgets
 

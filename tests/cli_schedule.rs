@@ -4,6 +4,11 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
+
 use jiff::{SignedDuration, Timestamp, tz::TimeZone};
 use tempfile::tempdir;
 
@@ -43,6 +48,50 @@ fn version_and_usage_have_stable_exit_codes() {
         .as_i64()
         .and_then(|code| i32::try_from(code).ok());
     assert_eq!(invalid.status.code(), expected_usage);
+}
+
+#[test]
+fn malformed_relative_durations_keep_duration_diagnostics() {
+    let cases = [
+        ("5x", "expected one of h, m, or s"),
+        ("1 h", "expected one of h, m, or s"),
+        ("30s1m", "duration units must be unique and ordered h, m, s"),
+        ("1m1m", "duration units must be unique and ordered h, m, s"),
+        ("18446744073709551616s", "duration arithmetic overflowed"),
+    ];
+    for (input, expected) in cases {
+        let output = atx()
+            .args(["--dry-run", input, "--", "true"])
+            .output()
+            .expect("run malformed duration");
+        assert_eq!(output.status.code(), Some(2), "{input}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{input}: {stderr}");
+        assert!(!stderr.contains("YYYY-MM-DD"), "{input}: {stderr}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn non_utf8_working_directory_is_rejected_without_lossy_storage() {
+    let root = tempdir().expect("root");
+    let directory = root
+        .path()
+        .join(OsString::from_vec(b"working-\xff".to_vec()));
+    fs::create_dir(&directory).expect("non-UTF-8 directory");
+    let output = atx()
+        .arg("--dry-run")
+        .arg("--cwd")
+        .arg(&directory)
+        .args(["30s", "--", "true"])
+        .output()
+        .expect("run with non-UTF-8 cwd");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostic");
+    assert!(
+        stderr.contains("working directory must be valid UTF-8"),
+        "{stderr}"
+    );
 }
 
 #[test]

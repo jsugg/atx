@@ -109,6 +109,7 @@ impl UtcTimestamp {
         Self(timestamp)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_second(second: i64) -> Result<Self, PrimitiveError> {
         Timestamp::new(second, 0)
             .map(Self)
