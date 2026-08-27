@@ -250,7 +250,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PathEnvironment, Platform, create_new_private_file, ensure_private_dir,
+        PathEnvironment, PathError, Platform, create_new_private_file, ensure_private_dir,
         open_or_create_private_append_log, open_private_file, resolve_paths,
         validate_private_dir_for_uid,
     };
@@ -513,10 +513,6 @@ mod tests {
         // The parent of the target does not exist, so creation fails for a
         // reason other than AlreadyExists and must not be swallowed.
         let nested = root.path().join("missing").join("leaf");
-        let error = ensure_private_dir(&nested).expect_err("missing parent");
-        assert!(
-            error.to_string().contains("filesystem operation failed"),
-            "{error}"
-        );
+        assert!(matches!(ensure_private_dir(&nested), Err(PathError::Io(_))));
     }
 }

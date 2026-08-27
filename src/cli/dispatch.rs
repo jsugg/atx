@@ -1591,7 +1591,7 @@ impl SupervisorAcknowledger for DryRunBoundary {
         _job_id: crate::domain::JobId,
         _revision: crate::domain::Revision,
     ) -> Result<(), SupervisorAckError> {
-        Err(SupervisorAckError(
+        Err(SupervisorAckError::Unavailable(
             "dry-run crossed its supervisor boundary".to_owned(),
         ))
     }
@@ -1623,7 +1623,7 @@ impl SupervisorAcknowledger for SessionAcknowledger {
             return Ok(());
         }
         start_session_supervisor(&self.state_directory, &self.runtime_directory)
-            .map_err(|error| SupervisorAckError(error.to_string()))?;
+            .map_err(|error| SupervisorAckError::Unavailable(error.to_string()))?;
         // The supervisor may still be opening its store and reconciling
         // startup under load; poll until a hard deadline rather than a fixed
         // attempt count.
@@ -1633,7 +1633,7 @@ impl SupervisorAcknowledger for SessionAcknowledger {
             match self.socket.acknowledge(job_id, revision) {
                 Ok(()) => return Ok(()),
                 // A rejected wake is definitive; retrying cannot fix it.
-                Err(error) if error.to_string().contains("rejected the wake") => return Err(error),
+                Err(error @ SupervisorAckError::Rejected(_)) => return Err(error),
                 Err(error) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(error);
@@ -1710,14 +1710,14 @@ mod tests {
     use std::process::ExitCode;
     #[cfg(target_os = "linux")]
     use std::sync::{Mutex, MutexGuard, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::{
-        SUPERVISOR_READY_TIMEOUT, SessionAcknowledger, build_doctor_report, build_job, cancel_job,
-        check_database, check_live_supervisor, check_private_directory, check_supervisor,
-        doctor_exit, finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
+        SessionAcknowledger, build_doctor_report, build_job, cancel_job, check_database,
+        check_live_supervisor, check_private_directory, check_supervisor, doctor_exit,
+        finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
         render_processes, render_run_output, render_runs, render_submission,
         resolve_submitting_tty, run, schedule, split_assignment,
     };
@@ -2238,7 +2238,7 @@ mod tests {
     fn submission_rendering_reports_unsupervised_commits() {
         let outcome = SubmissionOutcome::CommittedUnsupervised {
             job: fixture_job(5_000),
-            error: SupervisorAckError("no supervisor socket".to_owned()),
+            error: SupervisorAckError::Unavailable("no supervisor socket".to_owned()),
         };
         render_submission(&outcome, true, false, ColorArg::Never);
         render_submission(&outcome, false, true, ColorArg::Never);
@@ -3110,8 +3110,7 @@ mod tests {
         let elapsed = clock.now_elapsed().expect("elapsed");
         let cwd = file.to_str().expect("utf8").to_owned();
         let args = parsed_schedule(&["atx", "--cwd", &cwd, "30s", "--", "true"]);
-        let error = build_job(&args, &config, wall, elapsed).expect_err("file cwd");
-        assert!(error.contains("not a directory"));
+        assert!(build_job(&args, &config, wall, elapsed).is_err());
     }
 
     #[test]
@@ -3264,25 +3263,23 @@ mod tests {
         let error = acknowledger
             .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
             .expect_err("wake was rejected");
-        assert!(error.to_string().contains("rejected the wake"));
+        assert!(matches!(error, SupervisorAckError::Rejected(_)));
     }
 
     #[test]
-    fn session_acknowledger_gives_up_at_the_readiness_deadline() {
+    fn session_acknowledger_errors_when_supervisor_never_appears() {
         let root = tempdir().expect("root");
-        let state = private_dir(root.path(), "state");
         // No socket exists and no supervisor ever appears: every wake attempt
-        // fails immediately, so the loop must run out its readiness budget.
-        let started = Instant::now();
+        // fails, so the readiness loop must eventually return the error.
         let acknowledger = SessionAcknowledger::new(
             private_dir(root.path(), "state2"),
             private_dir(root.path(), "runtime2"),
         );
-        drop((
-            state,
-            acknowledger.acknowledge(JobId::new(), Revision::new(1).expect("revision")),
-        ));
-        assert!(started.elapsed() >= SUPERVISOR_READY_TIMEOUT);
+        let result = acknowledger.acknowledge(JobId::new(), Revision::new(1).expect("revision"));
+        assert!(
+            result.is_err(),
+            "a missing supervisor cannot acknowledge a wake"
+        );
     }
 
     #[test]

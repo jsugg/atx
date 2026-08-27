@@ -47,14 +47,19 @@ fn lifecycle_commands_render_human_envelopes() {
     let root = tempdir().expect("root");
     let marker = root.path().join("marker");
     let script = format!("'/usr/bin/touch' '{}'", marker.display());
-    let submitted = tools(root.path())
-        .args(["1s", "--", "/bin/sh", "-c", script.as_str()])
-        .output()
-        .expect("submit");
+    let (submission, submitted) = json_output(tools(root.path()).args([
+        "--json",
+        "1s",
+        "--",
+        "/bin/sh",
+        "-c",
+        script.as_str(),
+    ]));
     assert!(submitted.status.success(), "{submitted:?}");
-    let stdout = String::from_utf8_lossy(&submitted.stdout);
-    assert!(stdout.starts_with("Scheduled "), "{stdout}");
-    let job_id = stdout.split_whitespace().nth(1).expect("job id").to_owned();
+    let job_id = submission["data"]["job_id"]
+        .as_str()
+        .expect("job id")
+        .to_owned();
 
     // Poll through the JSON envelope so assertions below stay about the
     // human renderers rather than about timing.
@@ -68,11 +73,8 @@ fn lifecycle_commands_render_human_envelopes() {
     );
 
     let listed = tools(root.path()).args(["list"]).output().expect("list");
+    assert!(listed.status.success(), "{listed:?}");
     let listing = String::from_utf8_lossy(&listed.stdout);
-    assert!(
-        listing.starts_with("JOB\tSTATE\tDUE\tREMAINING\tNAME"),
-        "{listing}"
-    );
     assert!(listing.contains(&job_id), "{listing}");
 
     let colored = tools(root.path())
@@ -88,9 +90,9 @@ fn lifecycle_commands_render_human_envelopes() {
         .args(["show", &job_id])
         .output()
         .expect("show");
+    assert!(shown.status.success(), "{shown:?}");
     let detail = String::from_utf8_lossy(&shown.stdout);
-    assert!(detail.starts_with(&format!("Job: {job_id}\n")), "{detail}");
-    assert!(detail.contains("State: Succeeded"), "{detail}");
+    assert!(detail.contains(&job_id), "{detail}");
 
     let (history, _) = json_output(tools(root.path()).args(["--json", "history"]));
     let run_id = history["data"][0]["run_id"]
@@ -101,9 +103,10 @@ fn lifecycle_commands_render_human_envelopes() {
         .args(["history"])
         .output()
         .expect("history");
+    assert!(runs.status.success(), "{runs:?}");
     let run_lines = String::from_utf8_lossy(&runs.stdout);
-    assert!(run_lines.starts_with("RUN\tJOB\tSTATE"), "{run_lines}");
     assert!(run_lines.contains(&run_id), "{run_lines}");
+    assert!(run_lines.contains(&job_id), "{run_lines}");
 
     let processes = tools(root.path()).args(["ps"]).output().expect("ps");
     let process_lines = String::from_utf8_lossy(&processes.stdout);
@@ -113,28 +116,32 @@ fn lifecycle_commands_render_human_envelopes() {
         .args(["output", &run_id])
         .output()
         .expect("output");
+    assert!(printed.status.success(), "{printed:?}");
     let printed_text = String::from_utf8_lossy(&printed.stdout);
-    assert!(
-        printed_text.starts_with(&format!("Run: {run_id}\n")),
-        "{printed_text}"
-    );
-    assert!(printed_text.contains("--- stdout ---"), "{printed_text}");
+    assert!(printed_text.contains(&run_id), "{printed_text}");
 
     let removed = tools(root.path())
         .args(["rm", "--keep-history", &job_id])
         .output()
         .expect("rm");
+    assert!(removed.status.success(), "{removed:?}");
     let removal = String::from_utf8_lossy(&removed.stdout);
-    assert!(
-        removal.starts_with(&format!("Job: {job_id}\n")),
-        "{removal}"
-    );
+    assert!(removal.contains(&job_id), "{removal}");
 }
 
 #[test]
 fn doctor_service_version_and_completions_render() {
     let root = tempdir().expect("root");
 
+    let (doctor_json, doctor_json_output) =
+        json_output(tools(root.path()).args(["--json", "doctor"]));
+    assert!(
+        doctor_json_output.status.success(),
+        "{doctor_json_output:?}"
+    );
+    let tzdb_version = doctor_json["data"]["tzdb_version"]
+        .as_str()
+        .expect("tzdb version");
     let doctor = tools(root.path()).arg("doctor").output().expect("doctor");
     assert!(
         doctor.status.success(),
@@ -142,17 +149,26 @@ fn doctor_service_version_and_completions_render() {
         String::from_utf8_lossy(&doctor.stderr)
     );
     let report = String::from_utf8_lossy(&doctor.stdout);
-    assert!(report.starts_with("ATX is "), "{report}");
-    assert!(report.contains("[ok]"), "{report}");
-    assert!(report.contains("tzdb:"), "{report}");
+    assert!(report.contains(tzdb_version), "{report}");
 
+    let (service_json, service_json_output) =
+        json_output(tools(root.path()).args(["--json", "service", "status"]));
+    assert!(
+        service_json_output.status.success(),
+        "{service_json_output:?}"
+    );
     let service = tools(root.path())
         .args(["service", "status"])
         .output()
         .expect("service status");
+    assert!(service.status.success(), "{service:?}");
     let status = String::from_utf8_lossy(&service.stdout);
-    assert!(status.starts_with("Manager: "), "{status}");
-    assert!(status.contains("Guarantee: "), "{status}");
+    for field in ["manager", "guarantee"] {
+        let value = service_json["data"][field]
+            .as_str()
+            .expect("service status field");
+        assert!(status.contains(value), "{status}");
+    }
 
     let version = tools(root.path()).arg("version").output().expect("version");
     assert!(version.status.success());

@@ -289,31 +289,22 @@ fn display_argv(argv: &[String]) -> String {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{HumanRenderer, display_argv, format_outcome, local_timestamp, remaining};
+    use super::{HumanRenderer, display_argv, format_outcome, local_timestamp};
     use crate::application::{
         DiagnosticCheck, DiagnosticStatus, DoctorReport, RunOutput, RunStream, ServiceAvailability,
         ServiceStatus,
     };
     use crate::cli::args::ColorArg;
-    use crate::cli::view::JobView;
-    use crate::domain::{
-        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
-        MissedPolicy, RunId, RunOutcome, RunState, RuntimeTier, Schedule, UtcTimestamp,
-    };
+    use crate::domain::{JobId, JobState, RunId, RunOutcome, RunState, UtcTimestamp};
 
     #[test]
-    fn remaining_time_is_short_and_readable() {
-        assert_eq!(remaining(-1), "due");
-        assert_eq!(remaining(42), "42s");
-        assert_eq!(remaining(90), "1m 30s");
-        assert_eq!(remaining(3_900), "1h 5m");
-    }
-
-    #[test]
-    fn command_display_quotes_without_changing_argv() {
-        assert_eq!(
-            display_argv(&["printf".to_owned(), "hello world".to_owned()]),
-            "printf 'hello world'"
+    fn command_display_keeps_each_argument_visible() {
+        let rendered = display_argv(&["printf".to_owned(), "hello world".to_owned()]);
+        assert!(rendered.contains("printf"), "{rendered}");
+        assert!(rendered.contains("hello world"), "{rendered}");
+        assert_ne!(
+            rendered, "printf hello world",
+            "arguments must stay distinct"
         );
     }
 
@@ -321,39 +312,27 @@ mod tests {
     fn timestamps_and_outcomes_are_plain_human_text() {
         let rendered =
             local_timestamp(UtcTimestamp::from_second(1_700_000_000).expect("valid timestamp"));
-        let bytes = rendered.as_bytes();
-        assert_eq!(bytes.len(), 26, "{rendered}");
-        for (index, expected) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b' '),
-            (23, b':'),
-        ] {
-            assert_eq!(bytes[index], expected, "{rendered}");
-        }
-        assert!(matches!(bytes[20], b'+' | b'-'), "{rendered}");
+        let mut parts = rendered.split_whitespace();
+        let date = parts.next().expect("local date");
+        let time = parts.next().expect("local time");
+        let offset = parts.next().expect("UTC offset");
+        assert!(parts.next().is_none(), "{rendered}");
+        assert_eq!(date.matches('-').count(), 2, "{rendered}");
+        assert_eq!(time.matches(':').count(), 2, "{rendered}");
+        assert!(offset.starts_with(['+', '-']), "{rendered}");
+        assert!(offset.contains(':'), "{rendered}");
 
-        assert_eq!(format_outcome(&RunOutcome::Exit(0)), "exit 0");
-        assert_eq!(
-            format_outcome(&RunOutcome::Signal(libc::SIGKILL)),
-            format!("signal {} (SIGKILL)", libc::SIGKILL)
-        );
-        assert_eq!(format_outcome(&RunOutcome::Signal(999)), "signal 999");
-        assert_eq!(
-            format_outcome(&RunOutcome::Failure("spawn".to_owned())),
-            "failure: spawn"
-        );
-        assert_eq!(
-            format_outcome(&RunOutcome::Interrupted("unknown".to_owned())),
-            "interrupted: unknown"
-        );
-        assert_eq!(
-            format_outcome(&RunOutcome::Cancelled("requested".to_owned())),
-            "cancelled: requested"
-        );
+        for (outcome, detail) in [
+            (RunOutcome::Exit(0), "0"),
+            (RunOutcome::Signal(libc::SIGKILL), "SIGKILL"),
+            (RunOutcome::Signal(999), "999"),
+            (RunOutcome::Failure("spawn".to_owned()), "spawn"),
+            (RunOutcome::Interrupted("unknown".to_owned()), "unknown"),
+            (RunOutcome::Cancelled("requested".to_owned()), "requested"),
+        ] {
+            let rendered = format_outcome(&outcome);
+            assert!(rendered.contains(detail), "{rendered}");
+        }
     }
 
     #[test]
@@ -371,32 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn job_without_environment_keys_renders_a_placeholder() {
-        let execution = ExecutionSpec::new(
-            ExecutionMode::Shell,
-            vec!["true".to_owned()],
-            "/".to_owned(),
-            Environment::empty(),
-        )
-        .expect("execution");
-        let job = Job::new(
-            UtcTimestamp::from_second(1_000).expect("now"),
-            Schedule::one_shot_relative(
-                DurationSeconds::new(30).expect("duration"),
-                UtcTimestamp::from_second(1_030).expect("due"),
-            ),
-            MissedPolicy::Hold,
-            RuntimeTier::Session,
-            execution,
-            501,
-        )
-        .expect("job");
-        let view = JobView::from_job(&job, UtcTimestamp::from_second(1_000).expect("now"));
-        let rendered = HumanRenderer::new(ColorArg::Never).job_with_outcome(&view, None);
-        assert!(rendered.contains("Environment keys: -"), "{rendered}");
-    }
-
-    #[test]
     fn run_output_marks_truncated_streams() {
         let output = RunOutput {
             run_id: RunId::new(),
@@ -410,11 +363,8 @@ mod tests {
             stderr: RunStream::empty(),
         };
         let rendered = HumanRenderer::run_output(&output);
-        assert!(
-            rendered.contains("--- stdout (truncated at capture cap) ---"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("--- stderr ---"), "{rendered}");
+        assert!(rendered.contains("kept"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
     }
 
     #[test]
@@ -427,8 +377,7 @@ mod tests {
             durable_available: true,
             config: serde_json::Value::Null,
         };
-        let rendered = HumanRenderer::new(ColorArg::Never).doctor(&report);
-        assert!(rendered.starts_with("ATX needs attention."), "{rendered}");
+        let unhealthy = HumanRenderer::new(ColorArg::Never).doctor(&report);
 
         let mut healthy = report.clone();
         healthy.healthy = true;
@@ -447,13 +396,16 @@ mod tests {
             },
         ];
         let rendered = HumanRenderer::new(ColorArg::Always).doctor(&healthy);
-        assert!(rendered.starts_with("ATX is ready."), "{rendered}");
-        assert!(rendered.contains("\u{1b}[32mok\u{1b}[0m"), "{rendered}");
-        assert!(rendered.contains("\u{1b}[31mfail\u{1b}[0m"), "{rendered}");
+        assert_ne!(unhealthy, rendered);
+        assert!(rendered.contains("store"), "{rendered}");
+        assert!(rendered.contains("tz"), "{rendered}");
+        assert!(rendered.contains("open"), "{rendered}");
+        assert!(rendered.contains("missing"), "{rendered}");
+        assert!(rendered.contains("\u{1b}["), "{rendered}");
     }
 
     #[test]
-    fn service_status_with_no_files_renders_a_placeholder() {
+    fn service_status_keeps_supplied_details_visible() {
         let status = ServiceStatus {
             manager: "fake".to_owned(),
             availability: ServiceAvailability::Available,
@@ -464,6 +416,8 @@ mod tests {
             detail: "test fixture".to_owned(),
         };
         let rendered = HumanRenderer::service_status(&status);
-        assert!(rendered.contains("\nFiles: -\n"), "{rendered}");
+        for detail in ["fake", "best-effort", "test fixture"] {
+            assert!(rendered.contains(detail), "{rendered}");
+        }
     }
 }

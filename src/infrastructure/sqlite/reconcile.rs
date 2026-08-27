@@ -291,8 +291,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::job_store::tests::sample_job;
-    use super::super::{Database, JobStore, RetentionPolicy, StartupStore};
-    use super::MAX_RECOVERY_RECORDS;
+    use super::super::{Database, JobStore, RetentionPolicy, StartupStore, StoreError};
+    use super::{MAX_RECOVERY_RECORDS, load_nonterminal};
     use crate::application::{
         CommandFate, IdentityInspectionError, IdentityInspector, IdentityStatus, RecoveryAction,
         RecoveryStore, reconcile_startup,
@@ -601,12 +601,10 @@ mod tests {
                 timestamp(4_110),
             )
             .expect("cancelled");
-        let startup =
-            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
-        let error = startup
-            .load_nonterminal()
-            .expect_err("orphaned active run must be corrupt");
-        assert!(error.to_string().contains("terminal or missing job"));
+        assert!(matches!(
+            load_nonterminal(&store),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -621,12 +619,10 @@ mod tests {
                 .claim_run(job.id(), timestamp(second), timestamp(second - 29))
                 .expect("claim");
         }
-        let startup =
-            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
-        let error = startup
-            .load_nonterminal()
-            .expect_err("duplicate active runs must be corrupt");
-        assert!(error.to_string().contains("more than one active run"));
+        assert!(matches!(
+            load_nonterminal(&store),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -742,12 +738,10 @@ mod tests {
         let cap = i64::try_from(MAX_RECOVERY_RECORDS).expect("cap fits i64") + 1;
         bulk_copy_jobs(&mut store, job.id(), cap);
 
-        let startup =
-            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
-        let error = startup
-            .load_nonterminal()
-            .expect_err("job flood must be corrupt");
-        assert!(error.to_string().contains("too many jobs to reconcile"));
+        assert!(matches!(
+            load_nonterminal(&store),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -794,12 +788,10 @@ mod tests {
         }
         connection.execute_batch("COMMIT").expect("commit run copy");
 
-        let startup =
-            StartupStore::new(&mut store, RetentionPolicy::new(30, 30).expect("retention"));
-        let error = startup
-            .load_nonterminal()
-            .expect_err("run flood must be corrupt");
-        assert!(error.to_string().contains("too many active runs"));
+        assert!(matches!(
+            load_nonterminal(&store),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

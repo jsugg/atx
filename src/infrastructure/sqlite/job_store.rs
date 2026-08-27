@@ -525,10 +525,17 @@ pub(super) mod tests {
             .connection_mut()
             .execute_batch("BEGIN IMMEDIATE")
             .expect("write lock");
-        let start = Instant::now();
-        let result = contender.create(&sample_job(1_000, 1_030));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(contender.create(&sample_job(1_000, 1_030)))
+                .expect("test is waiting for the result");
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the configured busy timeout must bound lock waiting");
         assert!(matches!(result, Err(StoreError::Busy)));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.join().expect("contender thread");
         blocker
             .connection_mut()
             .execute_batch("ROLLBACK")

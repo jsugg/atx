@@ -76,7 +76,8 @@ jobs:
           # --allow-dirty is fine here and only here. The real crates.io
           # job below never patches and never allows it.
           cargo publish --registry atx-mock --locked --allow-dirty
-          scripts/assert-mock-published.sh "$version" "$RUNNER_TEMP/requests.log"
+          scripts/assert-mock-published.sh \
+            "$version" "$RUNNER_TEMP/requests.log" "target/package/atx-$version.crate"
       - name: Duplicate publish must fail
         env:
           CARGO_REGISTRIES_ATX_MOCK_TOKEN: dummy-not-a-real-token

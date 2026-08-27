@@ -104,18 +104,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"errors": [{"detail": "not found"}]})
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        # Upload format: u32 little-endian JSON length, JSON metadata, .crate blob.
+        # Upload format: u32 JSON length, JSON metadata, u32 crate length, crate blob.
         try:
             meta_len = int.from_bytes(body[0:4], "little")
-            meta = json.loads(body[4 : 4 + meta_len])
+            meta_end = 4 + meta_len
+            meta = json.loads(body[4:meta_end])
+            crate_len = int.from_bytes(body[meta_end : meta_end + 4], "little")
+            crate_blob = body[meta_end + 4 :]
+            if crate_len != len(crate_blob):
+                raise ValueError("crate length does not match upload metadata")
         except (IndexError, ValueError):
             log({"method": "PUT", "path": self.path, "error": "unparsable body", "content_length": length})
             return self._json(400, {"errors": [{"detail": "unparsable upload"}]})
+        cksum = hashlib.sha256(crate_blob).hexdigest()
         event = {
             "method": "PUT",
             "path": self.path,
             "name": meta.get("name"),
             "vers": meta.get("vers"),
+            "cksum": cksum,
             "content_length": length,
         }
         log(event)
@@ -128,8 +135,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(409, {"errors": [{"detail": "already exists"}]})
         # The .crate blob follows the metadata block; its sha256 must match
         # what the index advertises so cargo's visibility poll accepts it.
-        crate_blob = body[4 + meta_len :]
-        cksum = hashlib.sha256(crate_blob).hexdigest()
         state["entries"].append({"name": meta["name"], "vers": meta["vers"], "cksum": cksum})
         write_state(state)
         return self._json(200, {"warnings": {"invalid_categories": [], "invalid_badges": [], "other": []}})

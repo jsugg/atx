@@ -59,8 +59,16 @@ impl SubmissionOutcome {
 pub(crate) struct SubmissionStoreError(pub(crate) String);
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
-#[error("supervisor did not acknowledge job: {0}")]
-pub(crate) struct SupervisorAckError(pub(crate) String);
+pub(crate) enum SupervisorAckError {
+    #[error("supervisor rejected the wake: {0}")]
+    Rejected(String),
+    #[error("supervisor socket was substituted")]
+    SocketSubstitution,
+    #[error("supervisor returned an invalid acknowledgement")]
+    InvalidAcknowledgement,
+    #[error("supervisor did not acknowledge job: {0}")]
+    Unavailable(String),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub(crate) enum SubmitError {
@@ -105,7 +113,9 @@ mod tests {
         ) -> Result<(), SupervisorAckError> {
             self.calls.set(self.calls.get() + 1);
             if self.fail {
-                Err(SupervisorAckError("socket unavailable".to_owned()))
+                Err(SupervisorAckError::Unavailable(
+                    "socket unavailable".to_owned(),
+                ))
             } else {
                 Ok(())
             }

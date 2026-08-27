@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::fs;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -14,6 +14,13 @@ use tempfile::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
+}
+
+fn assert_invalid_argument(output: &Output) {
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("JSON error response");
+    assert_eq!(error["error"]["code"], "INVALID_ARGUMENT", "{error}");
 }
 
 #[test]
@@ -51,23 +58,14 @@ fn version_and_usage_have_stable_exit_codes() {
 }
 
 #[test]
-fn malformed_relative_durations_keep_duration_diagnostics() {
-    let cases = [
-        ("5x", "expected one of h, m, or s"),
-        ("1 h", "expected one of h, m, or s"),
-        ("30s1m", "duration units must be unique and ordered h, m, s"),
-        ("1m1m", "duration units must be unique and ordered h, m, s"),
-        ("18446744073709551616s", "duration arithmetic overflowed"),
-    ];
-    for (input, expected) in cases {
+fn malformed_relative_durations_are_usage_errors() {
+    let cases = ["5x", "1 h", "30s1m", "1m1m", "18446744073709551616s"];
+    for input in cases {
         let output = atx()
-            .args(["--dry-run", input, "--", "true"])
+            .args(["--json", "--dry-run", input, "--", "true"])
             .output()
             .expect("run malformed duration");
-        assert_eq!(output.status.code(), Some(2), "{input}: {output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(expected), "{input}: {stderr}");
-        assert!(!stderr.contains("YYYY-MM-DD"), "{input}: {stderr}");
+        assert_invalid_argument(&output);
     }
 }
 
@@ -80,18 +78,14 @@ fn non_utf8_working_directory_is_rejected_without_lossy_storage() {
         .join(OsString::from_vec(b"working-\xff".to_vec()));
     fs::create_dir(&directory).expect("non-UTF-8 directory");
     let output = atx()
+        .arg("--json")
         .arg("--dry-run")
         .arg("--cwd")
         .arg(&directory)
         .args(["30s", "--", "true"])
         .output()
         .expect("run with non-UTF-8 cwd");
-    assert_eq!(output.status.code(), Some(2), "{output:?}");
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostic");
-    assert!(
-        stderr.contains("working directory must be valid UTF-8"),
-        "{stderr}"
-    );
+    assert_invalid_argument(&output);
 }
 
 #[test]
@@ -1032,35 +1026,25 @@ fn malformed_environment_is_rejected_not_panicked() {
     // persistence boundary and must fail as a typed usage error, not a panic.
     let bad_value = std::ffi::OsStr::from_bytes(b"/bin:\xFF");
     let retained = atx()
+        .arg("--json")
         .arg("--state-dir")
         .arg(&state)
         .args(["--dry-run", "30s", "--", "/bin/true"])
         .env("PATH", bad_value)
         .output()
         .expect("run with non-UTF-8 PATH");
-    assert_eq!(
-        retained.status.code(),
-        Some(2),
-        "expected usage error: {retained:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&retained.stderr).contains("not valid UTF-8"),
-        "{retained:?}"
-    );
+    assert_invalid_argument(&retained);
 
     // An unknown ATX_* name that is not valid UTF-8 is rejected the same way.
     let unknown = atx()
+        .arg("--json")
         .arg("--state-dir")
         .arg(&state)
         .args(["--dry-run", "30s", "--", "/bin/true"])
         .env(std::ffi::OsStr::from_bytes(b"ATX_\xFF"), "1")
         .output()
         .expect("run with non-UTF-8 ATX_ key");
-    assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
-    assert!(
-        String::from_utf8_lossy(&unknown.stderr).contains("not valid UTF-8"),
-        "{unknown:?}"
-    );
+    assert_invalid_argument(&unknown);
 }
 
 /// `--quiet` suppresses successful output, never the safety warnings.

@@ -414,10 +414,35 @@ mod tests {
             .spawn()
             .expect("spawn");
         let pid = child.id();
-        // Give the short command time to exit without reaping it, so the
-        // inspection reliably exercises the zombie fallback instead of
-        // racing the still-live process.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let pid_t = i32::try_from(pid).expect("PID fits pid_t");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not exit before the test deadline"
+            );
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: `info` points to writable storage and WNOWAIT leaves the child unreaped.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+                continue;
+            }
+            // SAFETY: the storage was zeroed before waitid wrote any available event.
+            let info = unsafe { info.assume_init() };
+            if info.si_pid == pid_t {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let identity = inspector
             .inspect(pid)
             .expect("inspect zombie")

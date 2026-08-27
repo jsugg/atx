@@ -376,7 +376,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::job_store::tests::sample_job;
-    use super::super::{Database, JobStore};
+    use super::super::{Database, JobStore, StoreError};
     use super::{Job, hide_job};
     use crate::application::{ManagementStore as _, RunOutputStore as _};
     use crate::domain::{JobId, JobState, ProcessIdentitySnapshot, RunId, RunState, UtcTimestamp};
@@ -608,12 +608,10 @@ mod tests {
                 )
                 .expect("seed active run");
         }
-        assert!(
-            super::active_runs(&store)
-                .expect_err("run flood must be corrupt")
-                .to_string()
-                .contains("more than 1000 active runs")
-        );
+        assert!(matches!(
+            super::active_runs(&store),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]

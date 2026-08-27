@@ -66,8 +66,12 @@ impl SocketAcknowledger {
 
 impl SupervisorAcknowledger for SocketAcknowledger {
     fn acknowledge(&self, job_id: JobId, revision: Revision) -> Result<(), SupervisorAckError> {
-        self.send(job_id, revision)
-            .map_err(|error| SupervisorAckError(error.to_string()))
+        self.send(job_id, revision).map_err(|error| match error {
+            IpcError::Rejected(reason) => SupervisorAckError::Rejected(reason),
+            IpcError::SocketSubstitution => SupervisorAckError::SocketSubstitution,
+            IpcError::InvalidAcknowledgement => SupervisorAckError::InvalidAcknowledgement,
+            other => SupervisorAckError::Unavailable(other.to_string()),
+        })
     }
 }
 
@@ -225,8 +229,8 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{IpcMessage, RuntimeGuard, SocketAcknowledger, read_frame, write_frame};
-    use crate::application::{ElapsedClock, SupervisorAcknowledger};
+    use super::{IpcError, IpcMessage, RuntimeGuard, SocketAcknowledger, read_frame, write_frame};
+    use crate::application::{ElapsedClock, SupervisorAckError, SupervisorAcknowledger};
     use crate::domain::{JobId, Revision};
     use crate::infrastructure::process::NativeProcessInspector;
     use crate::infrastructure::time::NativeClock;
@@ -319,7 +323,10 @@ mod tests {
         let error = client
             .acknowledge(job_id, revision)
             .expect_err("nack must fail");
-        assert!(error.to_string().contains("rejected the wake"), "{error}");
+        assert_eq!(
+            error,
+            SupervisorAckError::Rejected("job not found".to_owned())
+        );
         server.join().expect("server");
     }
 
@@ -332,10 +339,7 @@ mod tests {
         let error = acknowledger
             .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
             .expect_err("regular file is not a socket");
-        assert!(
-            error.to_string().contains("socket was substituted"),
-            "{error}"
-        );
+        assert_eq!(error, SupervisorAckError::SocketSubstitution);
 
         let link = root.path().join("link.sock");
         symlink("/tmp", &link).expect("symlink");
@@ -343,10 +347,7 @@ mod tests {
         let error = acknowledger
             .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
             .expect_err("symlink is not a socket");
-        assert!(
-            error.to_string().contains("socket was substituted"),
-            "{error}"
-        );
+        assert_eq!(error, SupervisorAckError::SocketSubstitution);
     }
 
     #[test]
@@ -374,10 +375,7 @@ mod tests {
         let error = client
             .acknowledge(job_id, revision)
             .expect_err("mismatched ack must fail");
-        assert!(
-            error.to_string().contains("wrong acknowledgement"),
-            "{error}"
-        );
+        assert_eq!(error, SupervisorAckError::InvalidAcknowledgement);
         server.join().expect("server");
     }
 
@@ -516,10 +514,7 @@ mod tests {
         let error = client
             .acknowledge(job_id, revision)
             .expect_err("foreign job ack must fail");
-        assert!(
-            error.to_string().contains("wrong acknowledgement"),
-            "{error}"
-        );
+        assert_eq!(error, SupervisorAckError::InvalidAcknowledgement);
         server.join().expect("server");
     }
 
@@ -660,7 +655,7 @@ mod tests {
             Ok(_guard) => unreachable!("an over-long lock path cannot be created"),
         };
         assert!(
-            error.to_string().contains("I/O failed"),
+            matches!(error, IpcError::Io(_)),
             "unexpected error: {error}"
         );
     }
