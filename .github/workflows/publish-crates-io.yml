@@ -75,9 +75,12 @@ jobs:
           # The registry-name sed patch leaves the tree dirty by design;
           # --allow-dirty is fine here and only here. The real crates.io
           # job below never patches and never allows it.
+          cargo package --locked --allow-dirty
+          package="$RUNNER_TEMP/atx-$version.crate"
+          cp "target/package/atx-$version.crate" "$package"
           cargo publish --registry atx-mock --locked --allow-dirty
           scripts/assert-mock-published.sh \
-            "$version" "$RUNNER_TEMP/requests.log" "target/package/atx-$version.crate"
+            "$version" "$RUNNER_TEMP/requests.log" "$package"
       - name: Duplicate publish must fail
         env:
           CARGO_REGISTRIES_ATX_MOCK_TOKEN: dummy-not-a-real-token
