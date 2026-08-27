@@ -116,13 +116,9 @@ macro_rules! identifier {
                 Self(Uuid::from_u128(value))
             }
 
+            #[cfg(test)]
             pub(crate) const fn as_uuid(self) -> Uuid {
                 self.0
-            }
-
-            #[cfg(test)]
-            pub(crate) fn version(self) -> usize {
-                self.0.get_version_num()
             }
         }
 
@@ -192,8 +188,8 @@ mod tests {
         let first = JobId::new();
         let second = JobId::new();
 
-        assert_eq!(first.version(), 7);
-        assert_eq!(second.version(), 7);
+        assert_eq!(first.as_uuid().get_version_num(), 7);
+        assert_eq!(second.as_uuid().get_version_num(), 7);
         assert_ne!(first, second);
     }
 

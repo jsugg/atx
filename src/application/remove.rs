@@ -1,1 +1,0 @@
-//! Job-removal application service.

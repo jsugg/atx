@@ -36,19 +36,38 @@ pub(crate) fn internal() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     // The numeric values are a documented stability contract (README and
     // docs): scripts match on them, so remapping silently would break users.
     #[test]
     fn exit_codes_are_stable_across_releases() {
-        assert_eq!(usage(), std::process::ExitCode::from(2));
-        assert_eq!(not_found(), std::process::ExitCode::from(3));
-        assert_eq!(conflict(), std::process::ExitCode::from(4));
-        assert_eq!(capability(), std::process::ExitCode::from(5));
-        assert_eq!(storage(), std::process::ExitCode::from(10));
-        assert_eq!(supervision(), std::process::ExitCode::from(11));
-        assert_eq!(permission(), std::process::ExitCode::from(12));
-        assert_eq!(internal(), std::process::ExitCode::from(70));
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/exit-codes-v1.json"))
+                .expect("valid exit-code fixture");
+        let expected = [
+            ("success", ExitCode::SUCCESS),
+            ("usage", usage()),
+            ("not_found", not_found()),
+            ("conflict", conflict()),
+            ("capability", capability()),
+            ("storage", storage()),
+            ("supervision", supervision()),
+            ("permission", permission()),
+            ("internal", internal()),
+        ];
+        assert_eq!(
+            fixture.as_object().map(serde_json::Map::len),
+            Some(expected.len())
+        );
+        for (name, actual) in expected {
+            let value = fixture[name].as_u64().expect("numeric fixture value");
+            assert_eq!(
+                actual,
+                ExitCode::from(u8::try_from(value).expect("u8 exit code"))
+            );
+        }
     }
 }

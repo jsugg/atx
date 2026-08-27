@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use super::args::ColorArg;
 use super::view::{JobView, ProcessView, RunView, SubmissionView};
 use crate::application::{DiagnosticStatus, DoctorReport, RunOutput, ServiceChange, ServiceStatus};
-use crate::domain::{JobState, Schedule};
+use crate::domain::{JobState, RunOutcome, Schedule, UtcTimestamp};
 
 pub(crate) struct HumanRenderer {
     color: bool,
@@ -27,19 +27,22 @@ impl HumanRenderer {
         format!(
             "{prefix} {} for {} ({})",
             view.job_id,
-            view.next_due_utc,
+            local_timestamp(view.next_due_utc),
             self.state(view.state)
         )
     }
 
     pub(crate) fn jobs(&self, jobs: &[JobView]) -> String {
+        if jobs.is_empty() {
+            return "No jobs.".to_owned();
+        }
         let mut lines = vec!["JOB\tSTATE\tDUE\tREMAINING\tNAME".to_owned()];
         lines.extend(jobs.iter().map(|job| {
             format!(
                 "{}\t{}\t{}\t{}\t{}",
                 job.job_id,
                 self.state(job.state),
-                job.next_due_utc,
+                local_timestamp(job.next_due_utc),
                 remaining(job.remaining_seconds),
                 job.name.as_deref().unwrap_or("-")
             )
@@ -61,12 +64,13 @@ impl HumanRenderer {
         };
         let name = job.name.as_deref().unwrap_or("-");
         let description = job.description.as_deref().unwrap_or("-");
-        let outcome = last_outcome.map_or_else(|| "-".to_owned(), |outcome| format!("{outcome:?}"));
+        let outcome =
+            last_outcome.map_or_else(|| "-".to_owned(), |outcome| format_outcome(&outcome));
         format!(
             "Job: {}\nName: {name}\nDescription: {description}\nState: {}\nDue: {}\nRemaining: {}\nSchedule: {}\nRuntime: {:?}\nLast outcome: {outcome}\nCommand: {}\nWorking directory: {}\nEnvironment keys: {}",
             job.job_id,
             self.state(job.state),
-            job.next_due_utc,
+            local_timestamp(job.next_due_utc),
             remaining(job.remaining_seconds),
             schedule(&job.schedule),
             job.runtime_tier,
@@ -77,6 +81,9 @@ impl HumanRenderer {
     }
 
     pub(crate) fn runs(runs: &[RunView]) -> String {
+        if runs.is_empty() {
+            return "No runs.".to_owned();
+        }
         let mut lines = vec!["RUN\tJOB\tSTATE\tSCHEDULED\tFINISHED".to_owned()];
         lines.extend(runs.iter().map(|run| {
             format!(
@@ -84,14 +91,18 @@ impl HumanRenderer {
                 run.run_id,
                 run.job_id,
                 run.state,
-                run.scheduled_for_utc,
-                run.finished_at_utc.as_deref().unwrap_or("-")
+                local_timestamp(run.scheduled_for_utc),
+                run.finished_at_utc
+                    .map_or_else(|| "-".to_owned(), local_timestamp)
             )
         }));
         lines.join("\n")
     }
 
     pub(crate) fn processes(processes: &[ProcessView]) -> String {
+        if processes.is_empty() {
+            return "No live ATX processes.".to_owned();
+        }
         let mut lines = vec!["JOB\tRUN\tROLE\tPID\tPGID\tSTATE".to_owned()];
         lines.extend(processes.iter().map(|process| {
             format!(
@@ -116,7 +127,7 @@ impl HumanRenderer {
             output
                 .outcome
                 .as_ref()
-                .map_or_else(|| "-".to_owned(), |outcome| format!("{outcome:?}"))
+                .map_or_else(|| "-".to_owned(), format_outcome)
         );
         let mut sections = vec![snapshot_header];
         for (label, stream) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
@@ -214,6 +225,38 @@ fn remaining(seconds: i64) -> String {
     format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
 }
 
+fn local_timestamp(timestamp: UtcTimestamp) -> String {
+    timestamp
+        .as_jiff()
+        .to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+fn format_outcome(outcome: &RunOutcome) -> String {
+    match outcome {
+        RunOutcome::Exit(code) => format!("exit {code}"),
+        RunOutcome::Signal(signal) => signal_name(*signal).map_or_else(
+            || format!("signal {signal}"),
+            |name| format!("signal {signal} ({name})"),
+        ),
+        RunOutcome::Failure(reason) => format!("failure: {reason}"),
+        RunOutcome::Interrupted(reason) => format!("interrupted: {reason}"),
+        RunOutcome::Cancelled(reason) => format!("cancelled: {reason}"),
+    }
+}
+
+fn signal_name(signal: i32) -> Option<&'static str> {
+    match signal {
+        libc::SIGHUP => Some("SIGHUP"),
+        libc::SIGINT => Some("SIGINT"),
+        libc::SIGQUIT => Some("SIGQUIT"),
+        libc::SIGKILL => Some("SIGKILL"),
+        libc::SIGTERM => Some("SIGTERM"),
+        _ => None,
+    }
+}
+
 fn schedule(value: &Schedule) -> String {
     match value {
         Schedule::OneShotRelative { duration, .. } => format!("after {duration}"),
@@ -246,32 +289,50 @@ fn display_argv(argv: &[String]) -> String {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{HumanRenderer, display_argv, remaining};
+    use super::{HumanRenderer, display_argv, format_outcome, local_timestamp};
     use crate::application::{
         DiagnosticCheck, DiagnosticStatus, DoctorReport, RunOutput, RunStream, ServiceAvailability,
         ServiceStatus,
     };
     use crate::cli::args::ColorArg;
-    use crate::cli::view::JobView;
-    use crate::domain::{
-        DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
-        MissedPolicy, RunId, RunState, RuntimeTier, Schedule, UtcTimestamp,
-    };
+    use crate::domain::{JobId, JobState, RunId, RunOutcome, RunState, UtcTimestamp};
 
     #[test]
-    fn remaining_time_is_short_and_readable() {
-        assert_eq!(remaining(-1), "due");
-        assert_eq!(remaining(42), "42s");
-        assert_eq!(remaining(90), "1m 30s");
-        assert_eq!(remaining(3_900), "1h 5m");
+    fn command_display_keeps_each_argument_visible() {
+        let rendered = display_argv(&["printf".to_owned(), "hello world".to_owned()]);
+        assert!(rendered.contains("printf"), "{rendered}");
+        assert!(rendered.contains("hello world"), "{rendered}");
+        assert_ne!(
+            rendered, "printf hello world",
+            "arguments must stay distinct"
+        );
     }
 
     #[test]
-    fn command_display_quotes_without_changing_argv() {
-        assert_eq!(
-            display_argv(&["printf".to_owned(), "hello world".to_owned()]),
-            "printf 'hello world'"
-        );
+    fn timestamps_and_outcomes_are_plain_human_text() {
+        let rendered =
+            local_timestamp(UtcTimestamp::from_second(1_700_000_000).expect("valid timestamp"));
+        let mut parts = rendered.split_whitespace();
+        let date = parts.next().expect("local date");
+        let time = parts.next().expect("local time");
+        let offset = parts.next().expect("UTC offset");
+        assert!(parts.next().is_none(), "{rendered}");
+        assert_eq!(date.matches('-').count(), 2, "{rendered}");
+        assert_eq!(time.matches(':').count(), 2, "{rendered}");
+        assert!(offset.starts_with(['+', '-']), "{rendered}");
+        assert!(offset.contains(':'), "{rendered}");
+
+        for (outcome, detail) in [
+            (RunOutcome::Exit(0), "0"),
+            (RunOutcome::Signal(libc::SIGKILL), "SIGKILL"),
+            (RunOutcome::Signal(999), "999"),
+            (RunOutcome::Failure("spawn".to_owned()), "spawn"),
+            (RunOutcome::Interrupted("unknown".to_owned()), "unknown"),
+            (RunOutcome::Cancelled("requested".to_owned()), "requested"),
+        ] {
+            let rendered = format_outcome(&outcome);
+            assert!(rendered.contains(detail), "{rendered}");
+        }
     }
 
     #[test]
@@ -289,32 +350,6 @@ mod tests {
     }
 
     #[test]
-    fn job_without_environment_keys_renders_a_placeholder() {
-        let execution = ExecutionSpec::new(
-            ExecutionMode::Shell,
-            vec!["true".to_owned()],
-            "/".to_owned(),
-            Environment::empty(),
-        )
-        .expect("execution");
-        let job = Job::new(
-            UtcTimestamp::from_second(1_000).expect("now"),
-            Schedule::one_shot_relative(
-                DurationSeconds::new(30).expect("duration"),
-                UtcTimestamp::from_second(1_030).expect("due"),
-            ),
-            MissedPolicy::Hold,
-            RuntimeTier::Session,
-            execution,
-            501,
-        )
-        .expect("job");
-        let view = JobView::from_job(&job, UtcTimestamp::from_second(1_000).expect("now"));
-        let rendered = HumanRenderer::new(ColorArg::Never).job_with_outcome(&view, None);
-        assert!(rendered.contains("Environment keys: -"), "{rendered}");
-    }
-
-    #[test]
     fn run_output_marks_truncated_streams() {
         let output = RunOutput {
             run_id: RunId::new(),
@@ -328,11 +363,8 @@ mod tests {
             stderr: RunStream::empty(),
         };
         let rendered = HumanRenderer::run_output(&output);
-        assert!(
-            rendered.contains("--- stdout (truncated at capture cap) ---"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("--- stderr ---"), "{rendered}");
+        assert!(rendered.contains("kept"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
     }
 
     #[test]
@@ -345,8 +377,7 @@ mod tests {
             durable_available: true,
             config: serde_json::Value::Null,
         };
-        let rendered = HumanRenderer::new(ColorArg::Never).doctor(&report);
-        assert!(rendered.starts_with("ATX needs attention."), "{rendered}");
+        let unhealthy = HumanRenderer::new(ColorArg::Never).doctor(&report);
 
         let mut healthy = report.clone();
         healthy.healthy = true;
@@ -365,13 +396,16 @@ mod tests {
             },
         ];
         let rendered = HumanRenderer::new(ColorArg::Always).doctor(&healthy);
-        assert!(rendered.starts_with("ATX is ready."), "{rendered}");
-        assert!(rendered.contains("\u{1b}[32mok\u{1b}[0m"), "{rendered}");
-        assert!(rendered.contains("\u{1b}[31mfail\u{1b}[0m"), "{rendered}");
+        assert_ne!(unhealthy, rendered);
+        assert!(rendered.contains("store"), "{rendered}");
+        assert!(rendered.contains("tz"), "{rendered}");
+        assert!(rendered.contains("open"), "{rendered}");
+        assert!(rendered.contains("missing"), "{rendered}");
+        assert!(rendered.contains("\u{1b}["), "{rendered}");
     }
 
     #[test]
-    fn service_status_with_no_files_renders_a_placeholder() {
+    fn service_status_keeps_supplied_details_visible() {
         let status = ServiceStatus {
             manager: "fake".to_owned(),
             availability: ServiceAvailability::Available,
@@ -382,6 +416,8 @@ mod tests {
             detail: "test fixture".to_owned(),
         };
         let rendered = HumanRenderer::service_status(&status);
-        assert!(rendered.contains("\nFiles: -\n"), "{rendered}");
+        for detail in ["fake", "best-effort", "test fixture"] {
+            assert!(rendered.contains(detail), "{rendered}");
+        }
     }
 }

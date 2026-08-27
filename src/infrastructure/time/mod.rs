@@ -3,6 +3,7 @@
 use crate::application::{ClockError, ElapsedClock, WallClock};
 use crate::domain::{ElapsedInstant, UtcTimestamp};
 
+#[cfg(any(target_os = "linux", test))]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -24,6 +25,7 @@ impl ElapsedClock for NativeClock {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn elapsed_from_parts(seconds: i64, nanoseconds: i64) -> Result<ElapsedInstant, ClockError> {
     if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
         return Err(ClockError::OutOfRange);
@@ -37,6 +39,7 @@ fn elapsed_from_parts(seconds: i64, nanoseconds: i64) -> Result<ElapsedInstant, 
         .ok_or(ClockError::OutOfRange)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ticks_to_nanos(ticks: u128, numerator: u32, denominator: u32) -> Result<u128, ClockError> {
     if denominator == 0 {
         return Err(ClockError::Unavailable);

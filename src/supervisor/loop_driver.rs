@@ -19,8 +19,6 @@ pub(crate) enum SupervisorEvent {
         job_id: JobId,
         deadline: ElapsedInstant,
     },
-    Cancel(JobId),
-    RunFinished(JobId),
     Shutdown,
 }
 
@@ -48,9 +46,6 @@ pub(crate) fn run_loop<Now, Due>(
         };
         match event {
             Ok(SupervisorEvent::Schedule { job_id, deadline }) => heap.upsert(job_id, deadline),
-            Ok(SupervisorEvent::Cancel(job_id) | SupervisorEvent::RunFinished(job_id)) => {
-                heap.remove(job_id);
-            }
             Ok(SupervisorEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) if empty => break,
             Err(RecvTimeoutError::Timeout) => {}
@@ -101,7 +96,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{SupervisorEvent, reconcile_wall_schedule, run_loop, wait_until};
     use crate::domain::{ElapsedInstant, JobId, UtcTimestamp};
@@ -144,24 +139,18 @@ mod tests {
     }
 
     #[test]
-    fn new_earlier_deadline_wakes_the_loop() {
+    fn queued_deadline_is_delivered_without_idle_waiting() {
         let (sender, receiver) = mpsc::channel();
-        let wake_sender = sender.clone();
-        let shutdown_sender = sender;
+        let shutdown_sender = sender.clone();
         let clock = Arc::new(AtomicU64::new(0));
-        let wake_clock = Arc::clone(&clock);
         let job_id = JobId::new();
-        let start = Instant::now();
-        let wake = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            wake_clock.store(1, Ordering::Release);
-            wake_sender
-                .send(SupervisorEvent::Schedule {
-                    job_id,
-                    deadline: ElapsedInstant::from_nanos(1),
-                })
-                .expect("loop is listening");
-        });
+        clock.store(1, Ordering::Release);
+        sender
+            .send(SupervisorEvent::Schedule {
+                job_id,
+                deadline: ElapsedInstant::from_nanos(1),
+            })
+            .expect("event queue is open");
 
         let mut heap = DeadlineHeap::default();
         let mut due = Vec::new();
@@ -177,10 +166,8 @@ mod tests {
                     .expect("loop is listening");
             },
         );
-        wake.join().expect("wake thread");
 
         assert_eq!(due, vec![job_id]);
-        assert!(start.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

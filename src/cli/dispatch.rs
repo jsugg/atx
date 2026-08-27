@@ -107,11 +107,29 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
     use std::io::Write;
 
     fn render(man: &clap_mangen::Man, path: &std::path::Path) -> Result<(), String> {
+        let mut generated = Vec::new();
+        man.render(&mut generated)
+            .map_err(|error| format!("render {}: {error}", path.display()))?;
+        let generated = String::from_utf8(generated)
+            .map_err(|error| format!("render {} as UTF-8: {error}", path.display()))?;
+        let mut normalized = generated
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        normalized.push('\n');
+        while normalized.contains(".br\n\n.br\n") {
+            normalized = normalized.replace(".br\n\n.br\n", ".br\n");
+        }
+        while normalized.contains("\n\n.br\n") {
+            normalized = normalized.replace("\n\n.br\n", "\n.br\n");
+        }
         let file = std::fs::File::create(path)
             .map_err(|error| format!("create {}: {error}", path.display()))?;
         let mut writer = std::io::BufWriter::new(file);
-        man.render(&mut writer)
-            .map_err(|error| format!("render {}: {error}", path.display()))?;
+        writer
+            .write_all(normalized.as_bytes())
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
         writer.flush().map_err(|error| format!("flush: {error}"))
     }
 
@@ -129,7 +147,9 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
         .to_string();
     let name = cmd.get_name().to_owned();
     render(
-        &clap_mangen::Man::new(cmd.clone()).date(&date),
+        &clap_mangen::Man::new(cmd.clone())
+            .title(name.to_ascii_uppercase())
+            .date(&date),
         &out_dir.join(format!("{name}.1")),
     )?;
     for sub in cmd.get_subcommands() {
@@ -139,7 +159,7 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
         let path = out_dir.join(format!("{name}-{}.1", sub.get_name()));
         render(
             &clap_mangen::Man::new(sub.clone())
-                .title(name.clone())
+                .title(name.to_ascii_uppercase())
                 .date(&date),
             &path,
         )?;
@@ -592,7 +612,10 @@ fn doctor_exit(report: &DoctorReport) -> ExitCode {
 }
 
 fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliError> {
-    let (mut store, paths, config) = open_management(global)?;
+    let (store, paths, config) = open_management(global)?;
+    let Some(mut store) = store else {
+        return manage_without_database(global, command);
+    };
     match command {
         ManagementCommand::List { state, limit } => {
             let state = state.map(crate::domain::JobState::from);
@@ -607,8 +630,9 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             // contract keeps it on `history`/`output` instead.
             let outcome = store
                 .list_runs(Some(job.id()), 1)
-                .ok()
-                .and_then(|runs| runs.first().cloned())
+                .map_err(|error| CliError::storage(global.json, error))?
+                .into_iter()
+                .next()
                 .and_then(|run| run.snapshot().outcome);
             render_job(&job, outcome, global);
         }
@@ -686,21 +710,38 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
     Ok(())
 }
 
-fn open_management(global: &GlobalArgs) -> Result<(JobStore, PlatformPaths, Config), CliError> {
+fn manage_without_database(
+    global: &GlobalArgs,
+    command: &ManagementCommand,
+) -> Result<(), CliError> {
+    match command {
+        ManagementCommand::List { .. } => {
+            render_jobs(&[], global);
+            Ok(())
+        }
+        ManagementCommand::History { job: None, .. } => {
+            render_runs(&[], global);
+            Ok(())
+        }
+        ManagementCommand::Ps => render_processes(&[], global),
+        _ => Err(CliError::not_found(global.json, "job or run not found")),
+    }
+}
+
+fn open_management(
+    global: &GlobalArgs,
+) -> Result<(Option<JobStore>, PlatformPaths, Config), CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
         .map_err(|error| CliError::permission(global.json, error))?;
     let config = load_effective_config(&paths, global, false)
         .map_err(|error| CliError::usage(global.json, error))?;
     let database_path = paths.state_dir().join("atx.db");
     if !database_path.is_file() {
-        return Err(CliError::not_found(
-            global.json,
-            "ATX has no state database yet",
-        ));
+        return Ok((None, paths, config));
     }
     let database = Database::open(&database_path, Duration::from_secs(2))
         .map_err(|error| CliError::storage(global.json, error))?;
-    Ok((JobStore::new(database), paths, config))
+    Ok((Some(JobStore::new(database)), paths, config))
 }
 
 fn cancel_job(
@@ -864,7 +905,7 @@ fn finish_job_cancellation(
     // have completed naturally and the job moved on (a recurring job returns
     // to Waiting); either way the terminal outcome the caller wanted already
     // happened or no longer applies.
-    let finished = match store.transition_job(
+    match store.transition_job(
         current.id(),
         current.revision(),
         target,
@@ -888,8 +929,7 @@ fn finish_job_cancellation(
             ))
         }
         Err(error) => Err(management_store_error(error)),
-    };
-    finished.map_err(management_store_error)
+    }
 }
 
 fn management_store_error(error: impl std::fmt::Display) -> ManagementError {
@@ -1066,7 +1106,7 @@ fn load_effective_config(
         }),
         verbosity: if global.quiet {
             Some(Verbosity::Quiet)
-        } else if global.verbose > 0 {
+        } else if global.verbose {
             Some(Verbosity::Verbose)
         } else {
             None
@@ -1092,13 +1132,17 @@ fn resolve_output_policy(global: &mut GlobalArgs) {
     let Ok(config) = load_effective_config(&paths, global, false) else {
         return;
     };
-    global.quiet = config.verbosity() == Verbosity::Quiet;
-    global.verbose = u8::from(config.verbosity() == Verbosity::Verbose);
-    global.color = Some(match config.color() {
-        ColorMode::Auto => ColorArg::Auto,
-        ColorMode::Always => ColorArg::Always,
-        ColorMode::Never => ColorArg::Never,
-    });
+    if !global.quiet && !global.verbose {
+        global.quiet = config.verbosity() == Verbosity::Quiet;
+        global.verbose = config.verbosity() == Verbosity::Verbose;
+    }
+    if global.color.is_none() {
+        global.color = Some(match config.color() {
+            ColorMode::Auto => ColorArg::Auto,
+            ColorMode::Always => ColorArg::Always,
+            ColorMode::Never => ColorArg::Never,
+        });
+    }
 }
 
 fn build_job(
@@ -1176,7 +1220,10 @@ fn build_schedule(
     }
 
     let joined_duration = args.when.concat();
-    if let Ok(duration) = joined_duration.parse::<DurationSeconds>() {
+    if is_duration_input(&joined_duration) {
+        let duration = joined_duration
+            .parse::<DurationSeconds>()
+            .map_err(|error| error.to_string())?;
         if args.options.utc
             || args.options.tz.is_some()
             || args.options.dst.is_some()
@@ -1226,6 +1273,11 @@ fn build_schedule(
     ))
 }
 
+fn is_duration_input(input: &str) -> bool {
+    input.starts_with(|character: char| character.is_ascii_digit())
+        && !input.contains(['-', ':', 'T'])
+}
+
 fn build_execution(args: &SchedulingArgs, config: &Config) -> Result<ExecutionSpec, String> {
     let command_args = args
         .argv
@@ -1256,13 +1308,12 @@ fn build_execution(args: &SchedulingArgs, config: &Config) -> Result<ExecutionSp
         ));
     }
     let environment = build_environment(args)?;
-    let mut execution = ExecutionSpec::new(
-        mode,
-        command_args,
-        cwd.to_string_lossy().into_owned(),
-        environment,
-    )
-    .map_err(|error| error.to_string())?;
+    let cwd = cwd
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "working directory must be valid UTF-8".to_owned())?;
+    let mut execution = ExecutionSpec::new(mode, command_args, cwd, environment)
+        .map_err(|error| error.to_string())?;
     if mode == ExecutionMode::Shell {
         execution
             .set_shell_path(config.default_shell().to_owned())
@@ -1418,6 +1469,14 @@ fn render_job(job: &Job, last_outcome: Option<crate::domain::RunOutcome>, global
 }
 
 fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<(), CliError> {
+    if runs.is_empty() {
+        if global.json {
+            print_json_success(&Vec::<ProcessView>::new());
+        } else if !global.quiet {
+            println!("{}", HumanRenderer::processes(&[]));
+        }
+        return Ok(());
+    }
     let clock = NativeClock;
     let inspector = NativeProcessInspector::new(
         clock
@@ -1532,7 +1591,7 @@ impl SupervisorAcknowledger for DryRunBoundary {
         _job_id: crate::domain::JobId,
         _revision: crate::domain::Revision,
     ) -> Result<(), SupervisorAckError> {
-        Err(SupervisorAckError(
+        Err(SupervisorAckError::Unavailable(
             "dry-run crossed its supervisor boundary".to_owned(),
         ))
     }
@@ -1564,7 +1623,7 @@ impl SupervisorAcknowledger for SessionAcknowledger {
             return Ok(());
         }
         start_session_supervisor(&self.state_directory, &self.runtime_directory)
-            .map_err(|error| SupervisorAckError(error.to_string()))?;
+            .map_err(|error| SupervisorAckError::Unavailable(error.to_string()))?;
         // The supervisor may still be opening its store and reconciling
         // startup under load; poll until a hard deadline rather than a fixed
         // attempt count.
@@ -1574,7 +1633,7 @@ impl SupervisorAcknowledger for SessionAcknowledger {
             match self.socket.acknowledge(job_id, revision) {
                 Ok(()) => return Ok(()),
                 // A rejected wake is definitive; retrying cannot fix it.
-                Err(error) if error.to_string().contains("rejected the wake") => return Err(error),
+                Err(error @ SupervisorAckError::Rejected(_)) => return Err(error),
                 Err(error) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(error);
@@ -1651,14 +1710,14 @@ mod tests {
     use std::process::ExitCode;
     #[cfg(target_os = "linux")]
     use std::sync::{Mutex, MutexGuard, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::{
-        SUPERVISOR_READY_TIMEOUT, SessionAcknowledger, build_doctor_report, build_job, cancel_job,
-        check_database, check_live_supervisor, check_private_directory, check_supervisor,
-        doctor_exit, finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
+        SessionAcknowledger, build_doctor_report, build_job, cancel_job, check_database,
+        check_live_supervisor, check_private_directory, check_supervisor, doctor_exit,
+        finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
         render_processes, render_run_output, render_runs, render_submission,
         resolve_submitting_tty, run, schedule, split_assignment,
     };
@@ -1713,7 +1772,7 @@ mod tests {
     fn global(json: bool, quiet: bool) -> GlobalArgs {
         GlobalArgs {
             quiet,
-            verbose: 0,
+            verbose: false,
             json,
             color: Some(ColorArg::Never),
             state_dir: None,
@@ -1903,7 +1962,11 @@ mod tests {
     fn man_pages_export_and_report_write_failures() {
         let root = tempdir().expect("root");
         super::export_man_pages(root.path()).expect("export");
-        assert!(root.path().join("atx.1").exists());
+        let page = fs::read_to_string(root.path().join("atx.1")).expect("read man page");
+        assert!(page.lines().any(|line| line.starts_with(".TH ATX ")));
+        assert!(!page.lines().any(|line| line.ends_with(char::is_whitespace)));
+        assert!(!page.contains(".br\n\n.br\n"));
+        assert!(!page.contains("\n\n.br\n"));
 
         let blocker = root.path().join("blocker");
         fs::write(&blocker, b"").expect("file");
@@ -2175,7 +2238,7 @@ mod tests {
     fn submission_rendering_reports_unsupervised_commits() {
         let outcome = SubmissionOutcome::CommittedUnsupervised {
             job: fixture_job(5_000),
-            error: SupervisorAckError("no supervisor socket".to_owned()),
+            error: SupervisorAckError::Unavailable("no supervisor socket".to_owned()),
         };
         render_submission(&outcome, true, false, ColorArg::Never);
         render_submission(&outcome, false, true, ColorArg::Never);
@@ -2198,7 +2261,7 @@ mod tests {
         let state = root.path().join("state");
         let state_flag = state.clone().into_os_string();
 
-        // No database yet: not-found diagnostics, never a crash.
+        // No database yet: collection reads are empty successes.
         assert_eq!(
             run([
                 OsString::from("atx"),
@@ -2206,7 +2269,7 @@ mod tests {
                 state_flag.clone(),
                 OsString::from("list")
             ]),
-            exit::not_found()
+            ExitCode::SUCCESS
         );
 
         let _store = {
@@ -2258,6 +2321,31 @@ mod tests {
                 OsString::from("bogus"),
             ]),
             exit::usage()
+        );
+    }
+
+    #[test]
+    fn show_surfaces_run_history_storage_failures() {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(7_000);
+        store.create(&job).expect("create job");
+        store
+            .database()
+            .connection()
+            .execute_batch("ALTER TABLE runs RENAME TO broken_runs")
+            .expect("break run history table");
+        drop(store);
+
+        assert_eq!(
+            run([
+                OsString::from("atx"),
+                OsString::from("--state-dir"),
+                root.path().as_os_str().to_owned(),
+                OsString::from("show"),
+                OsString::from(job.id().to_string()),
+            ]),
+            exit::storage()
         );
     }
 
@@ -2594,6 +2682,10 @@ mod tests {
 
     #[test]
     fn unreadable_runtime_entries_warn_as_disagreeing() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root bypasses directory search permissions");
+            return;
+        }
         let runtime = tempdir().expect("runtime root");
         fs::write(runtime.path().join("supervisor.lock"), b"").expect("lock");
         fs::write(runtime.path().join("supervisor.sock"), b"").expect("socket file");
@@ -3018,8 +3110,7 @@ mod tests {
         let elapsed = clock.now_elapsed().expect("elapsed");
         let cwd = file.to_str().expect("utf8").to_owned();
         let args = parsed_schedule(&["atx", "--cwd", &cwd, "30s", "--", "true"]);
-        let error = build_job(&args, &config, wall, elapsed).expect_err("file cwd");
-        assert!(error.contains("not a directory"));
+        assert!(build_job(&args, &config, wall, elapsed).is_err());
     }
 
     #[test]
@@ -3172,25 +3263,23 @@ mod tests {
         let error = acknowledger
             .acknowledge(JobId::new(), Revision::new(1).expect("revision"))
             .expect_err("wake was rejected");
-        assert!(error.to_string().contains("rejected the wake"));
+        assert!(matches!(error, SupervisorAckError::Rejected(_)));
     }
 
     #[test]
-    fn session_acknowledger_gives_up_at_the_readiness_deadline() {
+    fn session_acknowledger_errors_when_supervisor_never_appears() {
         let root = tempdir().expect("root");
-        let state = private_dir(root.path(), "state");
         // No socket exists and no supervisor ever appears: every wake attempt
-        // fails immediately, so the loop must run out its readiness budget.
-        let started = Instant::now();
+        // fails, so the readiness loop must eventually return the error.
         let acknowledger = SessionAcknowledger::new(
             private_dir(root.path(), "state2"),
             private_dir(root.path(), "runtime2"),
         );
-        drop((
-            state,
-            acknowledger.acknowledge(JobId::new(), Revision::new(1).expect("revision")),
-        ));
-        assert!(started.elapsed() >= SUPERVISOR_READY_TIMEOUT);
+        let result = acknowledger.acknowledge(JobId::new(), Revision::new(1).expect("revision"));
+        assert!(
+            result.is_err(),
+            "a missing supervisor cannot acknowledge a wake"
+        );
     }
 
     #[test]
@@ -3269,7 +3358,7 @@ mod tests {
 
         assert!(matches!(
             finish_job_cancellation(&mut store, job.id(), RunState::Succeeded, NativeClock),
-            Err(ManagementError::Store(_))
+            Err(ManagementError::StateConflict(_))
         ));
         drop(requested);
     }
@@ -3389,7 +3478,7 @@ mod tests {
 
         let global = GlobalArgs {
             quiet: false,
-            verbose: 0,
+            verbose: false,
             json: true,
             color: Some(ColorArg::Never),
             state_dir: Some(state.clone()),

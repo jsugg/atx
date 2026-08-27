@@ -61,20 +61,19 @@ pub(crate) struct RunArtifacts {
 }
 
 impl RunArtifacts {
+    #[cfg(test)]
     pub(crate) fn stdout_path(&self) -> &Path {
         &self.stdout_path
     }
 
+    #[cfg(test)]
     pub(crate) fn stderr_path(&self) -> &Path {
         &self.stderr_path
     }
 
+    #[cfg(test)]
     pub(crate) const fn stdout_file(&self) -> &File {
         &self.stdout_file
-    }
-
-    pub(crate) const fn stderr_file(&self) -> &File {
-        &self.stderr_file
     }
 
     pub(crate) fn into_parts(self) -> (PathBuf, PathBuf, File, File) {

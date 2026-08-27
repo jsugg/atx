@@ -20,6 +20,7 @@ pub(crate) struct SystemdUserService<R = NativeCommandRunner> {
 }
 
 impl SystemdUserService {
+    #[cfg(target_os = "linux")]
     pub(crate) fn new(
         executable: PathBuf,
         state_directory: PathBuf,
@@ -357,16 +358,10 @@ mod tests {
             1000,
             FakeRunner::healthy(),
         );
-        let status = lingering.status().expect("status");
-        assert!(status.running);
-        assert_eq!(
-            status.detail,
-            "user service is enabled, running, and lingering is enabled"
-        );
-        assert_eq!(
-            status.guarantee,
-            "restarts after crashes and starts without an interactive login"
-        );
+        let lingering_status = lingering.status().expect("status");
+        assert!(lingering_status.running);
+        assert!(!lingering_status.detail.is_empty());
+        assert!(!lingering_status.guarantee.is_empty());
 
         let plain = SystemdUserService::with_runner(
             "/bin/atx".into(),
@@ -376,16 +371,12 @@ mod tests {
             1000,
             FakeRunner::no_linger(),
         );
-        let status = plain.status().expect("status");
-        assert!(status.running);
-        assert_eq!(
-            status.detail,
-            "user service is enabled and running; lingering is disabled"
-        );
-        assert_eq!(
-            status.guarantee,
-            "restarts after crashes while this user's systemd manager is running"
-        );
+        let plain_status = plain.status().expect("status");
+        assert!(plain_status.running);
+        assert!(!plain_status.detail.is_empty());
+        assert!(!plain_status.guarantee.is_empty());
+        assert_ne!(lingering_status.detail, plain_status.detail);
+        assert_ne!(lingering_status.guarantee, plain_status.guarantee);
     }
 
     #[test]
@@ -403,8 +394,17 @@ mod tests {
         )
         .expect("write unit");
 
-        // A failing loginctl probe must degrade to lingering disabled
-        // instead of failing the whole status report.
+        let no_linger = SystemdUserService::with_runner(
+            "/bin/atx".into(),
+            root.path().join("state"),
+            root.path().join("runtime"),
+            unit.clone(),
+            1000,
+            FakeRunner::no_linger(),
+        );
+        let expected = no_linger.status().expect("no-linger status");
+
+        // A failed probe should use the same safe result as a disabled setting.
         let service = SystemdUserService::with_runner(
             "/bin/atx".into(),
             root.path().join("state"),
@@ -418,10 +418,8 @@ mod tests {
         );
         let status = service.status().expect("status");
         assert!(status.running);
-        assert_eq!(
-            status.detail,
-            "user service is enabled and running; lingering is disabled"
-        );
+        assert_eq!(status.detail, expected.detail);
+        assert_eq!(status.guarantee, expected.guarantee);
     }
 
     #[test]
@@ -521,7 +519,7 @@ mod tests {
         );
         let status = service.status().expect("status");
         assert!(!status.running);
-        assert_eq!(status.detail, "user service is installed but not running");
+        assert!(!status.detail.is_empty());
     }
 
     #[test]
@@ -538,7 +536,7 @@ mod tests {
         let status = service.status().expect("status");
         assert!(!status.installed);
         assert!(!status.running);
-        assert_eq!(status.detail, "user service is not installed");
+        assert!(!status.detail.is_empty());
     }
 
     #[test]

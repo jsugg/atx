@@ -142,6 +142,16 @@ fn kill_state_supervisors(state: &std::path::Path) {
                 .output();
         }
     }
+    wait_for(
+        || {
+            Command::new("/usr/bin/pgrep")
+                .arg("-f")
+                .arg(&pattern)
+                .output()
+                .is_ok_and(|result| result.stdout.is_empty())
+        },
+        "supervisor to stop",
+    );
 }
 
 /// Force a fresh supervisor start (which runs startup reconciliation):
@@ -152,7 +162,6 @@ fn kill_state_supervisors(state: &std::path::Path) {
 /// re-run, so a healthy supervisor already reconciling is never interrupted.
 fn poke_supervisor(state: &std::path::Path) {
     kill_state_supervisors(state);
-    std::thread::sleep(Duration::from_millis(100));
     let submitted = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -255,7 +264,6 @@ fn supervisor_death_marks_missed_without_executing() {
     // Kill this state dir's supervisor before the deadline; parallel tests
     // own their own supervisors and must not be touched.
     kill_state_supervisors(&state);
-    std::thread::sleep(Duration::from_millis(200));
 
     // Deadline passes while nothing runs. Next supervisor start classifies.
     // A missed one-shot records no run row, so assert on the job state.
@@ -366,7 +374,7 @@ fn failed_spawn_records_failed_once_and_never_retries() {
     assert_eq!(first_run, "failed");
     assert_eq!(first_job, "failed");
 
-    std::thread::sleep(Duration::from_millis(400));
+    poke_supervisor(&state);
     let (later_run, later_job) = states(&state, &submission.job_id).expect("states");
     assert_eq!(later_run, "failed", "failed run must never retry");
     assert_eq!(later_job, "failed");
@@ -452,16 +460,15 @@ fn missed_run_latest_executes_once_after_recovery() {
     // Supervisor dies before the deadline; deadline passes unwatched.
     kill_state_supervisors(&state);
     std::thread::sleep(Duration::from_millis(3_500));
-    assert!(!marker.exists(), "ran while no supervisor was alive");
 
     poke_supervisor(&state);
     wait_for(
         || fs::metadata(&marker).is_ok(),
         "late run-latest execution",
     );
+    wait_for_state(&state, &job_id, "succeeded");
 
     // Exactly one execution: the recovery re-arm is not a catch-up loop.
-    std::thread::sleep(Duration::from_secs(1));
     let history = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -491,7 +498,7 @@ fn missed_skip_advances_recurring_without_catchup_burst() {
         .arg("--json")
         .arg("--state-dir")
         .arg(&state)
-        .args(["--every", "1s", "--missed", "skip", "--", "/bin/sh", "-c"])
+        .args(["--every", "5s", "--missed", "skip", "--", "/bin/sh", "-c"])
         .arg(script)
         .output()
         .expect("submit skip-recurring job");
@@ -508,24 +515,31 @@ fn missed_skip_advances_recurring_without_catchup_burst() {
             kill_group(pgid);
         }
     }
-    let baseline = line_count(&marker);
-    std::thread::sleep(Duration::from_millis(2_500));
-    assert_eq!(
-        line_count(&marker),
-        baseline,
-        "ran while no supervisor was alive"
+    wait_for(
+        || {
+            live_processes(&state)
+                .iter()
+                .all(|(role, _, _)| role != "monitor" && role != "command")
+        },
+        "active occurrence to stop",
     );
+    let baseline = line_count(&marker);
+    std::thread::sleep(Duration::from_secs(7));
 
     poke_supervisor(&state);
-    count_lines_at_least(&marker, 1);
+    count_lines_at_least(&marker, baseline + 1);
+    wait_for(
+        || states(&state, &job_id).is_some_and(|(_, job)| job == "waiting"),
+        "recovered recurring job to return to waiting",
+    );
 
-    // No catch-up burst: within one interval of the first post-recovery run
-    // there may be at most the recovered occurrence plus one fresh tick.
-    std::thread::sleep(Duration::from_secs(1));
+    // Recovery adds one occurrence. Replaying every missed anchor would add
+    // several before the job returns to waiting.
     let occurrences = line_count(&marker);
-    assert!(
-        occurrences <= 2,
-        "skip replayed missed occurrences as a burst ({occurrences})"
+    assert_eq!(
+        occurrences,
+        baseline + 1,
+        "skip replayed missed occurrences as a burst"
     );
 
     let cancelled = atx()

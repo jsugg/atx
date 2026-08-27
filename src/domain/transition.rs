@@ -11,8 +11,8 @@ pub(crate) enum TransitionActor {
     Cli,
     Supervisor,
     Monitor,
+    #[cfg(test)]
     Recovery,
-    Retention,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

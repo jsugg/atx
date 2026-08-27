@@ -6,11 +6,8 @@ mod reconcile;
 mod retention;
 mod run_store;
 
-#[allow(unused_imports)]
 pub(crate) use job_store::JobStore;
-#[allow(unused_imports)]
 pub(crate) use reconcile::StartupStore;
-#[allow(unused_imports)]
 pub(crate) use retention::RetentionPolicy;
 
 use std::fs::{self, OpenOptions};
@@ -227,6 +224,7 @@ pub(crate) enum StoreError {
     NotFound,
     #[error("job revision changed")]
     Conflict,
+    #[cfg(test)]
     #[error("page size must be between 1 and 100")]
     InvalidPageSize,
     #[error("database stayed busy past its configured timeout")]
@@ -278,7 +276,7 @@ mod tests {
     use rustix::fs::OpenOptionsExt as _;
     use tempfile::tempdir;
 
-    use super::{CURRENT_SCHEMA_VERSION, Database, apply_migrations, map_read_error};
+    use super::{CURRENT_SCHEMA_VERSION, Database, StoreError, apply_migrations, map_read_error};
 
     #[test]
     fn schema_has_expected_constraints_and_indexes() {
@@ -496,6 +494,10 @@ mod tests {
 
     #[test]
     fn unwritable_parent_directory_surfaces_as_io_error() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root bypasses directory write permissions");
+            return;
+        }
         let root = tempdir().expect("temp root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555))
             .expect("lock directory");
@@ -587,10 +589,7 @@ mod tests {
             rusqlite::types::Type::Text,
             Box::new(std::io::Error::other("not a store error")),
         ));
-        assert!(
-            error.to_string().starts_with("database operation failed"),
-            "{error}"
-        );
+        assert!(matches!(error, StoreError::Sqlite(_)));
     }
 
     #[test]

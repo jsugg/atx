@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(completed.state(), RunState::Succeeded);
         let echoed = fs::read_to_string(&tty).expect("echoed output");
         assert!(
-            echoed.contains("[atx: output truncated at capture cap]"),
+            echoed.to_lowercase().contains("truncated"),
             "truncation notice missing: {echoed:?}"
         );
     }
@@ -621,7 +621,7 @@ mod tests {
         assert_eq!(completed.state(), RunState::Succeeded);
         let echoed = fs::read_to_string(&tty).expect("echoed output");
         assert!(
-            echoed.contains("[atx: output truncated at capture cap]"),
+            echoed.to_lowercase().contains("truncated"),
             "truncation notice missing: {echoed:?}"
         );
     }

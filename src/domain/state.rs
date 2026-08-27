@@ -18,6 +18,7 @@ pub(crate) enum JobState {
 }
 
 impl JobState {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 10] = [
         Self::Scheduled,
         Self::Waiting,
@@ -52,6 +53,7 @@ pub(crate) enum RunState {
 }
 
 impl RunState {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 7] = [
         Self::Starting,
         Self::Running,

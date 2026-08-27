@@ -2,7 +2,9 @@
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStderr, ChildStdout, Command, Output, Stdio};
+#[cfg(test)]
+use std::process::Output;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -107,6 +109,7 @@ impl SpawnedChild {
         &self.identity
     }
 
+    #[cfg(test)]
     pub(crate) fn child_mut(&mut self) -> &mut Child {
         &mut self.child
     }
@@ -125,6 +128,7 @@ impl SpawnedChild {
         reap_failed_spawn(&mut self.child);
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_with_output(self) -> io::Result<Output> {
         self.child.wait_with_output()
     }

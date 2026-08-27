@@ -1,1 +1,0 @@
-//! Job-detail application service.

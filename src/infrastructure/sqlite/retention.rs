@@ -1,7 +1,10 @@
 //! Retention queries and orphan discovery.
 
+#[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 use jiff::SignedDuration;
@@ -128,6 +131,7 @@ fn cutoff(now: UtcTimestamp, days: u16) -> Result<String, StoreError> {
         .map_err(|_| StoreError::Domain("retention cutoff overflow".to_owned()))
 }
 
+#[cfg(test)]
 pub(crate) fn discover_orphan_artifacts(
     runs_directory: &Path,
     known_runs: &[RunId],
@@ -150,6 +154,7 @@ pub(crate) fn discover_orphan_artifacts(
 pub(crate) enum RetentionError {
     #[error("retention days must be between 1 and 3650")]
     InvalidDays,
+    #[cfg(test)]
     #[error("artifact directory contains a non-UTF-8 name")]
     NonUtf8Artifact,
     #[error("artifact scan failed: {0}")]

@@ -33,8 +33,16 @@ jobs:
       - name: Conventional commit titles
         run: |
           base="${{ github.event.pull_request.base.sha || github.event.before }}"
-          range="${base}..${{ github.sha }}"
-          commits=$(git rev-list "$range" --max-count=200)
+          head="${{ github.sha }}"
+          zero=0000000000000000000000000000000000000000
+          if [ -z "$base" ] || [ "$base" = "$zero" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base=$(git rev-parse "$head^" 2>/dev/null || true)
+          fi
+          if [ -n "$base" ]; then
+            commits=$(git rev-list "$base..$head" --max-count=200)
+          else
+            commits=$head
+          fi
           test -n "$commits"
           for c in $commits; do
             if [ "$(git rev-parse "$c^2" 2>/dev/null)" ]; then
@@ -47,7 +55,33 @@ jobs:
             fi
           done
       - name: Markdown lint
-        run: npx markdownlint-cli2 "**/*.md" "!target/**"
+        run: npx --yes markdownlint-cli2@0.23.2 "**/*.md" "!target/**"
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Workflow guards
+        run: |
+          shellcheck scripts/check-workflow-guards.sh
+          scripts/check-workflow-guards.sh
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+        with:
+          toolchain: 1.97.0
+      - name: Install mandoc
+        run: sudo apt-get update && sudo apt-get install -y mandoc shellcheck
+      - name: Generate and lint man pages
+        run: |
+          cargo run --locked -p xtask -- dist-man
+          mandoc -T lint dist/man/*.1
 
   fmt:
     name: fmt
@@ -55,7 +89,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.97.0
           components: rustfmt
@@ -63,9 +97,13 @@ jobs:
         run: cargo fmt --check
 
   clippy:
-    name: clippy
-    runs-on: ubuntu-24.04
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
@@ -77,12 +115,16 @@ jobs:
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   msrv:
-    name: msrv (1.85)
-    runs-on: ubuntu-24.04
+    name: msrv (1.85, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -130,42 +172,53 @@ jobs:
         run: cargo test --all-targets --all-features --locked
 
   coverage:
-    name: coverage
-    runs-on: ubuntu-24.04
+    name: coverage (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    env:
+      # %p and %m prevent forked supervisor and monitor processes from
+      # clobbering one another's profiles before llvm-profdata merges them.
+      LLVM_PROFILE_FILE_NAME: atx-%p-%m.profraw
+      COVERAGE_LINE_FLOOR: 95
+      COVERAGE_REGION_FLOOR: 85
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Nightly is required for `--branch`: llvm-cov's branch instrumentation
       # rides on -Z coverage-options=branch, unavailable on stable.
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-08-01
           components: llvm-tools-preview
       - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Measured on main: lines 95.5%, regions 86.1%. Regions approximate the
-      # branch-level signal the project tracks; the remaining gap sits in
-      # cli dispatch and platform/defensive failure arms. Raise both floors
-      # as those gain tests.
+      # Cached coverage binaries from older source trees skew llvm-cov totals.
+      - name: Clean coverage target
+        run: rm -rf target/llvm-cov-target
       - name: Coverage gate
-        # +nightly overrides the repo's rust-toolchain.toml pin (stable);
-        # --branch needs -Z coverage-options=branch.
         run: >-
-          cargo +nightly llvm-cov --branch --all-targets --all-features --locked
-          --fail-under-lines 95 --fail-under-regions 85 --html
+          cargo +nightly-2026-08-01 llvm-cov --branch --all-targets --all-features --locked
+          --fail-under-lines "$COVERAGE_LINE_FLOOR" --fail-under-regions "$COVERAGE_REGION_FLOOR" --html
       - name: Publish reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-report
+          name: coverage-report-${{ matrix.os }}
           path: target/llvm-cov/html
           retention-days: 14
 
   doc:
-    name: doc
-    runs-on: ubuntu-24.04
+    name: doc (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch

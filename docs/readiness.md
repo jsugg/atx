@@ -1,95 +1,71 @@
-# Production readiness
+# Release check
 
-A dated snapshot of what was checked at the current release candidate.
-Re-run the relevant pieces if you change anything big.
+This is a short record of the checks behind the `0.1.1` release candidate.
+Run them again after any meaningful change.
 
-Candidate: commit `75f625e` on `main`, checked 2026-08-26 from a clean
-worktree with no local modifications. The previous snapshot (commit
-`35b6b4d`) was superseded after an independent audit found release-blocking
-defects; every finding is now closed or explicitly deferred in the working
-notes, and this document records fresh evidence for the new candidate.
+Checked on 2026-08-26. The final proof is the set of required GitHub checks on
+the commit that receives the `v0.1.1` tag; this file does not try to name its own
+commit hash.
 
 ## Build and tests
 
-- Clean worktree at the candidate commit:
-  `./scripts/check.sh quick` and `./scripts/check.sh full` pass
-  (fmt, clippy `-D warnings` pedantic, MSRV, doc build, audit, deny,
-  mdlint, lychee, package file-list, full unit + integration suites).
-- Full test matrix green locally on macOS ARM64, and required CI checks
-  cover Linux plus both Intel/ARM macOS runners.
-- Acceptance suite waits for terminal states and was stress-repeated
-  locally ×10; S11 exercises the real capture cap with 12 MiB streams.
+- `./scripts/check.sh full` covers formatting, warnings, clippy, the full test
+  suite, Rust 1.85, docs, dependency checks, Markdown, links, the package file
+  list, and a crates.io dry run.
+- Required checks run tests on Linux and native Apple Silicon and Intel macOS.
+  Linux also runs the full suite once as root and once as the ordinary runner
+  user.
+- Clippy, the Rust 1.85 check, docs, coverage, and CodeQL run on both Linux and
+  macOS.
+- The S15 late-cancellation regression waits for a terminal run and passes ten
+  repeated runs on macOS.
 
-## Performance evidence
+## Coverage, mutation, and fuzzing
 
-- Release-profile budget test
-  (`infrastructure::sqlite::job_store::tests::
-  ten_thousand_jobs_meet_submission_and_list_budgets`) passes under
-  `--release`: submission p95 ≈ 313 µs, listing p95 ≈ 1.6 ms per
-  100-job page. A nightly workflow re-measures this on fixed hardware.
+- A clean macOS branch-coverage run with the pinned nightly measured 96.57%
+  lines, 94.71% regions, and 91.45% branches. CI removes old coverage binaries
+  before measuring and requires at least 95% lines and 85% regions on both
+  Linux and macOS.
+- A local mutation run over duration parsing, calendar syntax, recurrence, and
+  state transitions finished all 104 mutants in about eight minutes: 79 were
+  caught and 25 could not compile, with no survivors. The nightly workflow uses
+  the same four-file scope and saves the complete `mutants.out` report.
+- The five fuzz targets cover duration input, calendar input, environment
+  files, saved execution data, and IPC frames. Each previously completed its
+  five-minute CI budget without a crash; the scheduled workflow keeps running
+  them.
 
-## Coverage / mutation / fuzz
+## Release files
 
-- Branch coverage at the candidate (llvm-cov with branch mode,
-  all targets and features, pinned nightly): lines 94.8 percent,
-  regions 87.3, functions 96.6. HTML report uploads as a CI artifact.
-- cargo-mutants over `src/domain/` and `src/infrastructure/config/`:
-  442 mutants — 33 caught, 408 unviable, 1 missed. The survivor
-  (`>` vs `>=` on the 255-byte timezone-name cap) was killed by a new
-  boundary test. A nightly mutation workflow keeps future survivors
-  visible.
-- Five fuzz targets (duration, calendar, env_file,
-  execution_persistence, ipc_frame) each ran a 300 s budget against
-  committed seed corpora with the pinned nightly; no crashes.
+- The tag must match `Cargo.toml` and a dated changelog section, and each release
+  job checks out that exact tag.
+- Six native archives cover Apple Silicon and Intel macOS plus x86_64 and arm64
+  Linux with GNU libc and musl. Each archive is unpacked and smoke-tested.
+- Archives include the binary, licence, README, changelog, and lint-clean man
+  pages. Each archive has a CycloneDX SBOM.
+- `SHA256SUMS` covers archives and SBOMs. A real tag run attests the archives,
+  SBOMs, and checksum file, then verifies those attestations before making a
+  draft release. A manual rehearsal publishes and attests nothing.
+- The `release` and `crates-io` environments each allow `v*` **tag** refs. The
+  main-branch ruleset requires the new Linux/macOS matrix checks and the root
+  test job.
 
-## JSON contract
+## Security and dependencies
 
-- `docs/json-api.md` documents the versioned envelope (`schema_version`)
-  and every field of every machine-readable payload; golden key-set
-  end-to-end tests pin those shapes against the real binary so doc and
-  code cannot drift silently.
+- `cargo audit` and `cargo deny` pass on the locked dependency set.
+- GitHub Actions use full commit SHAs. The nightly toolchain and the audit,
+  deny, Markdown, link, and mutation tools have fixed versions.
+- State and runtime paths check owners, modes, file types, and symlinks.
+  Cancellation checks boot identity, process start identity, and process group
+  before signalling.
+- Saved environment values are redacted from normal output. IPC frames and
+  external inputs have explicit size and encoding checks.
 
-## Release artifacts
+## Before publishing
 
-- `release.yml` checks out the exact tag for every job and proves
-  HEAD == tagged commit before anything builds; tag must equal
-  Cargo.toml version and match a changelog section whose text becomes
-  the release notes.
-- Archives carry the binary, LICENSE-MIT, README, and generated man
-  pages; CI extracts and inspects each archive like a consumer before
-  upload. SBOMs, SHA256SUMS, and build-provenance attestations are
-  produced and verified inside the run.
-- The publish path uses short-lived OIDC credentials; no workflow reads
-  a stored registry token. Publishing to crates.io additionally requires
-  the repository variable `CRATES_IO_PUBLISH_ENABLED=true`
-  (currently unset — zero repository variables exist) and stays gated on
-  the owner's separate recorded authorization.
-
-## Supply chain
-
-- `cargo deny` licenses/sources clean; `cargo audit` reports no known
-  vulnerabilities across the locked dependency set.
-- All GitHub Actions are pinned to full commit SHAs.
-- Dependency-review and CodeQL run on every PR.
-
-## Security posture
-
-- Trust boundaries documented in `docs/security-model.md`.
-- Malformed external input (including non-UTF-8 environment entries)
-  produces typed errors instead of panics; one failing due job cannot
-  suppress its batch and is retried with a bounded backoff.
-- State and runtime paths reject unsafe owners, modes, and symlink
-  substitution; background processes open logs through a
-  directory-relative no-follow helper.
-- Cancellation verifies boot identity, PID start token, and process
-  group before signaling.
-- Configuration keys (`history_days`, `terminal_job_days`,
-  `max_log_bytes_per_stream`) demonstrably change background-process
-  behavior, verified by end-to-end tests with non-default values.
-
-## What remains before publishing
-
-- Remote CI green on the candidate commit (required ruleset checks).
-- A GitHub release rehearsal from an annotated tag proving archives,
-  checksums, SBOMs, and attestations end-to-end.
-- Owner's recorded `GREENLIGHT PUBLISH CRATE` authorization.
+1. Merge the candidate only after every required check is green.
+2. Tag that exact merge commit as `v0.1.1` and inspect the resulting draft
+   release, checksums, SBOMs, and attestations.
+3. Publish the draft when it looks right.
+4. Do not publish the crate without the owner's exact
+   `GREENLIGHT PUBLISH CRATE` authorization.

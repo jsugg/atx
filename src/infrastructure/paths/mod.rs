@@ -11,7 +11,9 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Platform {
+    #[cfg(any(target_os = "linux", test))]
     Linux,
+    #[cfg(any(target_os = "macos", test))]
     MacOs,
 }
 
@@ -39,6 +41,7 @@ impl PlatformPaths {
         &self.runtime_dir
     }
 
+    #[cfg(test)]
     pub(crate) const fn runtime_uses_fallback(&self) -> bool {
         self.runtime_uses_fallback
     }
@@ -60,6 +63,7 @@ pub(crate) fn resolve_paths(
     }
 
     let state_dir = match platform {
+        #[cfg(any(target_os = "linux", test))]
         Platform::Linux => environment
             .xdg_state_home
             .as_ref()
@@ -71,6 +75,7 @@ pub(crate) fn resolve_paths(
                     .map(|home| home.join(".local/state/atx"))
             })
             .ok_or(PathError::MissingHome)?,
+        #[cfg(any(target_os = "macos", test))]
         Platform::MacOs => environment
             .home
             .as_ref()
@@ -80,10 +85,12 @@ pub(crate) fn resolve_paths(
     require_absolute(&state_dir)?;
 
     let (runtime_dir, runtime_uses_fallback) = match platform {
+        #[cfg(any(target_os = "linux", test))]
         Platform::Linux => match &environment.xdg_runtime_dir {
             Some(root) => (root.join("atx"), false),
             None => (fallback_runtime(environment, uid)?, true),
         },
+        #[cfg(any(target_os = "macos", test))]
         Platform::MacOs => (fallback_runtime(environment, uid)?, true),
     };
     require_absolute(&runtime_dir)?;
@@ -148,6 +155,7 @@ pub(crate) fn create_new_private_file(directory: &File, name: &str) -> Result<Fi
     Ok(File::from(file))
 }
 
+#[cfg(test)]
 pub(crate) fn open_private_file(directory: &File, name: &str) -> Result<File, PathError> {
     validate_leaf_name(name)?;
     let file = openat(
@@ -242,7 +250,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PathEnvironment, Platform, create_new_private_file, ensure_private_dir,
+        PathEnvironment, PathError, Platform, create_new_private_file, ensure_private_dir,
         open_or_create_private_append_log, open_private_file, resolve_paths,
         validate_private_dir_for_uid,
     };
@@ -505,10 +513,6 @@ mod tests {
         // The parent of the target does not exist, so creation fails for a
         // reason other than AlreadyExists and must not be swallowed.
         let nested = root.path().join("missing").join("leaf");
-        let error = ensure_private_dir(&nested).expect_err("missing parent");
-        assert!(
-            error.to_string().contains("filesystem operation failed"),
-            "{error}"
-        );
+        assert!(matches!(ensure_private_dir(&nested), Err(PathError::Io(_))));
     }
 }

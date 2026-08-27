@@ -19,6 +19,7 @@ pub(super) const JOB_COLUMNS: &str = "
     runtime_tier, schedule_json, missed_policy, execution_json, next_due_utc,
     timezone_database_version, owner_uid
 ";
+#[cfg(test)]
 const MAX_PAGE_SIZE: usize = 100;
 
 pub(crate) struct JobStore {
@@ -30,6 +31,7 @@ impl JobStore {
         Self { database }
     }
 
+    #[cfg(test)]
     pub(crate) const fn database(&self) -> &Database {
         &self.database
     }
@@ -79,6 +81,7 @@ impl JobStore {
         load_job(self.database.connection(), id)
     }
 
+    #[cfg(test)]
     pub(crate) fn list(&self, after: Option<JobId>, limit: usize) -> Result<Vec<Job>, StoreError> {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             return Err(StoreError::InvalidPageSize);
@@ -100,6 +103,7 @@ impl JobStore {
         rows.map(|row| row.map_err(map_read_error)).collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn delete(
         &mut self,
         id: JobId,
@@ -521,10 +525,17 @@ pub(super) mod tests {
             .connection_mut()
             .execute_batch("BEGIN IMMEDIATE")
             .expect("write lock");
-        let start = Instant::now();
-        let result = contender.create(&sample_job(1_000, 1_030));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(contender.create(&sample_job(1_000, 1_030)))
+                .expect("test is waiting for the result");
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the configured busy timeout must bound lock waiting");
         assert!(matches!(result, Err(StoreError::Busy)));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        worker.join().expect("contender thread");
         blocker
             .connection_mut()
             .execute_batch("ROLLBACK")
