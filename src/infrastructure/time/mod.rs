@@ -39,6 +39,7 @@ fn elapsed_from_parts(seconds: i64, nanoseconds: i64) -> Result<ElapsedInstant, 
         .ok_or(ClockError::OutOfRange)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn ticks_to_nanos(ticks: u128, numerator: u32, denominator: u32) -> Result<u128, ClockError> {
     if denominator == 0 {
         return Err(ClockError::Unavailable);

@@ -291,8 +291,10 @@ pub(crate) enum ProcessError {
     Malformed,
     #[error("permission denied while inspecting process")]
     PermissionDenied,
+    #[cfg(target_os = "macos")]
     #[error("process inspection is unsupported on this platform")]
     Unsupported,
+    #[cfg(target_os = "macos")]
     #[error("process inspection is unavailable")]
     Unavailable,
     #[cfg(any(target_os = "linux", test))]

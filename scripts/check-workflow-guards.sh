@@ -30,7 +30,9 @@ for workflow in .github/workflows/*.yml; do
 done
 
 require_pattern .github/workflows/ci.yml 'markdownlint-cli2@[0-9]+\.[0-9]+\.[0-9]+'
-require_pattern .github/workflows/ci.yml 'tool:[[:space:]]+actionlint@[0-9]+\.[0-9]+\.[0-9]+'
+require_pattern .github/workflows/ci.yml 'ACTIONLINT_VERSION:[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+'
+require_pattern .github/workflows/ci.yml 'rhysd/actionlint/releases/download/'
+require_pattern .github/workflows/ci.yml 'sha256sum --check'
 require_literal .github/workflows/ci.yml '          scripts/check-workflow-guards.sh'
 require_pattern .github/workflows/ci.yml 'toolchain:[[:space:]]+nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}'
 require_pattern .github/workflows/ci.yml 'ubuntu-[0-9]'

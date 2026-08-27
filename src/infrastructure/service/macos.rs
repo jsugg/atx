@@ -19,6 +19,7 @@ pub(crate) struct LaunchdService<R = NativeCommandRunner> {
     runner: R,
 }
 
+#[cfg(target_os = "macos")]
 impl LaunchdService {
     pub(crate) fn new(
         executable: PathBuf,
