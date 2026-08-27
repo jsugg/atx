@@ -20,6 +20,9 @@ cargo test --all-targets --all-features --locked
 
 Run `./scripts/check.sh full` before calling a phase complete.
 
+The retention integration test uses the `sqlite3` command. Install it before
+running the full suite.
+
 Some permission tests intentionally need an ordinary user because root can
 bypass the Unix permission checks they exercise. They skip explicitly when run
 as root; use a non-root account or container user when changing those tests.
