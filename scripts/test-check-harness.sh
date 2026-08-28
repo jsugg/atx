@@ -10,60 +10,32 @@ trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 cat >"$tmp/cargo" <<'SCRIPT'
 #!/bin/sh
-printf '%s\n' "$*" >>"$ATX_FAKE_LOG"
-saw_check=0
-saw_package=0
-saw_list=0
-saw_publish=0
-saw_dry_run=0
-for argument in "$@"; do
-    case "$argument" in
-        check) saw_check=1 ;;
-        package) saw_package=1 ;;
-        --list) saw_list=1 ;;
-        publish) saw_publish=1 ;;
-        --dry-run) saw_dry_run=1 ;;
-    esac
-done
-if [ "${ATX_FAKE_FAIL_CHECK:-0}" -eq 1 ] && [ "$saw_check" -eq 1 ]; then
-    exit 23
+case "$*" in
+    'fmt --check') stage=cargo-fmt ;;
+    'check --all-targets --all-features --locked') stage=cargo-check ;;
+    'test --all-targets --all-features --locked') stage=cargo-test ;;
+    'clippy --all-targets --all-features --locked -- -D warnings') stage=cargo-clippy ;;
+    '+1.85.0 check --all-targets --all-features --locked') stage=cargo-msrv ;;
+    'doc --no-deps --all-features') stage=cargo-doc ;;
+    audit) stage=cargo-audit ;;
+    'deny check') stage=cargo-deny ;;
+    'package --list') stage=cargo-package ;;
+    'publish --dry-run --locked') stage=cargo-publish ;;
+    *)
+        printf 'unexpected cargo command: %s\n' "$*" >&2
+        exit 97
+        ;;
+esac
+
+printf '%s\n' "$stage" >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = "$stage" ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
 fi
-if [ "$saw_package" -eq 1 ] && [ "$saw_list" -eq 1 ]; then
+if [ "$stage" = cargo-package ]; then
     cat "$ATX_PACKAGE_LIST"
 fi
-if [ "$saw_publish" -eq 1 ] && [ "$saw_dry_run" -ne 1 ]; then
-    printf 'live cargo publish attempted\n' >&2
-    exit 97
-fi
-exit 0
 SCRIPT
 chmod 0700 "$tmp/cargo"
-
-export ATX_FAKE_LOG="$tmp/calls"
-export ATX_PACKAGE_LIST="$tmp/package-good"
-cat >"$ATX_PACKAGE_LIST" <<'LIST'
-.cargo_vcs_info.json
-CHANGELOG.md
-Cargo.lock
-Cargo.toml
-Cargo.toml.orig
-LICENSE-MIT
-README.md
-src/main.rs
-LIST
-
-status=0
-ATX_FAKE_FAIL_CHECK=1 PATH="$tmp:$PATH" scripts/check.sh quick || status=$?
-
-if [ "$status" -ne 23 ]; then
-    printf 'quick check did not preserve the failing command status: %s\n' "$status" >&2
-    exit 1
-fi
-
-if ! tail -n 1 "$ATX_FAKE_LOG" | grep -Eq '(^|[[:space:]])check($|[[:space:]])'; then
-    printf 'quick check continued after failure\n' >&2
-    exit 1
-fi
 
 cat >"$tmp/versioned-tool" <<'SCRIPT'
 #!/bin/sh
@@ -75,6 +47,15 @@ case "$name" in
     lychee) version=0.24.2 ;;
     *) exit 97 ;;
 esac
+
+stage=$name
+if [ "${1:-}" = --version ]; then
+    stage=$name-version
+fi
+printf '%s\n' "$stage" >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = "$stage" ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
+fi
 if [ "${1:-}" = --version ]; then
     printf '%s %s\n' "$name" "$version"
 fi
@@ -93,15 +74,86 @@ chmod 0700 "$tmp/remote-command"
 ln -s remote-command "$tmp/git"
 ln -s remote-command "$tmp/gh"
 
-: >"$ATX_FAKE_LOG"
-PATH="$tmp:$PATH" scripts/check.sh static
-scripts/check-package-list.sh "$ATX_PACKAGE_LIST"
+export ATX_FAKE_LOG="$tmp/calls"
+export ATX_PACKAGE_LIST="$tmp/package-good"
+cat >"$ATX_PACKAGE_LIST" <<'LIST'
+.cargo_vcs_info.json
+CHANGELOG.md
+Cargo.lock
+Cargo.toml
+Cargo.toml.orig
+LICENSE-MIT
+README.md
+src/main.rs
+LIST
 
-cp "$ATX_PACKAGE_LIST" "$tmp/package-bad"
-printf '%s\n' '.local/plan.md' >>"$tmp/package-bad"
-if scripts/check-package-list.sh "$tmp/package-bad" >/dev/null 2>&1; then
-    printf 'package policy accepted an internal file\n' >&2
-    exit 1
-fi
+assert_failure() {
+    mode=$1
+    stage=$2
+    expected_status=$3
+
+    : >"$ATX_FAKE_LOG"
+    status=0
+    ATX_FAKE_FAIL_STAGE="$stage" ATX_FAKE_FAIL_STATUS="$expected_status" \
+        PATH="$tmp:$PATH" scripts/check.sh "$mode" >/dev/null 2>&1 || status=$?
+
+    if [ "$status" -ne "$expected_status" ]; then
+        printf '%s did not preserve %s failure status: expected %s, got %s\n' \
+            "$mode" "$stage" "$expected_status" "$status" >&2
+        exit 1
+    fi
+
+    last_stage=$(tail -n 1 "$ATX_FAKE_LOG")
+    if [ "$last_stage" != "$stage" ]; then
+        printf '%s continued after %s failure; last stage was %s\n' \
+            "$mode" "$stage" "$last_stage" >&2
+        exit 1
+    fi
+}
+
+assert_package_policy_failure() {
+    mode=$1
+    bad_package_list="$tmp/package-bad-$mode"
+    cp "$ATX_PACKAGE_LIST" "$bad_package_list"
+    printf '%s\n' '.local/plan.md' >>"$bad_package_list"
+
+    : >"$ATX_FAKE_LOG"
+    status=0
+    ATX_PACKAGE_LIST="$bad_package_list" PATH="$tmp:$PATH" \
+        scripts/check.sh "$mode" >/dev/null 2>&1 || status=$?
+
+    if [ "$status" -ne 1 ]; then
+        printf '%s did not preserve package-policy failure status: %s\n' \
+            "$mode" "$status" >&2
+        exit 1
+    fi
+    if grep -qx cargo-publish "$ATX_FAKE_LOG"; then
+        printf '%s continued after package-policy failure\n' "$mode" >&2
+        exit 1
+    fi
+}
+
+for stage in cargo-fmt cargo-check cargo-test cargo-clippy; do
+    assert_failure quick "$stage" 41
+    assert_failure full "$stage" 41
+done
+
+for stage in \
+    cargo-msrv cargo-doc \
+    cargo-audit-version cargo-deny-version mdlint-version lychee-version \
+    cargo-audit cargo-deny mdlint lychee cargo-package cargo-publish
+do
+    assert_failure static "$stage" 41
+    assert_failure full "$stage" 41
+done
+
+assert_package_policy_failure static
+assert_package_policy_failure full
+
+for mode in quick static full; do
+    : >"$ATX_FAKE_LOG"
+    PATH="$tmp:$PATH" scripts/check.sh "$mode"
+done
+scripts/check-package-list.sh "$ATX_PACKAGE_LIST"
 
 printf 'quality-harness-tests: PASS\n'
