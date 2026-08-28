@@ -201,13 +201,15 @@ fn serve_ipc(
                 // Every Wake gets a reply so clients never read a bare EOF:
                 // retry the load briefly to ride out transient database
                 // contention, then nack with the reason.
-                let reply = match load_deadline_with_retry(database_path, job_id) {
-                    Ok(deadline) => {
-                        if sender
-                            .send(SupervisorEvent::Schedule { job_id, deadline })
-                            .is_err()
-                        {
-                            break;
+                let reply = match load_wake_with_retry(database_path, job_id) {
+                    Ok(disposition) => {
+                        if let WakeDisposition::Schedule(deadline) = disposition {
+                            if sender
+                                .send(SupervisorEvent::Schedule { job_id, deadline })
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         IpcMessage::Ack {
                             protocol: 1,
@@ -229,45 +231,48 @@ fn serve_ipc(
     }
 }
 
-/// Load the deadline, retrying transient database failures so a busy store
-/// under load does not turn into an immediate nack.
-fn load_deadline_with_retry(
+#[derive(Debug)]
+enum WakeDisposition {
+    Schedule(crate::domain::ElapsedInstant),
+    AlreadyTerminal,
+}
+
+/// Load the wake disposition, retrying transient database failures so a busy
+/// store under load does not turn into an immediate nack.
+fn load_wake_with_retry(
     database_path: &Path,
     job_id: crate::domain::JobId,
-) -> Result<crate::domain::ElapsedInstant, DaemonError> {
+) -> Result<WakeDisposition, DaemonError> {
     const LOAD_ATTEMPTS: usize = 3;
     let mut last_error = DaemonError::MissingJob;
     for attempt in 0..LOAD_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(50));
         }
-        match load_deadline(database_path, job_id) {
-            Ok(deadline) => return Ok(deadline),
-            // A missing or terminal job is definitive; only retry
-            // storage-level faults.
-            Err(error @ (DaemonError::MissingJob | DaemonError::RevisionChanged)) => {
-                return Err(error);
-            }
+        match load_wake(database_path, job_id) {
+            Ok(disposition) => return Ok(disposition),
+            // A missing job is definitive; only retry storage-level faults.
+            Err(error @ DaemonError::MissingJob) => return Err(error),
             Err(error) => last_error = error,
         }
     }
     Err(last_error)
 }
 
-/// The wake carries the submitter's revision, but the deadline is always read
-/// from the freshly-loaded job: racing the supervisor's own Scheduled→Waiting
-/// transition must not nack a valid submission.
-fn load_deadline(
+/// The wake carries the submitter's identity, but state is always read from
+/// the freshly-loaded job so supervisor-owned transitions cannot nack it.
+fn load_wake(
     database_path: &Path,
     job_id: crate::domain::JobId,
-) -> Result<crate::domain::ElapsedInstant, DaemonError> {
+) -> Result<WakeDisposition, DaemonError> {
     let store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
     let job = store.load(job_id)?.ok_or(DaemonError::MissingJob)?;
     if job.state().is_terminal() {
-        return Err(DaemonError::RevisionChanged);
+        return Ok(WakeDisposition::AlreadyTerminal);
     }
     let clock = NativeClock;
     reconcile_wall_schedule(clock.now_utc()?, clock.now_elapsed()?, job.next_due_utc())
+        .map(WakeDisposition::Schedule)
         .map_err(|error| DaemonError::Recovery(error.to_string()))
 }
 
@@ -479,8 +484,6 @@ pub(crate) enum DaemonError {
     MissingIdentity,
     #[error("submitted job was not found")]
     MissingJob,
-    #[error("submitted job already reached a terminal state")]
-    RevisionChanged,
     #[error("IPC thread panicked")]
     IpcThreadPanicked,
 }
@@ -499,7 +502,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DaemonError, execute_due_jobs, load_deadline, load_deadline_with_retry,
+        DaemonError, WakeDisposition, execute_due_jobs, load_wake, load_wake_with_retry,
         request_ipc_shutdown, serve_ipc, stop_signal_set,
     };
     use crate::domain::{
@@ -551,26 +554,29 @@ mod tests {
     }
 
     #[test]
-    fn load_deadline_returns_deadline_for_live_job() {
+    fn load_wake_returns_schedule_for_live_job() {
         let root = tempdir().expect("root");
         let mut store = store_in(root.path());
         let job = scheduled_job(1000, 1030);
         store.create(&job).expect("create");
         let db_path = root.path().join("atx.db");
-        load_deadline(&db_path, job.id()).expect("deadline");
+        assert!(matches!(
+            load_wake(&db_path, job.id()).expect("wake disposition"),
+            WakeDisposition::Schedule(_)
+        ));
     }
 
     #[test]
-    fn load_deadline_reports_missing_job() {
+    fn load_wake_reports_missing_job() {
         let root = tempdir().expect("root");
         let _store = store_in(root.path());
         let db_path = root.path().join("atx.db");
-        let error = load_deadline(&db_path, JobId::new()).expect_err("missing job");
+        let error = load_wake(&db_path, JobId::new()).expect_err("missing job");
         assert!(matches!(error, DaemonError::MissingJob));
     }
 
     #[test]
-    fn load_deadline_accepts_job_after_revision_advanced() {
+    fn load_wake_accepts_job_after_revision_advanced() {
         // The supervisor's own Scheduled→Waiting transition may race the wake;
         // the deadline must still load from the freshly-read job.
         let root = tempdir().expect("root");
@@ -592,12 +598,14 @@ mod tests {
         let db_path = root.path().join("atx.db");
         // The deadline maps to the live elapsed clock; assert only that it
         // loaded rather than nacked.
-        let deadline = load_deadline(&db_path, job.id()).expect("deadline after revision advance");
-        assert!(deadline.as_nanos() > 0);
+        assert!(matches!(
+            load_wake(&db_path, job.id()).expect("wake after revision advance"),
+            WakeDisposition::Schedule(_)
+        ));
     }
 
     #[test]
-    fn load_deadline_rejects_terminal_job() {
+    fn load_wake_accepts_terminal_job_without_rescheduling() {
         let root = tempdir().expect("root");
         let mut store = store_in(root.path());
         let job = scheduled_job(1000, 1030);
@@ -615,8 +623,10 @@ mod tests {
             )
             .expect("mark terminal");
         let db_path = root.path().join("atx.db");
-        let error = load_deadline(&db_path, job.id()).expect_err("terminal job");
-        assert!(matches!(error, DaemonError::RevisionChanged));
+        assert!(matches!(
+            load_wake(&db_path, job.id()).expect("terminal wake"),
+            WakeDisposition::AlreadyTerminal
+        ));
     }
 
     #[test]
@@ -629,14 +639,10 @@ mod tests {
         fs::remove_file(&db_path).expect("drop fresh database");
         fs::create_dir(&db_path).expect("block the database path");
 
-        // A storage-level fault retries to exhaustion; only the definitive
-        // outcomes (missing job, changed revision) return immediately.
-        let error =
-            load_deadline_with_retry(&db_path, JobId::new()).expect_err("corrupt store fails");
-        assert!(!matches!(
-            error,
-            DaemonError::MissingJob | DaemonError::RevisionChanged
-        ));
+        // A storage-level fault retries to exhaustion; a missing job returns
+        // immediately.
+        let error = load_wake_with_retry(&db_path, JobId::new()).expect_err("corrupt store fails");
+        assert!(!matches!(error, DaemonError::MissingJob));
     }
 
     #[test]
@@ -679,6 +685,65 @@ mod tests {
                 revision: job.revision(),
             }
         );
+        drop(client);
+
+        let mut shutdown = UnixStream::connect(&socket).expect("connect shutdown");
+        write_frame(&mut shutdown, &IpcMessage::Shutdown { protocol: 1 }).expect("write shutdown");
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn serve_ipc_acknowledges_job_that_finished_before_wake() {
+        let root = tempdir().expect("root");
+        let mut store = store_in(root.path());
+        let job = scheduled_job(1000, 1030);
+        store.create(&job).expect("create");
+        store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Missed,
+                false,
+                TransitionActor::Supervisor,
+                "terminal before wake",
+                UtcTimestamp::from_second(1001).expect("now"),
+            )
+            .expect("mark terminal");
+
+        let socket = root.path().join("ipc.sock");
+        let listener = UnixListener::bind(&socket).expect("listener");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("mode");
+        let db_path = root.path().join("atx.db");
+        let (sender, receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve_ipc(&listener, &db_path, &sender);
+        });
+
+        let mut client = UnixStream::connect(&socket).expect("connect");
+        write_frame(
+            &mut client,
+            &IpcMessage::Wake {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            },
+        )
+        .expect("write wake");
+        let reply = read_frame(&mut client).expect("ack");
+        assert_eq!(
+            reply,
+            IpcMessage::Ack {
+                protocol: 1,
+                job_id: job.id(),
+                revision: job.revision(),
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let persisted = store.load(job.id()).expect("reload").expect("job remains");
+        assert_eq!(persisted.state(), JobState::Missed);
         drop(client);
 
         let mut shutdown = UnixStream::connect(&socket).expect("connect shutdown");
