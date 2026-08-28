@@ -169,6 +169,7 @@ pub(crate) fn expand_owned_descendants(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn retry_inspection<T>(
     attempts: usize,
     mut inspect: impl FnMut() -> Result<Inspection<T>, String>,
