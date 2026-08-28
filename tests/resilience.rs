@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, tz::TimeZone};
 use rustix::process::{Pid, Signal, kill_process_group};
-use tempfile::tempdir;
+mod support;
+
+use support::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
@@ -125,33 +127,9 @@ fn wait_for(predicate: impl Fn() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
-/// Kill any supervisor serving `state`; scoped so parallel tests are untouched.
+/// Kill only the supervisor serving `state` to simulate a crash.
 fn kill_state_supervisors(state: &std::path::Path) {
-    // Match only supervisors for THIS state dir; parallel tests each own one.
-    let pattern = format!("__supervisor --state-dir {}", state.display());
-    let output = Command::new("/usr/bin/pgrep")
-        .arg("-f")
-        .arg(&pattern)
-        .output()
-        .expect("pgrep supervisor");
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            let _ = Command::new("/bin/kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .output();
-        }
-    }
-    wait_for(
-        || {
-            Command::new("/usr/bin/pgrep")
-                .arg("-f")
-                .arg(&pattern)
-                .output()
-                .is_ok_and(|result| result.stdout.is_empty())
-        },
-        "supervisor to stop",
-    );
+    support::kill_session_supervisor(state).expect("kill fixture supervisor");
 }
 
 /// Force a fresh supervisor start (which runs startup reconciliation):

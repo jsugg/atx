@@ -11,7 +11,9 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use serde_json::Value;
-use tempfile::tempdir;
+mod support;
+
+use support::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
