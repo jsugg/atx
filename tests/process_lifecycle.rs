@@ -85,13 +85,14 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 #[test]
-fn ownership_never_expands_from_a_stale_process_group_or_wrong_uid() {
+fn ownership_never_expands_from_stale_groups_wrong_uids_or_terminal_processes() {
     let effective_uid = 501;
     let rows = vec![
         ProcessRow::for_test(10, 1, 77, effective_uid),
         ProcessRow::for_test(20, 1, 77, effective_uid),
         ProcessRow::for_test(30, 10, 88, effective_uid + 1),
         ProcessRow::for_test(40, 10, 99, effective_uid),
+        ProcessRow::for_test(50, 10, 99, effective_uid).with_state_for_test("Z"),
     ];
 
     assert_eq!(

@@ -96,6 +96,10 @@ struct FixtureOwnership {
 }
 
 impl ProcessRow {
+    fn is_terminal(&self) -> bool {
+        self.state.starts_with('Z')
+    }
+
     #[allow(dead_code)]
     pub(crate) fn for_test(pid: i32, parent_pid: i32, process_group_id: i32, user_id: u32) -> Self {
         Self {
@@ -106,6 +110,12 @@ impl ProcessRow {
             state: "S".to_owned(),
             command_name: "test".to_owned(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_state_for_test(mut self, state: &str) -> Self {
+        state.clone_into(&mut self.state);
+        self
     }
 }
 
@@ -159,7 +169,10 @@ pub(crate) fn expand_owned_descendants(
     loop {
         let before = owned.len();
         for process in rows {
-            if process.user_id == effective_uid && owned.contains(&process.parent_pid) {
+            if process.user_id == effective_uid
+                && !process.is_terminal()
+                && owned.contains(&process.parent_pid)
+            {
                 owned.insert(process.pid);
             }
         }
@@ -239,7 +252,7 @@ pub(crate) fn process_is_terminal(pid: i32) -> Result<bool, String> {
     Ok(process_table()?
         .into_iter()
         .find(|process| process.pid == pid)
-        .is_none_or(|process| process.state.starts_with('Z')))
+        .is_none_or(|process| process.is_terminal()))
 }
 
 /// Count processes whose current identity and argv establish ownership by `root`.
@@ -486,6 +499,9 @@ fn fixture_processes(
         let Some(expected) = ownership.identities.get(&process.pid) else {
             continue;
         };
+        if process.is_terminal() {
+            continue;
+        }
         match classify_live_identity(expected, process.user_id)? {
             IdentityMatch::Same => {
                 owned.insert(process.pid);
@@ -526,7 +542,7 @@ fn fixture_processes(
 }
 
 fn is_fixture_atx_process(process: &ProcessRow, root: &Path) -> Result<Inspection<bool>, String> {
-    if process.user_id != rustix::process::geteuid().as_raw() || process.state.starts_with('Z') {
+    if process.user_id != rustix::process::geteuid().as_raw() || process.is_terminal() {
         return Ok(Inspection::Present(false));
     }
     #[cfg(target_os = "linux")]
@@ -613,7 +629,7 @@ fn supervisor_matches(
     else {
         return Ok(false);
     };
-    if process.state.starts_with('Z') {
+    if process.is_terminal() {
         return Ok(false);
     }
     if process.user_id != rustix::process::geteuid().as_raw()
