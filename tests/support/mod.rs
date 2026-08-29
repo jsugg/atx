@@ -37,7 +37,7 @@ pub(crate) struct TestRoot {
 pub(crate) struct ProcessRow {
     pid: i32,
     parent_pid: i32,
-    process_group_id: i32,
+    process_group_id: i64,
     user_id: u32,
     state: String,
     command_name: String,
@@ -97,7 +97,7 @@ struct FixtureOwnership {
 
 impl ProcessRow {
     fn is_terminal(&self) -> bool {
-        self.state.starts_with('Z')
+        matches!(self.state.chars().next(), Some('X' | 'Z'))
     }
 
     #[allow(dead_code)]
@@ -105,7 +105,7 @@ impl ProcessRow {
         Self {
             pid,
             parent_pid,
-            process_group_id,
+            process_group_id: i64::from(process_group_id),
             user_id,
             state: "S".to_owned(),
             command_name: "test".to_owned(),
@@ -169,10 +169,7 @@ pub(crate) fn expand_owned_descendants(
     loop {
         let before = owned.len();
         for process in rows {
-            if process.user_id == effective_uid
-                && !process.is_terminal()
-                && owned.contains(&process.parent_pid)
-            {
+            if process.user_id == effective_uid && owned.contains(&process.parent_pid) {
                 owned.insert(process.pid);
             }
         }
@@ -199,14 +196,51 @@ pub(crate) fn retry_inspection<T>(
     inspect()
 }
 
+#[cfg(target_os = "linux")]
+fn enable_child_subreaper() -> io::Result<()> {
+    // SAFETY: `prctl` receives the documented integer-only subreaper arguments.
+    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_terminal_child(pid: i32) -> Result<bool, String> {
+    loop {
+        // SAFETY: `waitpid` writes no status when passed a null status pointer.
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if result == pid {
+            return Ok(true);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(libc::ECHILD | libc::ESRCH)) {
+            return Ok(true);
+        }
+        return Err(format!("reap terminal child PID {pid}: {error}"));
+    }
+}
+
 /// Create an ATX-aware temporary root.
 pub(crate) fn tempdir() -> io::Result<TestRoot> {
+    #[cfg(target_os = "linux")]
+    enable_child_subreaper()?;
     tempfile::tempdir().map(|inner| TestRoot { inner })
 }
 
 /// Create an ATX-aware temporary root beneath `parent`.
 #[allow(dead_code)]
 pub(crate) fn tempdir_in(parent: &Path) -> io::Result<TestRoot> {
+    #[cfg(target_os = "linux")]
+    enable_child_subreaper()?;
     tempfile::tempdir_in(parent).map(|inner| TestRoot { inner })
 }
 
@@ -249,10 +283,19 @@ pub(crate) fn process_exists(pid: i32) -> Result<bool, String> {
 /// Return whether `pid` has exited or reached an unreaped terminal state.
 #[allow(dead_code)]
 pub(crate) fn process_is_terminal(pid: i32) -> Result<bool, String> {
-    Ok(process_table()?
+    match process_table()?
         .into_iter()
         .find(|process| process.pid == pid)
-        .is_none_or(|process| process.is_terminal()))
+    {
+        None => Ok(true),
+        Some(process) if process.is_terminal() => {
+            #[cfg(target_os = "linux")]
+            return reap_terminal_child(pid);
+            #[cfg(not(target_os = "linux"))]
+            return Ok(true);
+        }
+        Some(_) => Ok(false),
+    }
 }
 
 /// Count processes whose current identity and argv establish ownership by `root`.
@@ -500,6 +543,8 @@ fn fixture_processes(
             continue;
         };
         if process.is_terminal() {
+            #[cfg(target_os = "linux")]
+            reap_terminal_child(process.pid)?;
             continue;
         }
         match classify_live_identity(expected, process.user_id)? {
@@ -630,6 +675,8 @@ fn supervisor_matches(
         return Ok(false);
     };
     if process.is_terminal() {
+        #[cfg(target_os = "linux")]
+        reap_terminal_child(process.pid)?;
         return Ok(false);
     }
     if process.user_id != rustix::process::geteuid().as_raw()
@@ -1001,11 +1048,16 @@ fn process_table() -> Result<Vec<ProcessRow>, String> {
         .collect()
 }
 
-fn parse_process_row(line: &str) -> Result<ProcessRow, String> {
+#[allow(dead_code)]
+pub(crate) fn parse_process_row(line: &str) -> Result<ProcessRow, String> {
     let mut fields = line.split_whitespace();
     let pid = parse_process_number(fields.next(), "PID", line)?;
     let parent_pid = parse_process_number(fields.next(), "parent PID", line)?;
-    let process_group_id = parse_process_number(fields.next(), "process group", line)?;
+    let process_group_id = fields
+        .next()
+        .ok_or_else(|| format!("process row has no process group: {line:?}"))?
+        .parse::<i64>()
+        .map_err(|error| format!("process row has invalid process group: {error}: {line:?}"))?;
     let user_id = parse_process_number(fields.next(), "user ID", line)?;
     let user_id = u32::try_from(user_id)
         .map_err(|error| format!("process row has invalid user ID: {error}: {line:?}"))?;

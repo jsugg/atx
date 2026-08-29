@@ -15,8 +15,8 @@ use support::parse_nul_arguments;
 use support::{
     CensusObservation, IdentityMatch, Inspection, ProcessIdentity, ProcessRow, StableEmpty,
     classify_identity, expand_owned_descendants, fixture_monitor_process_ids,
-    fixture_process_count, fixture_process_ids, kill_session_supervisor, process_exists,
-    process_is_terminal, retry_inspection, tempdir, tempdir_in,
+    fixture_process_count, fixture_process_ids, kill_session_supervisor, parse_process_row,
+    process_exists, process_is_terminal, retry_inspection, tempdir, tempdir_in,
 };
 
 fn atx() -> Command {
@@ -85,7 +85,7 @@ fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 #[test]
-fn ownership_never_expands_from_stale_groups_wrong_uids_or_terminal_processes() {
+fn ownership_expands_only_through_same_user_parentage() {
     let effective_uid = 501;
     let rows = vec![
         ProcessRow::for_test(10, 1, 77, effective_uid),
@@ -97,8 +97,13 @@ fn ownership_never_expands_from_stale_groups_wrong_uids_or_terminal_processes() 
 
     assert_eq!(
         expand_owned_descendants(&rows, [10].into_iter().collect(), effective_uid),
-        [10, 40].into_iter().collect()
+        [10, 40, 50].into_iter().collect()
     );
+}
+
+#[test]
+fn process_rows_accept_the_unsigned_dead_process_group_sentinel() {
+    parse_process_row("5167 0 4294967295 0 X ps").expect("parse dead process row");
 }
 
 #[test]
