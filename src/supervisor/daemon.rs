@@ -111,8 +111,13 @@ fn stop_signal_worker(
     worker: std::thread::JoinHandle<std::io::Result<()>>,
 ) -> Result<(), DaemonError> {
     if !worker.is_finished() {
+        #[cfg(target_env = "musl")]
+        // musl libc uses a pointer typedef; std exposes the same handle as a word.
+        let pthread = worker.as_pthread_t() as libc::pthread_t;
+        #[cfg(not(target_env = "musl"))]
+        let pthread = worker.as_pthread_t();
         // SAFETY: the join handle owns the target thread until it is joined below.
-        let result = unsafe { libc::pthread_kill(worker.as_pthread_t(), libc::SIGTERM) };
+        let result = unsafe { libc::pthread_kill(pthread, libc::SIGTERM) };
         if result != 0 && result != libc::ESRCH {
             return Err(std::io::Error::from_raw_os_error(result).into());
         }
@@ -758,6 +763,36 @@ mod tests {
         )
         .expect_err("reaping failure");
         assert_eq!(error.to_string(), "injected reaping failure");
+    }
+
+    #[test]
+    fn signal_worker_can_be_stopped_and_joined() {
+        let (ready, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mask = super::stop_signal_set();
+            // SAFETY: this worker's initialized mask has a valid stack pointer.
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut())
+            };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+            ready.send(()).map_err(std::io::Error::other)?;
+            let mut signal = 0;
+            // SAFETY: both pointers are valid and these signals are blocked in this worker.
+            let result = unsafe { libc::sigwait(&raw const mask, &raw mut signal) };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+            if signal != libc::SIGTERM {
+                return Err(std::io::Error::other("unexpected stop signal"));
+            }
+            Ok(())
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("signal worker ready");
+        super::stop_signal_worker(worker).expect("stop and join signal worker");
     }
 
     #[test]
