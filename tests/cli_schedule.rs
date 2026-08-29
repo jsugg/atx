@@ -10,7 +10,9 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 use jiff::{SignedDuration, Timestamp, tz::TimeZone};
-use tempfile::tempdir;
+mod support;
+
+use support::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
@@ -241,7 +243,7 @@ fn absolute_utc_job_runs_end_to_end() {
     let state = root.path().join("state");
     let marker = root.path().join("absolute");
     let due = Timestamp::now()
-        .checked_add(SignedDuration::from_secs(2))
+        .checked_add(SignedDuration::from_secs(5))
         .expect("future timestamp")
         .to_zoned(TimeZone::UTC)
         .strftime("%Y-%m-%d %H:%M:%S")

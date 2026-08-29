@@ -13,7 +13,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tempfile::tempdir;
+mod support;
+
+use support::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
