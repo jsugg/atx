@@ -217,7 +217,7 @@ pub(crate) fn kill_session_supervisor(state: &Path) -> Result<(), String> {
         return Ok(());
     }
     signal_process(&identity, Signal::KILL)?;
-    if wait_until(CLEANUP_TIMEOUT, || process_is_absent(&identity))? {
+    if wait_until(CLEANUP_TIMEOUT, || process_identity_is_terminal(&identity))? {
         Ok(())
     } else {
         Err(format!(
@@ -365,7 +365,7 @@ fn stop_supervisor(root: &Path, runtime: &Path) -> Result<(), String> {
     }
     signal_process(&identity, Signal::TERM)?;
     if wait_until(TERM_GRACE, || {
-        Ok(process_is_absent(&identity)? && !lock.exists())
+        Ok(process_identity_is_terminal(&identity)? && !lock.exists())
     })? {
         return Ok(());
     }
@@ -377,7 +377,7 @@ fn stop_supervisor(root: &Path, runtime: &Path) -> Result<(), String> {
         return Ok(());
     }
     signal_process(&identity, Signal::KILL)?;
-    if wait_until(CLEANUP_TIMEOUT, || process_is_absent(&identity))? {
+    if wait_until(CLEANUP_TIMEOUT, || process_identity_is_terminal(&identity))? {
         Ok(())
     } else {
         Err(format!("supervisor PID {} did not exit", identity.pid))
@@ -613,6 +613,9 @@ fn supervisor_matches(
     else {
         return Ok(false);
     };
+    if process.state.starts_with('Z') {
+        return Ok(false);
+    }
     if process.user_id != rustix::process::geteuid().as_raw()
         || classify_live_identity(identity, process.user_id)? != IdentityMatch::Same
     {
@@ -1064,15 +1067,15 @@ fn signal_process(expected: &ProcessIdentity, signal: Signal) -> Result<(), Stri
     }
 }
 
-fn process_is_absent(expected: &ProcessIdentity) -> Result<bool, String> {
+fn process_identity_is_terminal(expected: &ProcessIdentity) -> Result<bool, String> {
     let pid = i32::try_from(expected.pid).map_err(|_| format!("invalid PID {}", expected.pid))?;
     let current_boot = boot_identity()?;
     if current_boot != expected.boot_identity {
         return Ok(true);
     }
     match inspect_process_identity(pid, &current_boot)? {
-        Inspection::Present(current) => Ok(current != *expected),
-        Inspection::Absent => Ok(true),
+        Inspection::Present(current) if current == *expected => process_is_terminal(pid),
+        Inspection::Present(_) | Inspection::Absent => Ok(true),
         Inspection::Transient => Ok(false),
     }
 }
