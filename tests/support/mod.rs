@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use jiff::{SignedDuration, Timestamp};
 #[cfg(target_os = "macos")]
 use rustix::process::kill_process;
 use rustix::process::{Pid, Signal};
@@ -274,6 +275,147 @@ pub(crate) fn kill_session_supervisor(state: &Path) -> Result<(), String> {
     }
 }
 
+/// Age an acknowledged, never-claimed one-shot while its supervisor is stopped.
+#[allow(dead_code)]
+pub(crate) fn age_stopped_one_shot(state: &Path, job_id: &str) -> Result<(), String> {
+    let runtime = state.join("runtime");
+    let identity = read_identity_if_present(&runtime.join("supervisor.lock"))?
+        .ok_or("offline fixture requires the stopped supervisor's identity")?;
+    if supervisor_matches(
+        &identity,
+        &runtime,
+        Some(state),
+        state.parent().unwrap_or(state),
+    )? {
+        return Err("cannot age a fixture while its supervisor is alive".into());
+    }
+    let mut connection =
+        rusqlite::Connection::open(state.join("atx.db")).map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let (due, created, updated, raw_schedule, job_state): (String, String, String, String, String) =
+        transaction
+            .query_row(
+                "SELECT next_due_utc, created_at_utc, updated_at_utc, schedule_json, state
+             FROM jobs WHERE id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+    let run_count: i64 = transaction
+        .query_row(
+            "SELECT count(*) FROM runs WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !matches!(job_state.as_str(), "scheduled" | "waiting") || run_count != 0 {
+        return Err(format!(
+            "offline fixture requires an unclaimed job: state={job_state}, runs={run_count}"
+        ));
+    }
+    let old_due: Timestamp = due
+        .parse::<Timestamp>()
+        .map_err(|error| error.to_string())?;
+    let now = Timestamp::now();
+    if old_due <= now {
+        return Err("offline fixture must start with a future deadline".into());
+    }
+    let offset = old_due
+        .as_second()
+        .checked_sub(now.as_second())
+        .and_then(|seconds| seconds.checked_add(60))
+        .ok_or("fixture timestamp shift overflow")?;
+    let shift = SignedDuration::from_secs(offset);
+    let new_due = shift_fixture_timestamp(&due, shift)?;
+    let schedule = shift_one_shot_schedule(&raw_schedule, old_due, &new_due)?;
+    transaction
+        .execute(
+            "UPDATE jobs SET next_due_utc = ?1, created_at_utc = ?2, updated_at_utc = ?3,
+         schedule_json = ?4 WHERE id = ?5",
+            rusqlite::params![
+                new_due,
+                shift_fixture_timestamp(&created, shift)?,
+                shift_fixture_timestamp(&updated, shift)?,
+                schedule,
+                job_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let transitions: Vec<(i64, String)> = {
+        let mut statement = transaction
+            .prepare("SELECT id, occurred_at_utc FROM transitions WHERE job_id = ?1")
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([job_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| error.to_string())?
+    };
+    for (id, timestamp) in transitions {
+        transaction
+            .execute(
+                "UPDATE transitions SET occurred_at_utc = ?1 WHERE id = ?2",
+                rusqlite::params![shift_fixture_timestamp(&timestamp, shift)?, id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn shift_one_shot_schedule(raw: &str, old_due: Timestamp, new_due: &str) -> Result<String, String> {
+    let mut schedule: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    let object = schedule
+        .as_object_mut()
+        .ok_or("fixture schedule must be an object")?;
+    let field = match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some("one_shot_relative") => "persisted_due_utc",
+        Some("one_shot_absolute")
+            if object.get("timezone").and_then(serde_json::Value::as_str) == Some("UTC") =>
+        {
+            let input = new_due
+                .parse::<Timestamp>()
+                .map_err(|error| error.to_string())?
+                .to_zoned(jiff::tz::TimeZone::UTC)
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            object.insert("original_input".into(), input.into());
+            "resolved_due_utc"
+        }
+        _ => return Err("offline fixture requires a relative or UTC absolute one-shot".into()),
+    };
+    let scheduled_due = object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or("fixture schedule has no string deadline")?
+        .parse::<Timestamp>()
+        .map_err(|error| error.to_string())?;
+    if scheduled_due != old_due {
+        return Err("fixture job and schedule deadlines disagree".into());
+    }
+    object.insert(field.into(), new_due.into());
+    Ok(schedule.to_string())
+}
+
+fn shift_fixture_timestamp(value: &str, shift: SignedDuration) -> Result<String, String> {
+    value
+        .parse::<Timestamp>()
+        .map_err(|error| error.to_string())?
+        .checked_sub(shift)
+        .map(|timestamp| timestamp.to_string())
+        .map_err(|error| error.to_string())
+}
+
 /// Return whether `pid` is still present, including zombie processes.
 #[allow(dead_code)]
 pub(crate) fn process_exists(pid: i32) -> Result<bool, String> {
@@ -339,9 +481,10 @@ pub(crate) fn fixture_monitor_process_ids(root: &Path) -> Result<Vec<i32>, Strin
         {
             continue;
         }
-        if let Inspection::Present(command) = process_arguments(process.pid)?
-            && is_fixture_command(&command, root, "__monitor")
-        {
+        let Inspection::Present(command) = process_arguments(process.pid)? else {
+            continue;
+        };
+        if is_fixture_command(&command, root, "__monitor") {
             result.push(process.pid);
         }
     }

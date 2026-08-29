@@ -237,15 +237,15 @@ fn supervisor_death_marks_missed_without_executing() {
     let state = root.path().join("state");
     let marker = root.path().join("marker");
 
-    let submission = submit_absolute_with_marker(&state, &due_utc_from_now(3), &marker);
+    let submission = submit_absolute_with_marker(&state, &due_utc_from_now(1800), &marker);
 
     // Kill this state dir's supervisor before the deadline; parallel tests
     // own their own supervisors and must not be touched.
     kill_state_supervisors(&state);
 
-    // Deadline passes while nothing runs. Next supervisor start classifies.
+    support::age_stopped_one_shot(&state, &submission.job_id).expect("overdue offline fixture");
+    assert!(!marker.exists(), "command ran before recovery");
     // A missed one-shot records no run row, so assert on the job state.
-    std::thread::sleep(Duration::from_secs(5));
     wait_for(
         || {
             poke_supervisor(&state);
@@ -254,6 +254,10 @@ fn supervisor_death_marks_missed_without_executing() {
         "missed",
     );
     assert!(!marker.exists(), "command must not execute after the miss");
+    assert_eq!(
+        states(&state, &submission.job_id),
+        Some(("none".into(), "missed".into()))
+    );
 }
 
 /// Cancellation after natural completion: the cancel is accepted, the job
@@ -417,7 +421,7 @@ fn missed_run_latest_executes_once_after_recovery() {
     let state = root.path().join("state");
     let marker = root.path().join("late");
 
-    let due = due_utc_from_now(3);
+    let due = due_utc_from_now(1800);
     let output = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -437,7 +441,8 @@ fn missed_run_latest_executes_once_after_recovery() {
 
     // Supervisor dies before the deadline; deadline passes unwatched.
     kill_state_supervisors(&state);
-    std::thread::sleep(Duration::from_millis(3_500));
+    support::age_stopped_one_shot(&state, &job_id).expect("overdue offline fixture");
+    assert!(!marker.exists(), "run-latest executed before recovery");
 
     poke_supervisor(&state);
     wait_for(

@@ -1,5 +1,6 @@
 //! Single-instance scheduling supervisor.
 
+mod children;
 mod daemon;
 mod frame;
 mod heap;

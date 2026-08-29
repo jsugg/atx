@@ -571,13 +571,13 @@ fn s18_oneshot_missed_default_holds_without_late_execution() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let marker = root.path().join("never");
-    // Long lead leaves room for cold supervisor start before we kill it.
     let script = format!("touch '{}'", marker.display());
-    let submitted = json_run(&state, &["10s", "--", "/bin/sh", "-c", &script]);
+    let submitted = json_run(&state, &["30m", "--", "/bin/sh", "-c", &script]);
     let job_id = submitted["job_id"].as_str().expect("job ID").to_owned();
 
     kill_state_supervisors(&state);
-    std::thread::sleep(Duration::from_secs(12));
+    support::age_stopped_one_shot(&state, &job_id).expect("overdue offline fixture");
+    assert!(!marker.exists(), "command ran before recovery");
 
     // Reconciliation runs when a fresh supervisor starts: the occurrence is
     // recognized as missed, still without executing.
@@ -587,6 +587,12 @@ fn s18_oneshot_missed_default_holds_without_late_execution() {
         "held one-shot to become missed",
     );
     assert!(!marker.exists(), "reconciliation executed a held one-shot");
+    assert!(
+        json_run(&state, &["history", &job_id])
+            .as_array()
+            .expect("target history")
+            .is_empty()
+    );
 }
 
 /// S19: Recurring jobs skip elapsed occurrences across supervisor downtime:
