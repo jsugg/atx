@@ -1,7 +1,12 @@
-# Local Checks
+# Local checks
 
-`check.sh quick` is the normal edit loop. It formats, checks, tests, and runs
+`check.sh quick` is the normal edit loop. It checks formatting, builds, tests, and runs
 Clippy. Any failing command stops the script and keeps its exit status.
+
+`check.sh msrv` selects the installed Rust 1.85.0 compiler, checks and prints its
+version, then checks all targets and features with that compiler. It ignores
+compiler overrides and wrappers for this check. CI and `check.sh full` use the
+same stage.
 
 `check.sh full` adds MSRV, rustdoc, dependency policy, docs, package contents,
 and a crates.io dry run. Run it from a clean checkout because Cargo rejects a
