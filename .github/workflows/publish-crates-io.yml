@@ -50,11 +50,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Point cargo at the local registry mock
         run: |
-          # Workspace-local config (not committed): a named registry whose
-          # index and API live on loopback. The publish list is patched in
-          # the working tree only, never committed.
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
+          mock_home="$RUNNER_TEMP/atx-cargo-mock"
+          mkdir -p "$mock_home"
+          printf 'CARGO_HOME=%s\n' "$mock_home" >>"$GITHUB_ENV"
+          cat > "$mock_home/config.toml" <<'EOF'
           [registries.atx-mock]
           index = "sparse+http://127.0.0.1:8192/index/"
           EOF
@@ -85,10 +84,11 @@ jobs:
         env:
           CARGO_REGISTRIES_ATX_MOCK_TOKEN: dummy-not-a-real-token
         run: |
-          if cargo publish --registry atx-mock --locked >/dev/null 2>&1; then
+          if cargo publish --registry atx-mock --locked --allow-dirty >"$RUNNER_TEMP/duplicate-publish.log" 2>&1; then
             echo "::error::duplicate publish unexpectedly succeeded" >&2
             exit 1
           fi
+          grep -F 'already exists' "$RUNNER_TEMP/duplicate-publish.log"
       - name: Upload failures propagate nonzero
         run: |
           mkdir -p "$RUNNER_TEMP/failing"
@@ -97,15 +97,17 @@ jobs:
             curl -fsS http://127.0.0.1:8193/index/config.json >/dev/null 2>&1 && break
             sleep 0.2
           done
-          cat > .cargo/config.toml <<'EOF'
+          cat >> "$CARGO_HOME/config.toml" <<'EOF'
           [registries.atx-mock-fail]
           index = "sparse+http://127.0.0.1:8193/index/"
           EOF
           sed -i 's/"crates-io", "atx-mock"/"crates-io", "atx-mock", "atx-mock-fail"/' Cargo.toml
-          if CARGO_REGISTRIES_ATX_MOCK_FAIL_TOKEN=dummy cargo publish --registry atx-mock-fail --locked >/dev/null 2>&1; then
+          if CARGO_REGISTRIES_ATX_MOCK_FAIL_TOKEN=dummy cargo publish --registry atx-mock-fail --locked --allow-dirty >"$RUNNER_TEMP/failing-publish.log" 2>&1; then
             echo "::error::publish against failing registry unexpectedly succeeded" >&2
             exit 1
           fi
+          grep -F 'mock upload failure' "$RUNNER_TEMP/failing-publish.log"
+          git diff --exit-code -- .cargo/config.toml
 
   crates-io:
     name: crates.io trusted publishing

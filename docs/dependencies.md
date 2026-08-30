@@ -33,3 +33,6 @@ records why it cannot yet be removed.
 
 Runtime code must not need a network service, an external date parser, or a
 separately installed SQLite library.
+
+The development-only `xtask` reuses `serde_json` to read Cargo's build messages
+and run the executable Cargo actually produced, including custom target paths.
