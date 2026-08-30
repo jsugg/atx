@@ -9,7 +9,8 @@ fi
 
 list=$1
 
-for required in Cargo.toml Cargo.lock README.md CHANGELOG.md LICENSE-MIT src/main.rs; do
+for required in Cargo.toml Cargo.lock README.md CHANGELOG.md LICENSE-MIT src/main.rs \
+    tests/fixtures/exit-codes-v1.json; do
     if ! grep -Fx "$required" "$list" >/dev/null; then
         printf 'package is missing %s\n' "$required" >&2
         exit 1
@@ -18,6 +19,13 @@ done
 
 while IFS= read -r path; do
     case "$path" in
+        /* | ./* | ../* | */./* | */../* | */. | */.. | */)
+            printf 'noncanonical path in package: %s\n' "$path" >&2
+            exit 1
+            ;;
+    esac
+    case "$path" in
+        tests/fixtures/*) ;;
         .github/* | .local/* | benches/* | docs/* | fuzz/* | scripts/* | target/* | tests/*)
             printf 'internal path leaked into package: %s\n' "$path" >&2
             exit 1

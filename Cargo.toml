@@ -17,6 +17,7 @@ publish = ["crates-io"]
 include = [
     "/src/**",
     "/migrations/**",
+    "/tests/fixtures/**",
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",

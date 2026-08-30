@@ -121,6 +121,9 @@ Cargo.toml.orig
 LICENSE-MIT
 README.md
 src/main.rs
+tests/fixtures/exit-codes-v1.json
+tests/fixtures/json-error-v1.json
+tests/fixtures/migrations/v0.sql
 LIST
 
 assert_failure() {
@@ -149,9 +152,10 @@ assert_failure() {
 
 assert_package_policy_failure() {
     mode=$1
+    leaked_path=${2:-.local/plan.md}
     bad_package_list="$tmp/package-bad-$mode"
     cp "$ATX_PACKAGE_LIST" "$bad_package_list"
-    printf '%s\n' '.local/plan.md' >>"$bad_package_list"
+    printf '%s\n' "$leaked_path" >>"$bad_package_list"
 
     : >"$ATX_FAKE_LOG"
     status=0
@@ -200,8 +204,23 @@ for mode in msrv static full; do
     done
 done
 
-assert_package_policy_failure static
-assert_package_policy_failure full
+for mode in static full; do
+    for leaked_path in \
+        .local/plan.md tests/cli_schedule.rs tests/support/mod.rs \
+        tests/fixtures-other/leak.json tests/fixtures \
+        tests/fixtures/../cli_schedule.rs tests/fixtures/../../.local/plan.md \
+        tests/fixtures/./exit-codes-v1.json tests/fixtures/..
+    do
+        assert_package_policy_failure "$mode" "$leaked_path"
+    done
+done
+
+missing_fixture="$tmp/package-missing-fixture"
+grep -Fxv tests/fixtures/exit-codes-v1.json "$ATX_PACKAGE_LIST" >"$missing_fixture"
+if scripts/check-package-list.sh "$missing_fixture" >/dev/null 2>&1; then
+    printf 'package policy accepted a missing embedded fixture\n' >&2
+    exit 1
+fi
 
 for mode in quick static full msrv; do
     : >"$ATX_FAKE_LOG"
