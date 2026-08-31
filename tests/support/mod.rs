@@ -245,6 +245,90 @@ pub(crate) fn tempdir_in(parent: &Path) -> io::Result<TestRoot> {
     tempfile::tempdir_in(parent).map(|inner| TestRoot { inner })
 }
 
+#[allow(dead_code)]
+pub(crate) fn service_report_is_ready(report: &serde_json::Value) -> bool {
+    report["schema_version"] == 1
+        && report["ok"] == true
+        && report["data"]["healthy"] == true
+        && report["data"]["schema_version"]
+            .as_u64()
+            .is_some_and(|version| version > 0)
+}
+
+/// Wait for a live service identity and an initialized database, retaining failure details.
+#[allow(dead_code)]
+pub(crate) fn wait_for_service(
+    daemon: &mut std::process::Child,
+    state: &Path,
+    runtime: &Path,
+    stderr_log: &Path,
+) -> Result<(), String> {
+    wait_for_service_with_timeout(daemon, state, runtime, stderr_log, Duration::from_secs(10))
+}
+
+#[allow(dead_code)]
+pub(crate) fn wait_for_service_with_timeout(
+    daemon: &mut std::process::Child,
+    state: &Path,
+    runtime: &Path,
+    stderr_log: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or("service timeout overflow")?;
+    let mut last_probe = "no published identity".to_owned();
+    loop {
+        if let Some(status) = daemon.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!(
+                "service exited before readiness: {status}; {}",
+                fs::read_to_string(stderr_log).unwrap_or_else(|error| error.to_string())
+            ));
+        }
+        match read_identity_if_present(&runtime.join("supervisor.lock")) {
+            Ok(Some(identity))
+                if identity.pid == daemon.id() && runtime.join("supervisor.sock").exists() =>
+            {
+                let output = Command::new(env!("CARGO_BIN_EXE_atx"))
+                    .arg("--json")
+                    .arg("--state-dir")
+                    .arg(state)
+                    .arg("doctor")
+                    .output()
+                    .map_err(|error| error.to_string())?;
+                if output.status.success()
+                    && serde_json::from_slice(&output.stdout)
+                        .is_ok_and(|report| service_report_is_ready(&report))
+                    && supervisor_matches(
+                        &identity,
+                        runtime,
+                        Some(state),
+                        state.parent().unwrap_or(state),
+                    )?
+                {
+                    return Ok(());
+                }
+                last_probe = format!(
+                    "doctor {:?}: stdout={}, stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(Some(_)) => "identity or socket not ready".clone_into(&mut last_probe),
+            Ok(None) => {}
+            Err(error) => last_probe = error,
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "service readiness timed out: {last_probe}; {}",
+                fs::read_to_string(stderr_log).unwrap_or_else(|error| error.to_string())
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Abruptly stop the session supervisor owned by `state` for crash tests.
 #[allow(dead_code)]
 pub(crate) fn kill_session_supervisor(state: &Path) -> Result<(), String> {
@@ -372,6 +456,145 @@ pub(crate) fn age_stopped_one_shot(state: &Path, job_id: &str) -> Result<(), Str
     transaction.commit().map_err(|error| error.to_string())
 }
 
+/// Age a completed one-shot's entire timeline while no fixture process is alive.
+#[allow(dead_code)]
+pub(crate) fn age_stopped_terminal_job(
+    state: &Path,
+    job_id: &str,
+    days: u32,
+) -> Result<(), String> {
+    if days == 0 || fixture_process_count(state.parent().unwrap_or(state))? != 0 {
+        return Err("terminal aging requires a positive age and a stopped fixture".into());
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let database = fs::canonicalize(state)
+        .map_err(|error| error.to_string())?
+        .join("atx.db");
+    let mut connection = rusqlite::Connection::open_with_flags(database, flags)
+        .map_err(|error| error.to_string())?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let (due, schedule, state_name): (String, String, String) = transaction
+        .query_row(
+            "SELECT next_due_utc, schedule_json, state FROM jobs WHERE id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let (runs, active): (i64, i64) = transaction.query_row(
+        "SELECT count(*), coalesce(sum(state IN ('starting', 'running', 'cancel_requested')), 0)
+         FROM runs WHERE job_id = ?1", [job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|error| error.to_string())?;
+    if !matches!(
+        state_name.as_str(),
+        "succeeded" | "failed" | "cancelled" | "interrupted"
+    ) || runs == 0
+        || active != 0
+    {
+        return Err("terminal aging requires a completed job and only terminal runs".into());
+    }
+    let shift = SignedDuration::from_secs(i64::from(days) * 86_400);
+    let old_due = due
+        .parse::<Timestamp>()
+        .map_err(|error| error.to_string())?;
+    let new_due = shift_fixture_timestamp(&due, shift)?;
+    let schedule = shift_one_shot_schedule(&schedule, old_due, &new_due)?;
+    for table in [
+        FixtureTimeTable::Jobs,
+        FixtureTimeTable::Runs,
+        FixtureTimeTable::Transitions,
+    ] {
+        shift_fixture_rows(&transaction, table, job_id, shift)?;
+    }
+    transaction
+        .execute(
+            "UPDATE jobs SET schedule_json = ?1 WHERE id = ?2",
+            rusqlite::params![schedule, job_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum FixtureTimeTable {
+    Jobs,
+    Runs,
+    Transitions,
+}
+
+fn shift_fixture_rows(
+    transaction: &rusqlite::Transaction<'_>,
+    table: FixtureTimeTable,
+    job_id: &str,
+    shift: SignedDuration,
+) -> Result<(), String> {
+    let (table, key, fields): (&str, &str, &[&str]) = match table {
+        FixtureTimeTable::Jobs => (
+            "jobs",
+            "id",
+            &["next_due_utc", "created_at_utc", "updated_at_utc"],
+        ),
+        FixtureTimeTable::Runs => (
+            "runs",
+            "job_id",
+            &[
+                "scheduled_for_utc",
+                "created_at_utc",
+                "started_at_utc",
+                "finished_at_utc",
+            ],
+        ),
+        FixtureTimeTable::Transitions => ("transitions", "job_id", &["occurred_at_utc"]),
+    };
+    let rows: Vec<(i64, Vec<Option<String>>)> = {
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT rowid, {} FROM {table} WHERE {key} = ?1",
+                fields.join(", ")
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map([job_id], |row| {
+                let timestamps = (1..=fields.len())
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok((row.get(0)?, timestamps))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| error.to_string())?
+    };
+    let assignments = fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| format!("{field} = ?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut update = transaction
+        .prepare(&format!(
+            "UPDATE {table} SET {assignments} WHERE rowid = ?1"
+        ))
+        .map_err(|error| error.to_string())?;
+    for (id, timestamps) in rows {
+        let mut parameters = vec![rusqlite::types::Value::Integer(id)];
+        for timestamp in timestamps {
+            parameters.push(match timestamp {
+                Some(value) => {
+                    rusqlite::types::Value::Text(shift_fixture_timestamp(&value, shift)?)
+                }
+                None => rusqlite::types::Value::Null,
+            });
+        }
+        update
+            .execute(rusqlite::params_from_iter(parameters))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn shift_one_shot_schedule(raw: &str, old_due: Timestamp, new_due: &str) -> Result<String, String> {
     let mut schedule: serde_json::Value =
         serde_json::from_str(raw).map_err(|error| error.to_string())?;
@@ -494,6 +717,11 @@ pub(crate) fn fixture_monitor_process_ids(root: &Path) -> Result<Vec<i32>, Strin
 impl TestRoot {
     pub(crate) fn path(&self) -> &Path {
         self.inner.path()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stop_background(&self) -> Result<(), String> {
+        cleanup_root(self.path())
     }
 }
 

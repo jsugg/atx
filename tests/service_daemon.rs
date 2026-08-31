@@ -13,7 +13,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal, kill_process};
-use tempfile::tempdir;
+mod support;
+
+use support::tempdir;
 
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
@@ -62,24 +64,13 @@ fn service_managed_daemon_executes_due_jobs_and_stops_cleanly_on_sigterm() {
     let mut daemon = spawn_daemon(root.path());
     let socket = runtime_directory(root.path()).join("supervisor.sock");
 
-    // The socket binds before the database finishes migrating; wait for both
-    // so submission cannot race first-time initialization and its Wake is
-    // guaranteed to reach this daemon rather than a replacement supervisor.
-    wait_for(
-        || {
-            socket.exists()
-                && atx()
-                    .arg("--json")
-                    .arg("--state-dir")
-                    .arg(root.path().join("state"))
-                    .arg("list")
-                    .output()
-                    .expect("probe list")
-                    .status
-                    .success()
-        },
-        "daemon to finish initializing",
-    );
+    support::wait_for_service(
+        &mut daemon,
+        &root.path().join("state"),
+        &runtime_directory(root.path()),
+        &root.path().join("daemon.err"),
+    )
+    .expect("service supervisor readiness");
 
     let marker = root.path().join("state").join("daemon-ran.marker");
     let script = format!("'/usr/bin/touch' '{}'", marker.display());
@@ -140,22 +131,13 @@ fn service_managed_daemon_executes_due_jobs_and_stops_cleanly_on_sigterm() {
 fn service_managed_daemon_survives_a_broken_store_at_execution_time() {
     let root = tempdir().expect("root");
     let mut daemon = spawn_daemon(root.path());
-    let socket = runtime_directory(root.path()).join("supervisor.sock");
-    wait_for(
-        || {
-            socket.exists()
-                && atx()
-                    .arg("--json")
-                    .arg("--state-dir")
-                    .arg(root.path().join("state"))
-                    .arg("list")
-                    .output()
-                    .expect("probe list")
-                    .status
-                    .success()
-        },
-        "daemon to finish initializing",
-    );
+    support::wait_for_service(
+        &mut daemon,
+        &root.path().join("state"),
+        &runtime_directory(root.path()),
+        &root.path().join("daemon.err"),
+    )
+    .expect("service supervisor readiness");
 
     // Submit while the store is healthy so the Wake is acknowledged, then
     // destroy the store before the deadline fires. The live daemon keeps its

@@ -112,8 +112,8 @@ fn configured_log_cap_bounds_stored_streams() {
 }
 
 /// Supervisor startup applies the operator's retention window instead of a
-/// hardcoded default: an ancient terminal job is purged when the configured
-/// window is one day.
+/// hardcoded default: a two-day-old terminal job survives the default window
+/// and is purged when the configured window is one day.
 #[test]
 fn configured_retention_purges_old_terminal_jobs_at_startup() {
     let root = tempdir().expect("root");
@@ -130,48 +130,50 @@ fn configured_retention_purges_old_terminal_jobs_at_startup() {
         "job to reach a terminal state",
     );
 
-    // Backdate every row of that job beyond any default window.
-    let db = state.join("atx.db");
-    let ancient = "2020-01-01T00:00:00Z";
-    for statement in [
-        format!("UPDATE runs SET finished_at_utc = '{ancient}' WHERE job_id = '{job_id}';"),
-        format!("UPDATE transitions SET occurred_at_utc = '{ancient}' WHERE job_id = '{job_id}';"),
-        format!("UPDATE jobs SET updated_at_utc = '{ancient}' WHERE id = '{job_id}';"),
-    ] {
-        let result = Command::new("sqlite3")
-            .arg(&db)
-            .arg(statement)
-            .output()
-            .expect("sqlite3 available");
-        assert!(
-            result.status.success(),
-            "backdate failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
+    let original_job = json(&state, &["show", &job_id]);
+    let original_history = json(&state, &["history", &job_id]);
+    root.stop_background()
+        .expect("stop the original session supervisor");
+    support::age_stopped_terminal_job(&state, &job_id, 2).expect("age a valid terminal timeline");
+    let aged = json(&state, &["show", &job_id]);
+    assert_eq!(aged["job_id"], job_id);
+    assert_eq!(aged["state"], original_job["state"]);
+    assert_aged_timestamps(&original_job, &aged, &["next_due_utc"]);
+    let history = json(&state, &["history", &job_id]);
+    assert_eq!(history[0]["outcome"], original_history[0]["outcome"]);
+    assert_eq!(
+        history.as_array().expect("aged history").len(),
+        original_history.as_array().expect("original history").len()
+    );
+    assert_aged_timestamps(
+        &original_history[0],
+        &history[0],
+        &["scheduled_for_utc", "started_at_utc", "finished_at_utc"],
+    );
 
-    // A one-day retention window deletes the ancient job on next startup.
+    let runtime = state.join("runtime");
+    let log = root.path().join("daemon.err");
+    let mut daemon = spawn_retention_daemon(&state, &runtime, &log);
+    support::wait_for_service(&mut daemon, &state, &runtime, &log)
+        .expect("default service readiness");
+    let _ = json(&state, &["30m", "--", "/bin/true"]);
+    assert_eq!(
+        json(&state, &["show", &job_id])["state"],
+        original_job["state"]
+    );
+    assert!(daemon.try_wait().expect("default daemon status").is_none());
+    daemon.kill().expect("stop the default-retention daemon");
+    daemon.wait().expect("reap the default-retention daemon");
+
     fs::write(
         state.join("config.toml"),
         "history_days = 1\nterminal_job_days = 1\n",
     )
     .expect("write config");
-
-    let runtime = root.path().join("runtime");
-    let stderr_log = fs::File::create(root.path().join("daemon.err")).expect("daemon log");
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_atx"))
-        .arg("__supervisor")
-        .arg("--state-dir")
-        .arg(&state)
-        .arg("--runtime-dir")
-        .arg(&runtime)
-        .arg("--service-managed")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr_log)
-        .spawn()
-        .expect("start service-managed supervisor");
-
+    let mut daemon = spawn_retention_daemon(&state, &runtime, &log);
+    support::wait_for_service(&mut daemon, &state, &runtime, &log)
+        .expect("configured service readiness");
+    let _ = json(&state, &["30m", "--", "/bin/true"]);
     wait_for(
         || {
             let output = atx()
@@ -181,11 +183,64 @@ fn configured_retention_purges_old_terminal_jobs_at_startup() {
                 .args(["show", &job_id])
                 .output()
                 .expect("show");
-            !output.status.success()
+            if output.status.success() {
+                return false;
+            }
+            assert_eq!(output.status.code(), Some(3), "{output:?}");
+            let error: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("purge error");
+            assert_eq!(error["error"]["code"], "JOB_NOT_FOUND");
+            true
         },
-        "retention to purge the ancient terminal job",
+        "configured retention to purge the two-day-old terminal job",
     );
-
     daemon.kill().expect("stop daemon");
     daemon.wait().expect("reap daemon");
+}
+
+fn assert_aged_timestamps(original: &serde_json::Value, aged: &serde_json::Value, fields: &[&str]) {
+    for field in fields {
+        let before = original.get(field).expect("original timestamp field");
+        let after = aged.get(field).expect("aged timestamp field");
+        if before.is_null() {
+            assert!(after.is_null());
+        } else {
+            let before = before
+                .as_str()
+                .expect("original timestamp")
+                .parse::<jiff::Timestamp>()
+                .expect("valid timestamp");
+            let after = after
+                .as_str()
+                .expect("aged timestamp")
+                .parse::<jiff::Timestamp>()
+                .expect("valid timestamp");
+            assert_eq!(
+                after,
+                before
+                    .checked_sub(jiff::SignedDuration::from_secs(172_800))
+                    .expect("shift")
+            );
+        }
+    }
+}
+
+fn spawn_retention_daemon(
+    state: &std::path::Path,
+    runtime: &std::path::Path,
+    log: &std::path::Path,
+) -> std::process::Child {
+    let stderr = fs::File::create(log).expect("daemon log");
+    atx()
+        .arg("__supervisor")
+        .arg("--state-dir")
+        .arg(state)
+        .arg("--runtime-dir")
+        .arg(runtime)
+        .arg("--service-managed")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("start service-managed supervisor")
 }
