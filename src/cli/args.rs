@@ -202,25 +202,34 @@ pub(crate) enum ManagementCommand {
     /// List saved jobs.
     #[command(alias = "ls", after_long_help = LIST_EXAMPLES)]
     List {
+        /// Only list jobs in this state.
         #[arg(long, value_enum)]
         state: Option<StateFilter>,
+        /// Maximum number of jobs to list.
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// Show one job.
     #[command(after_long_help = SHOW_EXAMPLES)]
-    Show { job: String },
+    Show {
+        /// Job ID or unambiguous prefix.
+        job: String,
+    },
     /// Cancel one job.
     #[command(after_long_help = CANCEL_EXAMPLES)]
     Cancel {
+        /// Job ID or unambiguous prefix.
         job: String,
-        #[arg(long)]
+        /// Wait this long before force-killing the command.
+        #[arg(long, value_name = "DURATION")]
         grace: Option<String>,
     },
     /// Remove one job.
     #[command(name = "rm", after_long_help = RM_EXAMPLES)]
     Remove {
+        /// Job ID or unambiguous prefix.
         job: String,
+        /// Cancel an active job before removing it.
         #[arg(long)]
         cancel: bool,
         /// Keep completed-run history instead of deleting it with the job.
@@ -230,6 +239,7 @@ pub(crate) enum ManagementCommand {
     /// Run a saved job again.
     #[command(after_long_help = RUN_EXAMPLES)]
     Run {
+        /// Job ID or unambiguous prefix.
         job: String,
         /// Confirm running an interrupted job again.
         #[arg(long)]
@@ -238,16 +248,21 @@ pub(crate) enum ManagementCommand {
     /// List live ATX processes.
     #[command(after_long_help = PS_EXAMPLES)]
     Ps,
-    /// List completed runs.
+    /// List saved runs.
     #[command(after_long_help = HISTORY_EXAMPLES)]
     History {
+        /// Only list runs for this job ID or unambiguous prefix.
         job: Option<String>,
+        /// Maximum number of runs to list.
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// Print captured output of one run.
     #[command(after_long_help = OUTPUT_EXAMPLES)]
-    Output { run: String },
+    Output {
+        /// Run ID or unambiguous prefix.
+        run: String,
+    },
     /// Check local configuration and state.
     #[command(after_long_help = DOCTOR_EXAMPLES)]
     Doctor,
@@ -297,8 +312,11 @@ pub(crate) enum ManagementCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
 pub(crate) enum ServiceAction {
+    /// Install or repair the per-user durable service.
     Install,
+    /// Show service availability and current status.
     Status,
+    /// Stop and remove the per-user durable service.
     Uninstall,
 }
 
@@ -661,8 +679,96 @@ mod tests {
 
 #[cfg(test)]
 mod manual_tests {
+    #![allow(clippy::expect_used)]
+
     use super::{CLI_MANUAL, RawCli};
     use clap::CommandFactory;
+
+    fn collect_missing_help(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+        if command.is_hide_set() {
+            return;
+        }
+        if command
+            .get_about()
+            .or(command.get_long_about())
+            .is_none_or(|help| help.to_string().trim().is_empty())
+        {
+            missing.push(path.to_owned());
+        }
+        for argument in command
+            .get_arguments()
+            .filter(|argument| !argument.is_hide_set())
+        {
+            if argument
+                .get_help()
+                .or(argument.get_long_help())
+                .is_none_or(|help| help.to_string().trim().is_empty())
+            {
+                missing.push(format!("{path} argument {}", argument.get_id()));
+            }
+        }
+        for child in command.get_subcommands() {
+            // Clap's generated help nodes mirror the underlying commands.
+            if child.get_name() == "help" && !command.is_disable_help_subcommand_set() {
+                continue;
+            }
+            collect_missing_help(child, &format!("{path} {}", child.get_name()), missing);
+        }
+    }
+
+    #[test]
+    fn help_checker_catches_blank_nested_fields_and_skips_hidden_nodes() {
+        let mut command = clap::Command::new("fixture")
+            .about("Fixture commands")
+            .disable_help_subcommand(true)
+            .arg(clap::Arg::new("blank").help(" "))
+            .arg(clap::Arg::new("hidden").hide(true))
+            .subcommand(
+                clap::Command::new("service")
+                    .about("Service")
+                    .subcommand(clap::Command::new("install")),
+            )
+            .subcommand(clap::Command::new("__internal").hide(true));
+        command.build();
+        let mut missing = Vec::new();
+        collect_missing_help(&command, "fixture", &mut missing);
+        assert_eq!(
+            missing,
+            ["fixture argument blank", "fixture service install"]
+        );
+    }
+
+    #[test]
+    fn public_command_tree_has_complete_help() {
+        RawCli::command().debug_assert();
+        let mut command = RawCli::command();
+        command.build();
+        let mut missing = Vec::new();
+        collect_missing_help(&command, "atx", &mut missing);
+        assert!(missing.is_empty(), "missing help: {missing:#?}");
+    }
+
+    #[test]
+    fn cancellation_grace_uses_the_duration_value_name() {
+        let mut command = RawCli::command();
+        command.build();
+        let cancel = command
+            .get_subcommands()
+            .find(|command| command.get_name() == "cancel")
+            .expect("cancel command");
+        let grace = cancel
+            .get_arguments()
+            .find(|argument| argument.get_id() == "grace")
+            .expect("grace option");
+        let names = grace.get_value_names().expect("explicit value name");
+        assert_eq!(
+            names
+                .iter()
+                .map(clap::builder::Str::as_str)
+                .collect::<Vec<_>>(),
+            ["DURATION"]
+        );
+    }
 
     #[test]
     fn long_help_includes_manual_sections() {
