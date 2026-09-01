@@ -1,0 +1,7 @@
+[
+  {"kind": "exit", "value": 0},
+  {"kind": "signal", "value": 15},
+  {"kind": "failure", "value": "command could not start"},
+  {"kind": "interrupted", "value": "outcome unknown after restart"},
+  {"kind": "cancelled", "value": "cancelled by user"}
+]

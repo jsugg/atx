@@ -247,3 +247,18 @@ jobs:
           scripts/check-package-list.sh /tmp/package.list
       - name: Publish dry-run
         run: cargo publish --dry-run --locked
+      - name: Packaged bin tests
+        run: |
+          package_root=$(mktemp -d)
+          trap 'rm -rf "$package_root"' EXIT
+          CARGO_TARGET_DIR="$package_root/target" cargo package --locked --no-verify
+          set -- "$package_root"/target/package/atx-*.crate
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            printf 'expected one freshly built source archive\n' >&2
+            exit 1
+          fi
+          archive=$1
+          package_name=$(basename "$archive" .crate)
+          tar -xzf "$archive" -C "$package_root"
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo test --locked --bins \
+            --manifest-path "$package_root/$package_name/Cargo.toml"

@@ -123,6 +123,7 @@ README.md
 src/main.rs
 tests/fixtures/exit-codes-v1.json
 tests/fixtures/json-error-v1.json
+tests/fixtures/json-outcomes-v1.json
 tests/fixtures/migrations/v0.sql
 LIST
 
@@ -215,12 +216,14 @@ for mode in static full; do
     done
 done
 
-missing_fixture="$tmp/package-missing-fixture"
-grep -Fxv tests/fixtures/exit-codes-v1.json "$ATX_PACKAGE_LIST" >"$missing_fixture"
-if scripts/check-package-list.sh "$missing_fixture" >/dev/null 2>&1; then
-    printf 'package policy accepted a missing embedded fixture\n' >&2
-    exit 1
-fi
+for fixture in tests/fixtures/exit-codes-v1.json tests/fixtures/json-outcomes-v1.json; do
+    missing_fixture="$tmp/package-missing-fixture"
+    grep -Fxv "$fixture" "$ATX_PACKAGE_LIST" >"$missing_fixture"
+    if scripts/check-package-list.sh "$missing_fixture" >/dev/null 2>&1; then
+        printf 'package policy accepted missing embedded fixture: %s\n' "$fixture" >&2
+        exit 1
+    fi
+done
 
 for mode in quick static full msrv; do
     : >"$ATX_FAKE_LOG"

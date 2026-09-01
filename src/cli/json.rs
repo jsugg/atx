@@ -149,20 +149,9 @@ mod tests {
             RunOutcome::Interrupted("outcome unknown after restart".to_owned()),
             RunOutcome::Cancelled("cancelled by user".to_owned()),
         ];
-        let docs = include_str!("../../docs/json-api.md");
-        let section = docs
-            .split("### Outcome examples")
-            .nth(1)
-            .expect("outcome section");
-        let example = section
-            .split("```json\n")
-            .nth(1)
-            .expect("JSON example")
-            .split("```")
-            .next()
-            .expect("example end");
         let expected: serde_json::Value =
-            serde_json::from_str(example).expect("documented outcomes");
+            serde_json::from_str(include_str!("../../tests/fixtures/json-outcomes-v1.json"))
+                .expect("outcome contract fixture");
         let actual = serde_json::to_value(&outcomes).expect("outcomes");
         assert_eq!(actual, expected);
         assert_eq!(
