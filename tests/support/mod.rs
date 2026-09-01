@@ -1276,26 +1276,27 @@ fn inspect_process_identity_once(
 #[cfg(target_os = "linux")]
 fn process_arguments(pid: i32) -> Result<Inspection<Vec<OsString>>, String> {
     let path = PathBuf::from(format!("/proc/{pid}/cmdline"));
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
+    classify_linux_cmdline_read(&path, fs::read(&path))
+}
+
+#[cfg(target_os = "linux")]
+/// Keep departed tasks separate from transient and unexpected inspection failures.
+pub(crate) fn classify_linux_cmdline_read(
+    path: &Path,
+    result: io::Result<Vec<u8>>,
+) -> Result<Inspection<Vec<OsString>>, String> {
+    match result {
+        Ok(bytes) if bytes.is_empty() => Ok(Inspection::Transient),
+        Ok(bytes) => Ok(Inspection::Present(parse_nul_arguments(&bytes))),
         Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-            ) =>
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
         {
-            return Ok(if error.kind() == io::ErrorKind::NotFound {
-                Inspection::Absent
-            } else {
-                Inspection::Transient
-            });
+            Ok(Inspection::Absent)
         }
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
-    };
-    if bytes.is_empty() {
-        return Ok(Inspection::Transient);
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(Inspection::Transient),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
     }
-    Ok(Inspection::Present(parse_nul_arguments(&bytes)))
 }
 
 #[cfg(target_os = "linux")]

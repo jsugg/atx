@@ -162,6 +162,48 @@ fn linux_cmdline_parser_preserves_interior_empty_arguments() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cmdline_read_classifies_exit_and_preserves_real_errors() {
+    use std::io;
+    use support::{Inspection, classify_linux_cmdline_read};
+
+    let path = Path::new("/proc/42/cmdline");
+    for code in [libc::ESRCH, libc::ENOENT] {
+        assert_eq!(
+            classify_linux_cmdline_read(path, Err(io::Error::from_raw_os_error(code))),
+            Ok(Inspection::Absent)
+        );
+    }
+    for code in [libc::EACCES, libc::EPERM] {
+        assert_eq!(
+            classify_linux_cmdline_read(path, Err(io::Error::from_raw_os_error(code))),
+            Ok(Inspection::Transient)
+        );
+    }
+    assert_eq!(
+        classify_linux_cmdline_read(path, Ok(Vec::new())),
+        Ok(Inspection::Transient)
+    );
+    assert_eq!(
+        classify_linux_cmdline_read(path, Ok(b"atx\0\0job\0".to_vec())),
+        Ok(Inspection::Present(
+            vec!["atx", "", "job"]
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect()
+        ))
+    );
+    for error in [
+        io::Error::from_raw_os_error(libc::EIO),
+        io::Error::other("read fault"),
+    ] {
+        let error =
+            classify_linux_cmdline_read(path, Err(error)).expect_err("unexpected read failure");
+        assert!(error.contains("/proc/42/cmdline"), "{error}");
+    }
+}
+
 #[test]
 fn repeated_fixture_teardown_stops_session_supervisors() {
     for _ in 0..10 {
