@@ -58,7 +58,12 @@ fi
 
 require_pattern .github/workflows/release.yml 'DRY_RUN:'
 require_pattern .github/workflows/release.yml "if: env\.DRY_RUN == 'false'"
-require_pattern .github/workflows/release.yml "if: github\.event_name != 'workflow_dispatch'"
+require_pattern .github/workflows/release.yml "if: github\.event_name == 'push'"
+require_pattern .github/workflows/release.yml 'cargo install cargo-auditable --version 0\.7\.7 --locked'
+require_pattern .github/workflows/release.yml 'cargo auditable build --release --locked --target'
+require_pattern .github/workflows/release.yml 'syft-version: v1\.42\.3'
+require_pattern .github/workflows/release.yml 'cargo xtask check-sbom'
+require_pattern .github/workflows/release.yml 'upload-release-assets: false'
 require_pattern .github/workflows/release.yml 'sha256sum .*\.tar\.gz .*\.cdx\.json .*SHA256SUMS'
 require_pattern .github/workflows/release.yml 'dist/SHA256SUMS'
 require_pattern .github/workflows/release.yml 'gh attestation verify'

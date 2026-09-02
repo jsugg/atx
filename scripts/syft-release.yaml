@@ -1,0 +1,5 @@
+# Keep scanner-generated extraction paths out of the released inventory.
+check-for-app-update: false
+file:
+  metadata:
+    selection: none

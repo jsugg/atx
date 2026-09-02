@@ -1,21 +1,32 @@
 //! Repository maintenance tasks. Run with `cargo xtask <task>`.
 
+mod sbom;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() != Some("dist-man") {
-        eprintln!("usage: cargo xtask dist-man");
-        return ExitCode::from(2);
-    }
-    match dist_man() {
-        Ok(path) => {
-            println!("{}", path.display());
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let result = match args.as_slice() {
+        [task] if task == "dist-man" => dist_man().map(|path| path.display().to_string()),
+        [task, path, target] if task == "check-sbom" => match target.to_str() {
+            Some(target) => sbom::check(Path::new(path), target)
+                .map(|count| format!("SBOM: {count} locked runtime components verified")),
+            None => Err("release target must be UTF-8".into()),
+        },
+        _ => {
+            eprintln!("usage: cargo xtask dist-man | check-sbom FILE TARGET");
+            return ExitCode::from(2);
+        }
+    };
+    match result {
+        Ok(message) => {
+            println!("{message}");
             ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("xtask dist-man: {error}");
+            eprintln!("xtask: {error}");
             ExitCode::FAILURE
         }
     }

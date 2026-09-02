@@ -32,3 +32,8 @@ The required CI package job also tests the bin from a freshly extracted source
 archive. Workspace tests alone cannot catch a missing packaged test fixture.
 Use a fresh `CARGO_TARGET_DIR` for the extracted crate too. Reusing the workspace
 target can run an older test binary even when the archive contains the new code.
+
+`syft-release.yaml` configures the pinned release scanner. It omits temporary
+extraction-file metadata, not the Rust dependency inventory, and disables
+update checks. Release jobs scan the actual auditable archive and validate its
+inventory with `cargo xtask check-sbom FILE TARGET` before upload and finalize.
