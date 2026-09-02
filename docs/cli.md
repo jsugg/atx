@@ -94,6 +94,13 @@ rejected unless `--dst earlier` or `--dst later` chooses an offset.
 
 `--tty` is best effort. If the terminal has closed, the run's outcome does not
 change and `atx output` still has the captured output.
+ATX reopens the device without following links and checks that the opened TTY
+belongs to the current user and is not world-writable. Each stream echoes only
+its last 8 KiB. Control characters are removed except newline and tab; valid
+Unicode is kept, and malformed UTF-8 becomes printable replacement characters.
+The sanitized text also has an 8 KiB byte limit per stream. A notice marks a
+limited tail. A busy or unavailable terminal can receive only part of the echo;
+ATX does not wait for it or change its terminal settings. Captured files stay raw.
 
 ### Job environment
 
