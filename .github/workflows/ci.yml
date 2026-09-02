@@ -260,5 +260,5 @@ jobs:
           archive=$1
           package_name=$(basename "$archive" .crate)
           tar -xzf "$archive" -C "$package_root"
-          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo test --locked --bins \
+          CARGO_TARGET_DIR="$package_root/consumer-target" cargo test --locked --bins \
             --manifest-path "$package_root/$package_name/Cargo.toml"

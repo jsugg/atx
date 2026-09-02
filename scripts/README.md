@@ -30,3 +30,5 @@ excluded. Paths must be relative and contain no traversal components.
 
 The required CI package job also tests the bin from a freshly extracted source
 archive. Workspace tests alone cannot catch a missing packaged test fixture.
+Use a fresh `CARGO_TARGET_DIR` for the extracted crate too. Reusing the workspace
+target can run an older test binary even when the archive contains the new code.
