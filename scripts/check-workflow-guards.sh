@@ -42,6 +42,7 @@ require_literal .github/workflows/ci.yml '      COVERAGE_REGION_FLOOR: 85'
 
 require_pattern .github/workflows/codeql.yml 'ubuntu-[0-9]'
 require_pattern .github/workflows/codeql.yml 'macos-[0-9]'
+require_literal .github/workflows/codeql.yml '      - "xtask/**"'
 
 require_pattern .github/workflows/mutation.yml 'timeout-minutes:'
 require_pattern .github/workflows/mutation.yml 'cargo mutants'

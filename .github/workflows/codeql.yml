@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "src/**"
+      - "xtask/**"
       - ".github/workflows/codeql.yml"
   push:
     branches: [main]
