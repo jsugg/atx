@@ -9,6 +9,10 @@
 > GitHub release, and no prebuilt binaries yet. The install instructions and
 > badges below activate when the first release ships.
 
+The public `v0.1.0` tag was an unpublished release rehearsal, not a supported
+release. It stays unchanged for history. `0.1.1` is the first public release
+candidate; it has not shipped yet.
+
 <!-- RELEASE: remove this notice and enable the two badges below once the
      first release exists on crates.io. -->
 <!-- [![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx) -->
