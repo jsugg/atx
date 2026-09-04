@@ -3,6 +3,5 @@
     "MD013": { "line_length": 100, "heading_line_length": 100 },
     "MD024": { "siblings_only": true }
   },
-  "globs": ["**/*.md", "!target/**", "!.local/**", "!.serena/**"],
   "ignores": [".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
 }

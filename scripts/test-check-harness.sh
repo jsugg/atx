@@ -78,7 +78,6 @@ name=${0##*/}
 case "$name" in
     cargo-audit) version=0.22.2 ;;
     cargo-deny) version=0.20.2 ;;
-    mdlint) version=0.3.22 ;;
     lychee) version=0.24.2 ;;
     *) exit 97 ;;
 esac
@@ -96,7 +95,7 @@ if [ "${1:-}" = --version ]; then
 fi
 SCRIPT
 chmod 0700 "$tmp/versioned-tool"
-for tool in cargo-audit cargo-deny mdlint lychee; do
+for tool in cargo-audit cargo-deny lychee; do
     ln -s versioned-tool "$tmp/$tool"
 done
 
@@ -106,8 +105,35 @@ printf 'quality harness attempted remote command: %s\n' "${0##*/}" >&2
 exit 97
 SCRIPT
 chmod 0700 "$tmp/remote-command"
-ln -s remote-command "$tmp/git"
 ln -s remote-command "$tmp/gh"
+
+cat >"$tmp/git" <<'SCRIPT'
+#!/bin/sh
+if [ "$*" != 'ls-files -z -- *.md' ]; then
+    printf 'quality harness attempted unexpected Git command: %s\n' "$*" >&2
+    exit 97
+fi
+printf '%s\n' git-markdown >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = git-markdown ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
+fi
+printf 'README.md\000scripts/README.md\000'
+SCRIPT
+chmod 0700 "$tmp/git"
+
+cat >"$tmp/npx" <<'SCRIPT'
+#!/bin/sh
+if [ "$#" -lt 6 ] || [ "$1" != --yes ] || [ "$2" != markdownlint-cli2@0.23.2 ] \
+    || [ "$3" != --config ] || [ "$4" != .markdownlint-cli2.jsonc ] || [ "$5" != --no-globs ]; then
+    printf 'unexpected Markdown command: %s\n' "$*" >&2
+    exit 97
+fi
+printf '%s\n' npx-markdown >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = npx-markdown ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
+fi
+SCRIPT
+chmod 0700 "$tmp/npx"
 
 export ATX_FAKE_LOG="$tmp/calls"
 export ATX_FAKE_COMPILER_PATH="$tmp/rustc"
@@ -174,6 +200,9 @@ assert_package_policy_failure() {
     fi
 }
 
+assert_failure markdown git-markdown 41
+assert_failure markdown npx-markdown 41
+
 for stage in cargo-fmt cargo-check cargo-test cargo-clippy; do
     assert_failure quick "$stage" 41
     assert_failure full "$stage" 41
@@ -181,8 +210,8 @@ done
 
 for stage in \
     rustup-msrv rustc-msrv cargo-msrv cargo-doc \
-    cargo-audit-version cargo-deny-version mdlint-version lychee-version \
-    cargo-audit cargo-deny mdlint lychee cargo-package cargo-publish
+    cargo-audit-version cargo-deny-version lychee-version \
+    cargo-audit cargo-deny git-markdown npx-markdown lychee cargo-package cargo-publish
 do
     assert_failure static "$stage" 41
     assert_failure full "$stage" 41
@@ -225,7 +254,7 @@ for fixture in tests/fixtures/exit-codes-v1.json tests/fixtures/json-outcomes-v1
     fi
 done
 
-for mode in quick static full msrv; do
+for mode in quick static full markdown msrv; do
     : >"$ATX_FAKE_LOG"
     PATH="$tmp:$PATH" scripts/check.sh "$mode"
 done

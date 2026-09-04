@@ -7,9 +7,13 @@ cd "$ROOT"
 
 mode=${1:-quick}
 
-markdown_files() {
+link_files() {
     find docs -type f -name '*.md' -print
     printf '%s\n' README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md
+}
+
+markdown() {
+    scripts/check-markdown.sh || return $?
 }
 
 require_version() {
@@ -64,14 +68,12 @@ static() {
 
     require_version cargo-audit 0.22.2 || return $?
     require_version cargo-deny 0.20.2 || return $?
-    require_version mdlint 0.3.22 || return $?
     require_version lychee 0.24.2 || return $?
 
     cargo audit || return $?
     cargo deny check || return $?
-    markdown_paths=$(markdown_files) || return $?
-    # shellcheck disable=SC2086
-    mdlint check $markdown_paths || return $?
+    markdown || return $?
+    markdown_paths=$(link_files) || return $?
     # shellcheck disable=SC2086
     lychee --offline $markdown_paths || return $?
 
@@ -91,11 +93,13 @@ case "$mode" in
         ;;
     static) static || exit $? ;;
     msrv) msrv || exit $? ;;
+    markdown) markdown || exit $? ;;
     *)
-        printf 'usage: %s quick|msrv|static|full\n' "$0" >&2
+        printf 'usage: %s quick|msrv|markdown|static|full\n' "$0" >&2
         printf '  quick  fmt+check+test+clippy (pre-merge)\n' >&2
         printf '  msrv   verify and check with Rust 1.85.0 (no compiler wrappers)\n' >&2
-        printf '  static MSRV+doc+audit+deny+mdlint+lychee+package (extended)\n' >&2
+        printf '  markdown pinned CLI2+canonical config over tracked Markdown\n' >&2
+        printf '  static MSRV+doc+audit+deny+markdown+lychee+package (extended)\n' >&2
         printf '  full   quick+static (kept as an alias)\n' >&2
         exit 2
         ;;
