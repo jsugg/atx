@@ -30,7 +30,7 @@ use crate::domain::{
 };
 use crate::infrastructure::config::{ColorMode, Config, ConfigOverrides, Verbosity, load_config};
 use crate::infrastructure::paths::{
-    PathEnvironment, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
+    PathEnvironment, PathError, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
     validate_private_dir_for_uid,
 };
 use crate::infrastructure::process::{
@@ -237,12 +237,12 @@ fn run_service(global: &GlobalArgs, action: ServiceAction) -> ExitCode {
 
 fn service_operation(global: &GlobalArgs, action: ServiceAction) -> Result<(), CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     if action == ServiceAction::Install {
         ensure_private_dir(paths.state_dir())
-            .map_err(|error| CliError::permission(global.json, error))?;
+            .map_err(|error| CliError::path(global.json, error))?;
         ensure_private_dir(paths.runtime_dir())
-            .map_err(|error| CliError::permission(global.json, error))?;
+            .map_err(|error| CliError::path(global.json, error))?;
     }
     let mut manager = native_service_manager(&paths, global.json)?;
     match action {
@@ -320,7 +320,7 @@ fn run_doctor(global: &GlobalArgs) -> ExitCode {
 
 fn build_doctor_report(global: &GlobalArgs) -> Result<DoctorReport, CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     let uid = rustix::process::geteuid().as_raw();
     let mut builder = DoctorReportBuilder::default();
     check_private_directory(&mut builder, "state directory", paths.state_dir(), uid);
@@ -732,7 +732,7 @@ fn open_management(
     global: &GlobalArgs,
 ) -> Result<(Option<JobStore>, PlatformPaths, Config), CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     let config = load_effective_config(&paths, global, false)
         .map_err(|error| CliError::usage(global.json, error))?;
     let database_path = paths.state_dir().join("atx.db");
@@ -967,7 +967,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         eprintln!("Warning: --capture-env may save credentials in the state database.");
     }
     let paths = platform_paths(args.global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(json, error))?;
+        .map_err(|error| CliError::path(json, error))?;
     let config = load_effective_config(&paths, &args.global, args.options.durable)
         .map_err(|error| CliError::usage(json, error))?;
     if args.options.shell {
@@ -1006,7 +1006,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         return Ok((outcome, json, quiet));
     }
 
-    ensure_private_dir(paths.state_dir()).map_err(|error| CliError::permission(json, error))?;
+    ensure_private_dir(paths.state_dir()).map_err(|error| CliError::path(json, error))?;
     let database = Database::open(&paths.state_dir().join("atx.db"), Duration::from_secs(2))
         .map_err(|error| CliError::storage(json, error))?;
     let mut store = JobStore::new(database);
@@ -1017,9 +1017,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
     Ok((outcome, json, quiet))
 }
 
-fn platform_paths(
-    state_override: Option<&Path>,
-) -> Result<crate::infrastructure::paths::PlatformPaths, impl std::fmt::Display> {
+fn platform_paths(state_override: Option<&Path>) -> Result<PlatformPaths, PathError> {
     let environment = PathEnvironment {
         home: std::env::var_os("HOME").map(PathBuf::from),
         xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -1654,6 +1652,17 @@ struct CliError {
 }
 
 impl CliError {
+    fn path(json: bool, error: PathError) -> Self {
+        match error {
+            PathError::RelativePath | PathError::InvalidLeafName => Self::usage(json, error),
+            PathError::MissingHome
+            | PathError::MissingRuntimeRoot
+            | PathError::Insecure(_)
+            | PathError::Io(_)
+            | PathError::System(_) => Self::permission(json, error),
+        }
+    }
+
     fn usage(json: bool, error: impl std::fmt::Display) -> Self {
         Self::new(exit::usage(), "INVALID_ARGUMENT", json, error)
     }
@@ -1713,6 +1722,55 @@ mod tests {
     use std::time::Duration;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn path_error_variants_keep_usage_and_permission_classifications() {
+        use crate::infrastructure::paths::PathError;
+
+        for json in [false, true] {
+            let cases = [
+                (PathError::RelativePath, exit::usage(), "INVALID_ARGUMENT"),
+                (
+                    PathError::InvalidLeafName,
+                    exit::usage(),
+                    "INVALID_ARGUMENT",
+                ),
+                (
+                    PathError::MissingHome,
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::MissingRuntimeRoot,
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::Insecure("wrong owner"),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::System(rustix::io::Errno::ACCESS),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+            ];
+            for (error, expected_exit, expected_code) in cases {
+                let message = error.to_string();
+                let actual = super::CliError::path(json, error);
+                assert_eq!(actual.exit, expected_exit, "{message}");
+                assert_eq!(actual.code, expected_code, "{message}");
+                assert_eq!(actual.message, message);
+                assert_eq!(actual.json, json);
+            }
+        }
+    }
 
     use super::{
         SessionAcknowledger, build_doctor_report, build_job, cancel_job, check_database,
