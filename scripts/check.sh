@@ -7,14 +7,19 @@ cd "$ROOT"
 
 mode=${1:-quick}
 
-link_files() {
-    find docs -type f -name '*.md' -print
-    printf '%s\n' README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md CODE_OF_CONDUCT.md
-}
-
 markdown() {
     scripts/check-markdown.sh || return $?
 }
+
+fmt() { cargo fmt --check || return $?; }
+check() { cargo check --workspace --all-targets --all-features --locked || return $?; }
+test_stage() { cargo test --workspace --all-targets --all-features --locked || return $?; }
+clippy() { cargo clippy --workspace --all-targets --all-features --locked -- -D warnings || return $?; }
+docs() { RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features || return $?; }
+hygiene() { scripts/check-hygiene.sh || return $?; }
+man() { scripts/check-man.sh || return $?; }
+links_offline() { scripts/check-links.sh offline || return $?; }
+links_online() { scripts/check-links.sh online || return $?; }
 
 require_version() {
     tool=$1
@@ -35,13 +40,12 @@ require_version() {
     esac
 }
 
-# Deterministic pre-merge gate: build, tests, lint. This is what CI runs per
-# push; it is deliberately NOT the release gate.
+# Fast edit loop; CI calls these same stages separately on its runners.
 quick() {
-    cargo fmt --check || return $?
-    cargo check --all-targets --all-features --locked || return $?
-    cargo test --all-targets --all-features --locked || return $?
-    cargo clippy --all-targets --all-features --locked -- -D warnings || return $?
+    fmt || return $?
+    check || return $?
+    test_stage || return $?
+    clippy || return $?
 }
 
 msrv() {
@@ -56,27 +60,17 @@ msrv() {
     esac
     printf '%s\n' "$version"
     RUSTC="$compiler" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' \
-        cargo +1.85.0 check --all-targets --all-features --locked || return $?
+        cargo +1.85.0 check --workspace --all-targets --all-features --locked || return $?
 }
 
-# Extended static evidence on top of quick. Still not the release gate:
-# coverage floors, mutation, fuzz budgets, and performance evidence run as
-# dedicated scheduled/release workflows (see .github/workflows).
-static() {
-    msrv || return $?
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features || return $?
-
+dependencies() {
     require_version cargo-audit 0.22.2 || return $?
     require_version cargo-deny 0.20.2 || return $?
-    require_version lychee 0.24.2 || return $?
-
     cargo audit || return $?
     cargo deny check || return $?
-    markdown || return $?
-    markdown_paths=$(link_files) || return $?
-    # shellcheck disable=SC2086
-    lychee --offline $markdown_paths || return $?
+}
 
+package() {
     package_list=$(mktemp "${TMPDIR:-/tmp}/atx-package.XXXXXX") || return $?
     trap 'rm -f "$package_list"' EXIT HUP INT TERM
     cargo package --list >"$package_list" || return $?
@@ -84,23 +78,47 @@ static() {
     cargo publish --dry-run --locked || return $?
 }
 
+# Static checks are part of pre-merge; remote-only checks are documented separately.
+static() {
+    msrv || return $?
+    docs || return $?
+    dependencies || return $?
+    markdown || return $?
+    links_offline || return $?
+    package || return $?
+}
+
+pre_merge() {
+    quick || return $?
+    static || return $?
+    hygiene || return $?
+    man || return $?
+}
+
 case "$mode" in
     quick) quick || exit $? ;;
-    # Historical aggregate retained for CI compatibility.
-    full)
-        quick || exit $?
-        static || exit $?
-        ;;
+    pre-merge|full) pre_merge || exit $? ;;
+    fmt) fmt || exit $? ;;
+    check) check || exit $? ;;
+    test) test_stage || exit $? ;;
+    clippy) clippy || exit $? ;;
+    docs) docs || exit $? ;;
+    dependencies) dependencies || exit $? ;;
+    package) package || exit $? ;;
+    hygiene) hygiene || exit $? ;;
+    man) man || exit $? ;;
+    links-offline) links_offline || exit $? ;;
+    links-online) links_online || exit $? ;;
     static) static || exit $? ;;
     msrv) msrv || exit $? ;;
     markdown) markdown || exit $? ;;
     *)
-        printf 'usage: %s quick|msrv|markdown|static|full\n' "$0" >&2
+        printf 'usage: %s pre-merge|full|quick|static|fmt|check|test|clippy|msrv|docs|dependencies|package|hygiene|man|markdown|links-offline|links-online\n' "$0" >&2
         printf '  quick  fmt+check+test+clippy (pre-merge)\n' >&2
         printf '  msrv   verify and check with Rust 1.85.0 (no compiler wrappers)\n' >&2
         printf '  markdown pinned CLI2+canonical config over tracked Markdown\n' >&2
         printf '  static MSRV+doc+audit+deny+markdown+lychee+package (extended)\n' >&2
-        printf '  full   quick+static (kept as an alias)\n' >&2
+        printf '  pre-merge/full quick+static+hygiene+man (local contributor gate)\n' >&2
         exit 2
         ;;
 esac
