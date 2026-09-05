@@ -19,6 +19,45 @@ fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
 }
 
+#[test]
+fn relative_state_directory_is_usage_in_human_and_json_modes() {
+    let root = tempdir().expect("root");
+    let commands: &[&[&str]] = &[
+        &["list"],
+        &["doctor"],
+        &["service", "install"],
+        &["--dry-run", "30s", "--", "true"],
+    ];
+    for args in commands {
+        for json in [false, true] {
+            let mut command = atx();
+            command
+                .current_dir(root.path())
+                .args(["--state-dir", "relative-state"]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args(*args).output().expect("relative state-dir");
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{args:?}, JSON={json}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            if json {
+                let error = json_line(&output.stderr);
+                assert_eq!(error["schema_version"], 1);
+                assert_eq!(error["ok"], false);
+                assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
+                assert_eq!(error["error"]["message"], "path must be absolute");
+            } else {
+                assert_eq!(output.stderr, b"atx: path must be absolute\n");
+            }
+            assert!(!root.path().join("relative-state").exists());
+        }
+    }
+}
+
 /// Client pointed at the not-yet-existing state subdirectory, so ATX
 /// creates it with its required 0700 mode.
 fn tools(root: &std::path::Path) -> Command {
