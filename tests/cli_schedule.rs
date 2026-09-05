@@ -18,6 +18,82 @@ fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
 }
 
+/// Establish session supervision before tests that require a short command to execute.
+fn execution_state(root: &support::TestRoot) -> std::path::PathBuf {
+    let state = root.path().join("state");
+    let output = support::bounded_probe_output(
+        atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["30m", "--", "/bin/true"]),
+        Instant::now() + Duration::from_secs(15),
+    )
+    .expect("establish session supervisor");
+    assert!(output.status.success(), "{output:?}");
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("submission JSON");
+    assert_eq!(response["schema_version"], 1);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["data"]["supervised"], true);
+    assert_eq!(response["data"]["dry_run"], false);
+    assert_eq!(response["data"]["state"], "scheduled");
+    assert_eq!(response["data"]["runtime_tier"], "session");
+    state
+}
+
+#[test]
+fn execution_fixture_starts_a_session_without_running_its_future_seed() {
+    let root = tempdir().expect("root");
+    let state = execution_state(&root);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let doctor = support::bounded_probe_output(
+        atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("doctor"),
+        deadline,
+    )
+    .expect("doctor");
+    assert!(doctor.status.success(), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert!(support::service_report_is_ready(&report), "{report}");
+    let jobs = support::bounded_probe_output(
+        atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("list"),
+        deadline,
+    )
+    .expect("jobs");
+    assert!(jobs.status.success(), "{jobs:?}");
+    let jobs: serde_json::Value = serde_json::from_slice(&jobs.stdout).expect("jobs JSON");
+    assert_eq!(jobs["data"].as_array().expect("jobs array").len(), 1);
+    let history = support::bounded_probe_output(
+        atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("history"),
+        deadline,
+    )
+    .expect("history");
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+    assert!(
+        history["data"]
+            .as_array()
+            .expect("history array")
+            .is_empty()
+    );
+    assert_eq!(
+        support::fixture_process_count(root.path()).expect("live session census"),
+        1
+    );
+}
+
 fn assert_invalid_argument(output: &Output) {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let error: serde_json::Value =
@@ -240,7 +316,7 @@ fn relative_job_survives_submitter_terminal_closure() {
 #[test]
 fn absolute_utc_job_runs_end_to_end() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let marker = root.path().join("absolute");
     let due = Timestamp::now()
         .checked_add(SignedDuration::from_secs(5))
@@ -265,7 +341,7 @@ fn absolute_utc_job_runs_end_to_end() {
 #[test]
 fn fixed_rate_job_runs_more_than_once_and_can_be_cancelled() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let marker = root.path().join("recurring");
     let script = format!("printf 'x\\n' >>'{}'", marker.display());
     let output = atx()
@@ -317,7 +393,7 @@ fn wait_for_file(path: &std::path::Path) {
 #[test]
 fn output_prints_captured_streams_after_a_run() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let submitted = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -424,32 +500,56 @@ fn wait_for(predicate: impl Fn() -> bool, what: &str) {
 fn wait_for_history(state: &std::path::Path, job: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let done = match atx()
-            .arg("--state-dir")
-            .arg(state)
-            .args(["show", job])
-            .output()
-        {
-            Ok(job_view) if job_view.status.success() => {
-                // Only a terminal job counts; an empty or transiently
-                // failing listing must keep waiting.
-                String::from_utf8_lossy(&job_view.stdout)
-                    .lines()
-                    .any(|line| {
-                        matches!(
-                            line.trim(),
-                            "State: Succeeded"
-                                | "State: Failed"
-                                | "State: Cancelled"
-                                | "State: Interrupted"
-                                | "State: Missed"
-                        )
-                    })
+        let shown = support::bounded_probe_output(
+            atx()
+                .arg("--json")
+                .arg("--state-dir")
+                .arg(state)
+                .args(["show", job]),
+            deadline,
+        )
+        .expect("bounded job status");
+        assert!(shown.status.success(), "{shown:?}");
+        let value: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("job JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["ok"], true);
+        let state_name = value["data"]["state"].as_str().expect("job state");
+        assert_ne!(
+            state_name, "missed",
+            "job {job} was held without executing; terminal state is not run history"
+        );
+        if matches!(
+            state_name,
+            "succeeded" | "failed" | "cancelled" | "interrupted"
+        ) {
+            let history = support::bounded_probe_output(
+                atx()
+                    .arg("--json")
+                    .arg("--state-dir")
+                    .arg(state)
+                    .args(["history", job, "--limit", "1"]),
+                deadline,
+            )
+            .expect("bounded run history");
+            assert!(history.status.success(), "{history:?}");
+            let history: serde_json::Value =
+                serde_json::from_slice(&history.stdout).expect("history JSON");
+            assert_eq!(history["schema_version"], 1);
+            assert_eq!(history["ok"], true);
+            let run = history["data"]
+                .as_array()
+                .expect("history array")
+                .first()
+                .expect("terminal job must have a recorded run");
+            assert_eq!(run["job_id"], job);
+            if run["finished_at_utc"].is_string()
+                && run["outcome"].is_object()
+                && run["state"].as_str().is_some_and(|state| {
+                    matches!(state, "succeeded" | "failed" | "cancelled" | "interrupted")
+                })
+            {
+                return;
             }
-            _ => false,
-        };
-        if done {
-            return;
         }
         assert!(Instant::now() < deadline, "run never completed for {job}");
         std::thread::sleep(Duration::from_millis(100));
@@ -457,9 +557,54 @@ fn wait_for_history(state: &std::path::Path, job: &str) {
 }
 
 #[test]
-fn env_sources_reach_the_run_environment() {
+fn history_wait_rejects_a_missed_job_without_a_recorded_run() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
+    let submit_future = || {
+        let output = atx()
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(&state)
+            .args(["30m", "--", "/bin/true"])
+            .output()
+            .expect("future submission");
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("JSON")["data"]["job_id"]
+            .as_str()
+            .expect("job ID")
+            .to_owned()
+    };
+    let job = submit_future();
+    support::kill_session_supervisor(&state).expect("stop exact supervisor");
+    support::age_stopped_one_shot(&state, &job).expect("offline overdue fixture");
+    let _ = submit_future();
+    let shown = atx()
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["show", &job])
+        .output()
+        .expect("missed job");
+    let value: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("JSON");
+    assert_eq!(value["data"]["state"], "missed");
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_history(&state, &job);
+    }));
+    assert!(
+        result.is_err(),
+        "a missed job is not proof of a completed run"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "terminal empty history must fail promptly"
+    );
+}
+
+#[test]
+fn env_sources_reach_the_run_environment() {
+    let root = tempdir().expect("root");
+    let state = execution_state(&root);
 
     // Inline --env KEY=VALUE.
     let inline = atx()
@@ -521,7 +666,7 @@ fn env_sources_reach_the_run_environment() {
 #[test]
 fn capture_env_controls_whole_environment_snapshot() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let probe = "/bin/sh -c 'printf %s \"$GAP_CAPTURE\"'";
 
     // Default: sanitized environment must not leak the parent's extra var.
@@ -759,7 +904,7 @@ fn rm_refuses_live_then_removes_terminal_jobs() {
 #[test]
 fn run_reruns_completed_job_and_appends_history() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let submitted = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -805,7 +950,7 @@ fn run_reruns_completed_job_and_appends_history() {
 #[test]
 fn cancel_grace_escalates_to_kill_for_term_immune_process() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let marker = root.path().join("started");
     // TERM is trapped away, so only the post-grace KILL can stop this run.
     let script = format!("trap '' TERM; touch '{}'; sleep 30", marker.display());
@@ -848,7 +993,7 @@ fn cancel_grace_escalates_to_kill_for_term_immune_process() {
 #[test]
 fn cwd_runs_child_in_requested_directory() {
     let root = tempdir().expect("root");
-    let state = root.path().join("state");
+    let state = execution_state(&root);
     let workdir = root.path().join("workdir");
     fs::create_dir(&workdir).expect("create workdir");
     let submitted = atx()

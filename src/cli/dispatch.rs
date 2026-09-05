@@ -38,7 +38,7 @@ use crate::infrastructure::process::{
 };
 use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::service::NativeServiceManager;
-use crate::infrastructure::sqlite::{Database, JobStore, StoreError};
+use crate::infrastructure::sqlite::{DATABASE_BUSY_TIMEOUT, Database, JobStore, StoreError};
 use crate::infrastructure::time::NativeClock;
 use crate::run_monitor::run_monitor_process;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
@@ -483,7 +483,7 @@ fn check_database(builder: &mut DoctorReportBuilder, state_directory: &Path) -> 
         );
         return None;
     }
-    match Database::open(&database_path, Duration::from_secs(2))
+    match Database::open(&database_path, DATABASE_BUSY_TIMEOUT)
         .and_then(|database| database.schema_version())
     {
         Ok(version) => {
@@ -739,7 +739,7 @@ fn open_management(
     if !database_path.is_file() {
         return Ok((None, paths, config));
     }
-    let database = Database::open(&database_path, Duration::from_secs(2))
+    let database = Database::open(&database_path, DATABASE_BUSY_TIMEOUT)
         .map_err(|error| CliError::storage(global.json, error))?;
     Ok((Some(JobStore::new(database)), paths, config))
 }
@@ -1007,7 +1007,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
     }
 
     ensure_private_dir(paths.state_dir()).map_err(|error| CliError::permission(json, error))?;
-    let database = Database::open(&paths.state_dir().join("atx.db"), Duration::from_secs(2))
+    let database = Database::open(&paths.state_dir().join("atx.db"), DATABASE_BUSY_TIMEOUT)
         .map_err(|error| CliError::storage(json, error))?;
     let mut store = JobStore::new(database);
     let acknowledger =

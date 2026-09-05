@@ -75,8 +75,14 @@ rolls back. ATX refuses to change a database newer than the executable. It also
 treats an existing database with no schema as corruption, rather than replacing
 it with an empty one.
 
-SQLite uses foreign keys, WAL mode, full synchronous writes, and a bounded busy
-timeout. The main indexes cover due-job selection, run history, transition
+SQLite uses foreign keys, WAL mode, full synchronous writes, and a five-second
+busy timeout shared by the CLI, supervisor, and run monitor. Opening a database
+first takes a bounded advisory lock on its private directory. The lock covers
+file creation, connection setup, and migrations, so peers wait for the creator
+instead of mistaking an unfinished schema for corruption. It adds no lock file
+or schema change. An existing schema-less file is still refused after the lease
+is acquired; it is not proof of a new installation. Later writes use SQLite's
+normal transaction locks. The main indexes cover due-job selection, run history, transition
 history, visible-job listing, and hidden-job ID pagination.
 
 ## IPC and acknowledgement
