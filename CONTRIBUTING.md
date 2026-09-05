@@ -13,12 +13,26 @@ correct change, then clean it up. Bug fixes need a regression test.
 ## Local checks
 
 ```console
-cargo fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
+./scripts/check.sh quick
+./scripts/check.sh pre-merge
 ```
 
-Run `./scripts/check.sh full` before calling a phase complete.
+`quick` is the edit loop. `pre-merge` adds compiler-bound MSRV, docs, dependency
+policy, Markdown, offline links, package/dry run, all shell scripts and harnesses,
+workflow guards, and man generation/lint. `full` is an alias for `pre-merge`, not
+a claim that every release check ran locally. Use a clean checkout. See
+[script prerequisites and stages](scripts/README.md).
+
+CI calls those same named stages. It also checks commit titles, coverage floors,
+native architecture/libc/user variants, extracted source packages, and applicable
+security/dependency-review/release-archive workflows. Fuzz, mutation, and
+performance budgets have separate scheduled workflows. A local green result
+does not replace these remote checks.
+
+`./scripts/check.sh links-online` checks live URLs with bounded requests. It runs
+on documentation PRs and weekly in CI, separately from the offline pre-merge
+gate. Broken links fail visibly; use a read-only `GITHUB_TOKEN` if GitHub rate
+limits requests.
 
 For Markdown-only edits, run `./scripts/check.sh markdown`. It uses the same
 pinned tool, config, and tracked-file scope as CI. Node.js 22+ and npm are
