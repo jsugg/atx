@@ -58,6 +58,9 @@ wrong required tool versions fail with an actionable message.
 ## Script contracts
 
 - `check.sh MODE` composes the named stages and makes no remote mutation.
+  Its package stage verifies the extracted crate in a fresh private Cargo target,
+  then removes that target on success or failure. The caller's workspace target
+  is left alone. Cleanup failures stay visible and fail an otherwise green stage.
 - `check-hygiene.sh` shellchecks every shell script and runs workflow guards,
   aggregate failure tests, Markdown scope tests and mocked link scope tests.
 - `check-man.sh` tests/lints xtask, renders `dist/man` and lints its pages. Build

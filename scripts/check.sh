@@ -70,13 +70,31 @@ dependencies() {
     cargo deny check || return $?
 }
 
-package() {
-    package_list=$(mktemp "${TMPDIR:-/tmp}/atx-package.XXXXXX") || return $?
-    trap 'rm -f "$package_list"' EXIT HUP INT TERM
+# Cleanup must not hide the original command's failure status.
+cleanup_package() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    cleanup_status=0
+    rm -rf "$1" || cleanup_status=$?
+    if [ "$cleanup_status" -ne 0 ]; then
+        printf 'could not remove package verification directory: %s\n' "$1" >&2
+        if [ "$status" -eq 0 ]; then status=$cleanup_status; fi
+    fi
+    exit "$status"
+}
+
+package() (
+    package_work=$(mktemp -d "${TMPDIR:-/tmp}/atx-package.XXXXXX") || return $?
+    trap 'cleanup_package "$package_work"' EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    package_list="$package_work/files"
     cargo package --list >"$package_list" || return $?
     scripts/check-package-list.sh "$package_list" || return $?
-    cargo publish --dry-run --locked || return $?
-}
+    # The extracted verifier must not share the source binary's build cache.
+    CARGO_TARGET_DIR="$package_work/target" cargo publish --dry-run --locked || return $?
+)
 
 # Static checks are part of pre-merge; remote-only checks are documented separately.
 static() {

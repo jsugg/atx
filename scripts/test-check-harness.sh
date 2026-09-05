@@ -47,6 +47,16 @@ case "$*" in
 esac
 
 printf '%s\n' "$stage" >>"$ATX_FAKE_LOG"
+if [ "$stage" = cargo-publish ] && [ -n "${ATX_FAKE_PUBLISH_TARGET_LOG:-}" ]; then
+    publish_target=${CARGO_TARGET_DIR:-"$PWD/target"}
+    case "$publish_target" in
+        "$ATX_FAKE_PUBLISH_ROOT"/*) ;;
+        *) printf 'publish target escaped its owned fixture\n' >&2; exit 97 ;;
+    esac
+    printf '%s\n' "$publish_target" >"$ATX_FAKE_PUBLISH_TARGET_LOG"
+    mkdir -p "$publish_target/debug"
+    printf 'consumer-output\n' >"$publish_target/debug/atx"
+fi
 if [ "${ATX_FAKE_FAIL_STAGE:-}" = "$stage" ]; then
     exit "${ATX_FAKE_FAIL_STATUS:-41}"
 fi
@@ -326,6 +336,71 @@ if [ "$(cat "$ATX_FAKE_LOG")" != "$expected_calls" ]; then
     exit 1
 fi
 scripts/check-package-list.sh "$ATX_PACKAGE_LIST"
+
+source_target="$tmp/source-target"
+mkdir -p "$source_target/debug"
+for mode in package static full pre-merge; do
+    for inherited in yes no; do
+        for expected_status in 0 43; do
+            printf 'source-before\n' >"$source_target/debug/atx"
+            target_log="$tmp/publish-target"
+            rm -f "$target_log"
+            fail_stage=''
+            if [ "$expected_status" -ne 0 ]; then fail_stage=cargo-publish; fi
+            status=0
+            (
+                if [ "$inherited" = yes ]; then
+                    CARGO_TARGET_DIR="$source_target"
+                    export CARGO_TARGET_DIR
+                else
+                    unset CARGO_TARGET_DIR
+                fi
+                ATX_FAKE_PUBLISH_TARGET_LOG="$target_log" ATX_FAKE_PUBLISH_ROOT="$tmp" \
+                    ATX_FAKE_FAIL_STAGE="$fail_stage" ATX_FAKE_FAIL_STATUS=43 \
+                    TMPDIR="$tmp" PATH="$tmp:$PATH" "$CHECK" "$mode"
+            ) >/dev/null 2>&1 || status=$?
+            if [ "$status" -ne "$expected_status" ]; then
+                printf '%s changed publish status: expected %s, got %s\n' \
+                    "$mode" "$expected_status" "$status" >&2
+                exit 1
+            fi
+            publish_target=$(cat "$target_log")
+            if [ "$(cat "$source_target/debug/atx")" != source-before ] \
+                || [ "$publish_target" = "$fixture/target" ] \
+                || [ "$publish_target" = "$source_target" ] \
+                || [ -e "$publish_target" ] || [ -e "${publish_target%/*}" ]; then
+                printf '%s reused or retained consumer artifacts, inherited=%s status=%s\n' \
+                    "$mode" "$inherited" "$expected_status" >&2
+                exit 1
+            fi
+        done
+    done
+done
+
+cat >"$tmp/rm" <<'SCRIPT'
+#!/bin/sh
+if [ "${ATX_FAKE_CLEANUP_FAIL:-}" = yes ] && [ "$1" = -rf ]; then
+    printf 'injected package cleanup failure\n' >&2
+    exit 59
+fi
+exec /bin/rm "$@"
+SCRIPT
+chmod 0700 "$tmp/rm"
+for publish_status in 0 43; do
+    fail_stage=''
+    if [ "$publish_status" -ne 0 ]; then fail_stage=cargo-publish; fi
+    expected_status=$publish_status
+    if [ "$expected_status" -eq 0 ]; then expected_status=59; fi
+    status=0
+    ATX_FAKE_CLEANUP_FAIL=yes ATX_FAKE_FAIL_STAGE="$fail_stage" ATX_FAKE_FAIL_STATUS=43 \
+        TMPDIR="$tmp" PATH="$tmp:$PATH" "$CHECK" package >"$tmp/cleanup-error" 2>&1 || status=$?
+    if [ "$status" -ne "$expected_status" ] \
+        || ! grep -q 'could not remove package verification directory:' "$tmp/cleanup-error"; then
+        printf 'package cleanup hid a failure or its diagnostic: expected %s, got %s\n' \
+            "$expected_status" "$status" >&2
+        exit 1
+    fi
+done
 
 # Exercise the real helper composition separately from the aggregate gate doubles.
 cp "$ROOT/scripts/check-hygiene.sh" "$ROOT/scripts/check-man.sh" "$fixture/scripts/"
