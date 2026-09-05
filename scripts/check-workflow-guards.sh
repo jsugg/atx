@@ -81,4 +81,11 @@ if grep -Fq -- '--no-verify' .github/workflows/publish-crates-io.yml; then
     exit 1
 fi
 
+require_literal .github/ISSUE_TEMPLATE/config.yml 'blank_issues_enabled: true'
+require_literal .github/ISSUE_TEMPLATE/config.yml '    url: https://github.com/jsugg/atx/security/advisories/new'
+require_literal .github/ISSUE_TEMPLATE/bug_report.md 'atx doctor --json'
+require_literal .github/ISSUE_TEMPLATE/bug_report.md 'Remove credentials, environment values and private command output.'
+require_literal .github/ISSUE_TEMPLATE/bug_report.md "Redact paths or user names you don't want in a public issue."
+require_literal .github/ISSUE_TEMPLATE/bug_report.md "Include your OS version and \`atx version\` output too; doctor does not report them."
+
 printf 'workflow-guards: PASS\n'

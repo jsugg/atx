@@ -6,6 +6,8 @@ Please email `juanpedrosugg+github [at] gmail [dot] com` with a short reproducti
 and the affected version. Do not open a public issue for a vulnerability that could
 put someone's commands, environment, or local files at risk.
 
+You can also [send a private report through GitHub](https://github.com/jsugg/atx/security/advisories/new).
+
 There is no guaranteed response window yet; this is a one-person side-project.
 I will acknowledge a useful report as soon as I can and keep the reporter
 updated while checking it.
