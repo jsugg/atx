@@ -38,4 +38,5 @@ The development-only `xtask` reuses `serde_json` to read Cargo's build messages
 and run the executable Cargo actually produced, including custom target paths.
 It also uses pinned `yaml-rust2` 0.13.0 to check workflow policy values without
 depending on indentation or a global YAML interpreter. UTF-8 input, nesting and
-alias expansion are bounded. This parser is not shipped with ATX.
+alias expansion are bounded, including the copied string bytes. This parser is
+not shipped with ATX.

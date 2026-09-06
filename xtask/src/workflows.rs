@@ -11,6 +11,7 @@ use yaml_rust2::{Yaml, YamlLoader};
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_NODES: usize = 20_000;
+const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const FILES: &[&str] = &[
     "ci.yml",
     "codeql.yml",
@@ -21,6 +22,31 @@ const FILES: &[&str] = &[
     "publish-crates-io.yml",
     "config.yml",
 ];
+
+#[derive(Clone, Copy)]
+struct NodeCost {
+    nodes: usize,
+    depth: usize,
+    payload_bytes: usize,
+}
+
+impl NodeCost {
+    fn include(&mut self, child: Self) -> Result<(), String> {
+        self.nodes = self
+            .nodes
+            .checked_add(child.nodes)
+            .ok_or("YAML node count overflow")?;
+        self.payload_bytes = self
+            .payload_bytes
+            .checked_add(child.payload_bytes)
+            .ok_or("YAML scalar payload overflow")?;
+        self.depth = self.depth.max(child.depth + 1);
+        if self.depth > MAX_DEPTH {
+            return Err("expanded YAML nesting exceeds 64 levels".into());
+        }
+        Ok(())
+    }
+}
 
 /// Check local policy without executing workflow commands or changing repository state.
 pub(crate) fn check(root: &Path) -> Result<(), String> {
@@ -64,19 +90,20 @@ pub(crate) fn check(root: &Path) -> Result<(), String> {
     check_sources(&borrowed)
 }
 
-/// Bound expanded alias/anchor allocations before the high-level loader clones nodes.
+/// Bound node/text clones and expanded nesting before high-level loading.
 fn validate_budget(source: &str) -> Result<(), String> {
     if source.len() > MAX_BYTES {
         return Err("YAML input exceeds 256 KiB".to_owned());
     }
     let mut parser = Parser::new_from_str(source);
-    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
+    let mut stack: Vec<(usize, NodeCost)> = Vec::new();
     let mut anchors = BTreeMap::new();
     let mut allocated = 0_usize;
+    let mut allocated_bytes = 0_usize;
     let mut documents = 0_usize;
     loop {
         let (event, _) = parser.next_token().map_err(|error| error.to_string())?;
-        let (anchor, weight, depth, allocation) = match event {
+        let (anchor, cost, copies) = match event {
             Event::StreamEnd => break,
             Event::DocumentStart => {
                 documents += 1;
@@ -89,7 +116,14 @@ fn validate_budget(source: &str) -> Result<(), String> {
                 if stack.len() >= MAX_DEPTH {
                     return Err("YAML nesting exceeds 64 levels".into());
                 }
-                stack.push((anchor, 1, 1));
+                stack.push((
+                    anchor,
+                    NodeCost {
+                        nodes: 1,
+                        depth: 1,
+                        payload_bytes: 0,
+                    },
+                ));
                 allocated = allocated
                     .checked_add(1)
                     .filter(|value| *value <= MAX_NODES)
@@ -97,33 +131,47 @@ fn validate_budget(source: &str) -> Result<(), String> {
                 continue;
             }
             Event::SequenceEnd | Event::MappingEnd => {
-                let (anchor, weight, depth) = stack.pop().ok_or("unbalanced YAML container")?;
-                (anchor, weight, depth, if anchor == 0 { 0 } else { weight })
+                let (anchor, cost) = stack.pop().ok_or("unbalanced YAML container")?;
+                (anchor, cost, usize::from(anchor != 0))
             }
-            Event::Scalar(_, _, anchor, _) => (anchor, 1, 0, if anchor == 0 { 1 } else { 2 }),
+            Event::Scalar(value, _, anchor, _) => (
+                anchor,
+                NodeCost {
+                    nodes: 1,
+                    depth: 0,
+                    payload_bytes: value.len(),
+                },
+                if anchor == 0 { 1 } else { 2 },
+            ),
             Event::Alias(anchor) => {
-                let (weight, depth) = *anchors
+                let cost = *anchors
                     .get(&anchor)
                     .ok_or("undefined or recursive YAML alias")?;
-                (0, weight, depth, weight)
+                (0, cost, 1)
             }
             Event::Nothing | Event::StreamStart | Event::DocumentEnd => continue,
         };
         allocated = allocated
-            .checked_add(allocation)
+            .checked_add(
+                cost.nodes
+                    .checked_mul(copies)
+                    .ok_or("YAML node count overflow")?,
+            )
             .filter(|value| *value <= MAX_NODES)
             .ok_or("expanded YAML exceeds 20000 nodes")?;
+        allocated_bytes = allocated_bytes
+            .checked_add(
+                cost.payload_bytes
+                    .checked_mul(copies)
+                    .ok_or("YAML scalar payload overflow")?,
+            )
+            .filter(|value| *value <= MAX_PAYLOAD_BYTES)
+            .ok_or("expanded YAML scalar payload exceeds 8 MiB")?;
         if anchor != 0 {
-            anchors.insert(anchor, (weight, depth));
+            anchors.insert(anchor, cost);
         }
-        if let Some((_, total, parent_depth)) = stack.last_mut() {
-            *total = total
-                .checked_add(weight)
-                .ok_or("YAML node count overflow")?;
-            *parent_depth = (*parent_depth).max(depth + 1);
-            if *parent_depth > MAX_DEPTH {
-                return Err("expanded YAML nesting exceeds 64 levels".into());
-            }
+        if let Some((_, parent)) = stack.last_mut() {
+            parent.include(cost)?;
         }
     }
     if documents != 1 {
@@ -982,6 +1030,27 @@ mod tests {
     fn recursive_and_undefined_aliases_are_rejected() {
         for source in ["a: &a [*a]\n", "a: *missing\n"] {
             assert!(super::parse("fixture.yml", source).is_err(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn aliased_scalar_bytes_are_bounded_before_loading() {
+        let scalar = "x".repeat(160 * 1024);
+        for definition in [
+            format!("text: &text {scalar}\n"),
+            format!("text: &text [{scalar}]\n"),
+            format!("text: &text {{body: {scalar}}}\n"),
+            format!("base: &base {scalar}\ntext: &text [*base]\n"),
+        ] {
+            let source = format!("{definition}copies: [{}]\n", "*text, ".repeat(64));
+            assert!(source.len() < super::MAX_BYTES);
+            assert!(
+                super::validate_budget(&source)
+                    .expect_err("expanded scalar payload must be bounded before loading")
+                    .contains("payload")
+            );
+            let bounded = format!("{definition}copies: [*text]\n");
+            super::parse("fixture.yml", &bounded).expect("bounded large string alias");
         }
     }
 

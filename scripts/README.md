@@ -79,6 +79,8 @@ wrong required tool versions fail with an actionable message.
   policy values through `cargo xtask check-workflows`. The unpublished tool uses
   pinned YAML 1.2 parsing, accepts formatting changes, and bounds file size,
   nesting and alias expansion. Diagnostics name the workflow and policy field.
+  Limits are 256 KiB input, 64 container levels, 20,000 nodes and 8 MiB of
+  scalar text, including anchor and alias copies.
   Script and issue-template prose checks stay separate. It reads files and makes
   no remote change; Rust 1.85 or newer must be installed before the hygiene stage.
 - `mock_registry.py [PORT [WORKDIR]]` binds the loopback test registry with
