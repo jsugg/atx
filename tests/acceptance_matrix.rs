@@ -68,6 +68,58 @@ fn wait_for(predicate: impl Fn() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
+/// Check the job and its own finished run before trusting a command's output file.
+fn successful_run_finished(state: &std::path::Path, job: &str, deadline: Instant) -> bool {
+    let shown = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(state)
+            .args(["show", job]),
+        deadline,
+    )
+    .expect("bounded job status");
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("job JSON");
+    assert_eq!(shown["schema_version"], 1);
+    assert_eq!(shown["ok"], true);
+    match shown["data"]["state"].as_str().expect("job state") {
+        "scheduled" | "waiting" | "starting" | "running" | "cancel_requested" => return false,
+        "succeeded" => {}
+        other => panic!("expected job {job} to succeed, got {other}"),
+    }
+    let history = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(state)
+            .args(["history", job, "--limit", "1"]),
+        deadline,
+    )
+    .expect("bounded matching history");
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["ok"], true);
+    let run = history["data"]
+        .as_array()
+        .expect("history array")
+        .first()
+        .expect("successful job must have a recorded run");
+    assert_eq!(run["job_id"], job);
+    run["state"] == "succeeded" && run["finished_at_utc"].is_string() && run["outcome"].is_object()
+}
+
+/// Wait for the successful job and its matching run to finish.
+fn wait_for_successful_run(state: &std::path::Path, job: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !successful_run_finished(state, job, deadline) {
+        assert!(
+            Instant::now() < deadline,
+            "job {job} never completed successfully"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Kill only the supervisor serving `state` to simulate a crash.
 fn kill_state_supervisors(state: &std::path::Path) {
     support::kill_session_supervisor(state).expect("kill fixture supervisor");
@@ -95,6 +147,7 @@ fn s1_direct_argv_preserves_special_characters_and_unicode() {
     // the child's argv verbatim.
     let payload = "a'b\"c$d%e\\f;g|&h→😀";
     let submitted = atx()
+        .arg("--json")
         .arg("--state-dir")
         .arg(&state)
         .args([
@@ -110,8 +163,48 @@ fn s1_direct_argv_preserves_special_characters_and_unicode() {
         .output()
         .expect("submit");
     assert!(submitted.status.success(), "{submitted:?}");
-    wait_for(|| marker.exists(), "argv job to write its payload");
+    let response: serde_json::Value =
+        serde_json::from_slice(&submitted.stdout).expect("submission JSON");
+    let job = response["data"]["job_id"].as_str().expect("job ID");
+    wait_for_successful_run(&state, job);
     assert_eq!(fs::read_to_string(&marker).expect("payload"), payload);
+}
+
+#[test]
+fn payload_readiness_rejects_an_open_file_while_its_writer_is_running() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let _ = json_run(&state, &["30m", "--", "/bin/true"]);
+    let payload = root.path().join("payload");
+    let opened = root.path().join("opened");
+    let release = root.path().join("release");
+    let submitted = atx()
+        .args(["--json", "--state-dir"])
+        .arg(&state)
+        .args([
+            "1s", "--", "/bin/sh", "-c",
+            ": > \"$1\"; printf opened > \"$2\"; while [ ! -f \"$3\" ]; do /bin/sleep 0.01; done; printf complete > \"$1\"",
+            "writer",
+        ])
+        .arg(&payload).arg(&opened).arg(&release)
+        .output().expect("submit controlled writer");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let response: serde_json::Value =
+        serde_json::from_slice(&submitted.stdout).expect("submission JSON");
+    let job = response["data"]["job_id"].as_str().expect("job ID");
+    wait_for(|| opened.exists(), "writer to open its payload");
+    assert_eq!(fs::read(&payload).expect("opened payload"), b"");
+    assert_eq!(job_state(&state, job).as_deref(), Some("running"));
+    assert!(
+        !successful_run_finished(&state, job, Instant::now() + Duration::from_secs(5)),
+        "an open file was treated as a completed run"
+    );
+    fs::write(&release, "release writer").expect("release");
+    wait_for_successful_run(&state, job);
+    assert_eq!(
+        fs::read_to_string(&payload).expect("completed payload"),
+        "complete"
+    );
 }
 
 /// S2: Shell operators are inert without explicit `--shell`.
