@@ -1,6 +1,7 @@
 //! Repository maintenance tasks. Run with `cargo xtask <task>`.
 
 mod sbom;
+mod workflows;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,21 @@ fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match args.as_slice() {
         [task] if task == "dist-man" => dist_man().map(|path| path.display().to_string()),
+        [task] if task == "check-workflows" => workspace_root()
+            .and_then(|root| workflows::check(&root))
+            .map(|()| "workflow policy: PASS".to_owned()),
+        [task, root] if task == "check-workflows" => {
+            workflows::check(Path::new(root)).map(|()| "workflow policy: PASS".to_owned())
+        }
         [task, path, target] if task == "check-sbom" => match target.to_str() {
             Some(target) => sbom::check(Path::new(path), target)
                 .map(|count| format!("SBOM: {count} locked runtime components verified")),
             None => Err("release target must be UTF-8".into()),
         },
         _ => {
-            eprintln!("usage: cargo xtask dist-man | check-sbom FILE TARGET");
+            eprintln!(
+                "usage: cargo xtask dist-man | check-sbom FILE TARGET | check-workflows [ROOT]"
+            );
             return ExitCode::from(2);
         }
     };

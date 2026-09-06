@@ -76,7 +76,11 @@ wrong required tool versions fail with an actionable message.
   It performs no real build, upload or remote Git command and cannot recurse
   into the real hygiene harness. Fixture cleanup does not change this index.
 - `check-workflow-guards.sh` actionlints all workflows and asserts required
-  policy values. It reads files and makes no remote change.
+  policy values through `cargo xtask check-workflows`. The unpublished tool uses
+  pinned YAML 1.2 parsing, accepts formatting changes, and bounds file size,
+  nesting and alias expansion. Diagnostics name the workflow and policy field.
+  Script and issue-template prose checks stay separate. It reads files and makes
+  no remote change; Rust 1.85 or newer must be installed before the hygiene stage.
 - `mock_registry.py [PORT [WORKDIR]]` binds the loopback test registry with
   dummy credentials, recording `state.json` and `requests.log` in its work dir.
   It never talks to crates.io and is not a real credential exchange.
