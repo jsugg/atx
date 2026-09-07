@@ -40,10 +40,6 @@ impl ManagementStore for JobStore {
         active_runs(self).map_err(|error| management_error(&error))
     }
 
-    fn latest_active_run(&self, job_id: JobId) -> Result<Option<Run>, ManagementStoreError> {
-        latest_active_run(self, job_id).map_err(|error| management_error(&error))
-    }
-
     fn hide_job(
         &mut self,
         job_id: JobId,
@@ -148,7 +144,10 @@ fn active_runs(store: &JobStore) -> Result<Vec<Run>, StoreError> {
     Ok(runs)
 }
 
-fn latest_active_run(store: &JobStore, job_id: JobId) -> Result<Option<Run>, StoreError> {
+pub(super) fn latest_active_run(
+    store: &JobStore,
+    job_id: JobId,
+) -> Result<Option<Run>, StoreError> {
     let sql = format!(
         "SELECT {RUN_COLUMNS} FROM runs
          WHERE job_id = ?1 AND state IN ('starting', 'running', 'cancel_requested')
@@ -622,16 +621,14 @@ mod tests {
         let mut store = JobStore::new(database);
 
         let (job, run) = active_job_with_run(&mut store, 1_000);
-        let latest = store
-            .latest_active_run(job.id())
+        let latest = super::latest_active_run(&store, job.id())
             .expect("latest active run")
             .expect("present");
         assert_eq!(latest.id(), run.id());
         assert_eq!(latest.state(), RunState::Running);
 
         assert!(
-            store
-                .latest_active_run(JobId::new())
+            super::latest_active_run(&store, JobId::new())
                 .expect("missing")
                 .is_none()
         );

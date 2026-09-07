@@ -5,11 +5,12 @@ use std::str::FromStr;
 use rusqlite::types::Type;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+use super::job_store::load_job;
 use super::{JobStore, StoreError, map_read_error, map_write_error};
 use crate::application::{CancellationStore, CancellationStoreError};
 use crate::domain::{
-    ClaimToken, JobId, ProcessIdentitySnapshot, Run, RunId, RunOutcome, RunSnapshot, RunState,
-    Sequence, UtcTimestamp,
+    ClaimToken, JobId, JobState, ProcessIdentitySnapshot, Run, RunId, RunOutcome, RunSnapshot,
+    RunState, Sequence, UtcTimestamp,
 };
 
 pub(super) const RUN_COLUMNS: &str = "
@@ -31,6 +32,11 @@ impl JobStore {
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_write_error)?;
+        let job = load_job(&transaction, job_id)?.ok_or(StoreError::NotFound)?;
+        // Cancellation and claim eligibility share the same writer ordering.
+        if job.state() == JobState::CancelRequested || job.state().is_terminal() {
+            return Err(StoreError::Conflict);
+        }
         let duplicate: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM runs WHERE job_id = ?1 AND scheduled_for_utc = ?2

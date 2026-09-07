@@ -130,7 +130,11 @@ error. Commands that produce a list default to 100 records.
 - `atx show JOB` shows one job, its schedule, execution details, and last
   outcome.
 - `atx cancel JOB [--grace DURATION]` requests cancellation; the configured
-  grace period applies when omitted.
+  grace period applies when omitted. It waits for the active run to stop and
+  for its terminal record. A human stderr TTY gets one wait notice; `--quiet`,
+  `--json` and non-TTY stderr get none. The process may use one grace period,
+  followed by a terminal-record window of grace plus two seconds. The notice
+  reports those combined waits. Database work can add time outside that window.
 - `atx rm JOB [--cancel] [--keep-history]` removes a job. It refuses a live job
   unless `--cancel` is supplied. History is removed unless `--keep-history` is
   supplied.

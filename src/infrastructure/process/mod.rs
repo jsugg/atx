@@ -3,6 +3,8 @@
 mod cancel;
 mod spawn;
 
+pub(crate) use cancel::NativeCancellationRuntime;
+#[cfg(test)]
 pub(crate) use cancel::NativeGroupCanceller;
 #[cfg(test)]
 pub(crate) use cancel::{CancellationResult, cancel_validated_group};

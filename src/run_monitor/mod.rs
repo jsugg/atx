@@ -11,6 +11,8 @@ mod lifecycle;
 mod tty;
 
 pub(crate) use lifecycle::RunMonitor;
+#[cfg(test)]
+pub(crate) use tty::test_support::Pty;
 
 use crate::application::{ElapsedClock, SupervisorAcknowledger, WallClock};
 use crate::domain::{JobId, JobState, RunId, RunState, Schedule, TransitionActor};

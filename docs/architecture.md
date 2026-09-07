@@ -25,6 +25,14 @@ sockets, or platform clocks. The application layer coordinates submission,
 cancellation, history, recovery, and services. Infrastructure provides the
 database, paths, IPC socket, clocks, processes, and native service manager.
 
+Job cancellation uses application store, clock, process and wait ports. The CLI
+resolves the ID, invokes cancellation and renders the result. Revision conflicts
+or rejected stale transitions reload the job, with at most eight request
+attempts. A winning request blocks later claims in the same SQLite writer
+ordering; the application then reads the current active run. Native inspection
+and signalling stay in infrastructure, and a CLI progress sink writes only to
+an eligible stderr TTY.
+
 The CLI creates jobs with direct argv execution by default. The supervisor claims
 due occurrences; the monitor owns process creation, output capture, completion,
 and the final run record.

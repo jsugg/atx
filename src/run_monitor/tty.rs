@@ -190,6 +190,11 @@ pub(crate) mod test_support {
             &self.path
         }
 
+        /// Duplicate the owned slave without reopening or acquiring a terminal.
+        pub(crate) fn writer(&self) -> io::Result<File> {
+            self.slave.try_clone()
+        }
+
         pub(crate) fn set_mode(&self, mode: u32) -> io::Result<()> {
             self.slave
                 .set_permissions(std::fs::Permissions::from_mode(mode))

@@ -1,5 +1,6 @@
 //! `SQLite` job-store adapter.
 
+mod job_cancel;
 mod job_store;
 mod management;
 mod reconcile;

@@ -28,8 +28,6 @@ pub(crate) trait ManagementStore {
 
     fn active_runs(&self) -> Result<Vec<Run>, ManagementStoreError>;
 
-    fn latest_active_run(&self, job_id: JobId) -> Result<Option<Run>, ManagementStoreError>;
-
     fn hide_job(
         &mut self,
         job_id: JobId,
@@ -227,10 +225,6 @@ mod tests {
 
         fn active_runs(&self) -> Result<Vec<Run>, ManagementStoreError> {
             Ok(Vec::new())
-        }
-
-        fn latest_active_run(&self, _job_id: JobId) -> Result<Option<Run>, ManagementStoreError> {
-            Ok(None)
         }
 
         fn hide_job(

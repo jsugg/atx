@@ -1,8 +1,10 @@
 //! Top-level command dispatch.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,17 +18,16 @@ use super::exit;
 use super::human::HumanRenderer;
 use super::view::{JobView, ProcessView, RunOutputView, RunView, SubmissionView};
 use crate::application::{
-    CancelRunResult, DiagnosticStatus, DoctorReport, DoctorReportBuilder, ElapsedClock,
-    ManagementError, ManagementStore, RunOutput, RunOutputError, ServiceManager, SubmissionOutcome,
-    SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
-    cancel_claimed_run, install_service, list_jobs, list_runs, read_run_output, remove_job,
-    rerun_job, resolve_job, submit_job, uninstall_service,
+    CancelJobError, CancellationProgress, DiagnosticStatus, DoctorReport, DoctorReportBuilder,
+    ElapsedClock, ManagementError, ManagementStore, RunOutput, RunOutputError, ServiceManager,
+    SubmissionOutcome, SubmissionStore, SubmissionStoreError, SupervisorAckError,
+    SupervisorAcknowledger, WallClock, install_service, list_jobs, list_runs, read_run_output,
+    remove_job, rerun_job, resolve_job, submit_job, uninstall_service,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
-    ExecutionSpec, Job, JobState, MissedPolicy, Name, Run, RunOutcome, RunState, RuntimeTier,
-    Schedule, TimeZoneSelection, TransitionActor, UtcTimestamp, parse_calendar, relative_deadline,
-    resolve_calendar,
+    ExecutionSpec, Job, MissedPolicy, Name, RuntimeTier, Schedule, TimeZoneSelection, UtcTimestamp,
+    parse_calendar, relative_deadline, resolve_calendar,
 };
 use crate::infrastructure::config::{ColorMode, Config, ConfigOverrides, Verbosity, load_config};
 use crate::infrastructure::paths::{
@@ -34,11 +35,11 @@ use crate::infrastructure::paths::{
     validate_private_dir_for_uid,
 };
 use crate::infrastructure::process::{
-    IdentityStatus as NativeIdentityStatus, NativeGroupCanceller, NativeProcessInspector,
+    IdentityStatus as NativeIdentityStatus, NativeCancellationRuntime, NativeProcessInspector,
 };
 use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::service::NativeServiceManager;
-use crate::infrastructure::sqlite::{DATABASE_BUSY_TIMEOUT, Database, JobStore, StoreError};
+use crate::infrastructure::sqlite::{DATABASE_BUSY_TIMEOUT, Database, JobStore};
 use crate::infrastructure::time::NativeClock;
 use crate::run_monitor::run_monitor_process;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
@@ -616,6 +617,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
     let Some(mut store) = store else {
         return manage_without_database(global, command);
     };
+    let progress = CancellationNotice::new(global, std::io::stderr());
     match command {
         ManagementCommand::List { state, limit } => {
             let state = state.map(crate::domain::JobState::from);
@@ -664,7 +666,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .transpose()
                 .map_err(|error| CliError::usage(global.json, error))?
                 .unwrap_or(config.cancel_grace());
-            let cancelled = cancel_job(&mut store, job, grace)
+            let cancelled = cancel_job_with_progress(&mut store, job, grace, &progress)
                 .map_err(|error| management_cli_error(global.json, error))?;
             render_job(&cancelled, None, global);
         }
@@ -676,7 +678,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             let current = resolve_job(&store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
             if !current.state().is_terminal() && *cancel {
-                cancel_job(&mut store, job, config.cancel_grace())
+                cancel_job_with_progress(&mut store, job, config.cancel_grace(), &progress)
                     .map_err(|error| management_cli_error(global.json, error))?;
             }
             let removed = remove_job(&mut store, job, *keep_history)
@@ -744,191 +746,57 @@ fn open_management(
     Ok((Some(JobStore::new(database)), paths, config))
 }
 
-fn cancel_job(
+struct CancellationNotice<'a, Output> {
+    global: &'a GlobalArgs,
+    output: RefCell<Output>,
+}
+
+impl<'a, Output> CancellationNotice<'a, Output> {
+    fn new(global: &'a GlobalArgs, output: Output) -> Self {
+        Self {
+            global,
+            output: RefCell::new(output),
+        }
+    }
+}
+
+impl<Output: Write + IsTerminal> CancellationProgress for CancellationNotice<'_, Output> {
+    fn waiting(&self, maximum: Duration) {
+        let tty = self.output.borrow().is_terminal();
+        if let Some(line) = cancellation_progress_line(self.global, tty, maximum) {
+            let _ = writeln!(&mut *self.output.borrow_mut(), "{line}");
+        }
+    }
+}
+
+fn cancellation_progress_line(global: &GlobalArgs, tty: bool, maximum: Duration) -> Option<String> {
+    if global.json || global.quiet || !tty {
+        return None;
+    }
+    Some(format!(
+        "Waiting up to {}s for cancellation.",
+        maximum.as_secs()
+    ))
+}
+
+fn cancel_job_with_progress(
     store: &mut JobStore,
     prefix: &str,
     grace: DurationSeconds,
+    progress: &impl CancellationProgress,
 ) -> Result<Job, ManagementError> {
     let job = resolve_job(store, prefix)?;
-    if matches!(job.state(), JobState::Cancelled | JobState::CancelRequested) {
-        // Already cancelled or another canceller is mid-flight; either way
-        // the request is satisfied.
-        return Ok(job);
-    }
-    if job.state().is_terminal() {
-        return Err(ManagementError::StateConflict(
-            "completed job cannot be cancelled",
-        ));
-    }
-    let clock = NativeClock;
-    let mut now = clock.now_utc().map_err(management_store_error)?;
-    let active = store
-        .latest_active_run(job.id())
-        .map_err(ManagementError::from)?;
-    // A concurrent cancel may win the revision race, and the monitor may have
-    // advanced a recurring job (raising its update time past our snapshot's);
-    // re-reading with a fresh timestamp turns both races into the same
-    // idempotent outcome instead of a storage error.
-    let mut current = job;
-    let mut requested = None;
-    for _ in 0..8 {
-        if matches!(
-            current.state(),
-            JobState::CancelRequested | JobState::Cancelled
-        ) {
-            return Ok(current);
-        }
-        if current.state().is_terminal() {
-            break;
-        }
-        now = clock.now_utc().map_err(management_store_error)?;
-        match store.transition_job(
-            current.id(),
-            current.revision(),
-            JobState::CancelRequested,
-            false,
-            TransitionActor::Cli,
-            "cancel requested",
-            now,
-        ) {
-            Ok(pending) => {
-                requested = Some(pending);
-                break;
-            }
-            Err(error @ (StoreError::Conflict | StoreError::Domain(_))) => {
-                // Conflict: another writer moved the revision. Domain: the
-                // fresh snapshot carries a later update time than our stale
-                // `now`. Both resolve by reloading and retrying.
-                let _ = error;
-                current = store
-                    .load(current.id())
-                    .map_err(management_store_error)?
-                    .ok_or(ManagementError::NotFound)?;
-            }
-            Err(error) => return Err(management_store_error(error)),
-        }
-    }
-    let Some(requested) = requested else {
-        return Err(ManagementError::StateConflict(
-            "job changed state during cancellation",
-        ));
-    };
-
-    let Some(run) = active else {
-        return store
-            .transition_job(
-                requested.id(),
-                requested.revision(),
-                JobState::Cancelled,
-                false,
-                TransitionActor::Cli,
-                "cancelled before command start",
-                now,
-            )
-            .map_err(management_store_error);
-    };
-    let terminal_run = cancel_active_run(store, &run, grace, clock)?;
-    finish_job_cancellation(store, requested.id(), terminal_run.state(), clock)
+    crate::application::cancel_job(store, job, grace, &NativeCancellationRuntime, progress)
+        .map_err(cancellation_error)
 }
 
-fn cancel_active_run(
-    store: &mut JobStore,
-    run: &Run,
-    grace: DurationSeconds,
-    clock: NativeClock,
-) -> Result<Run, ManagementError> {
-    let boot_identity = clock.boot_identity().map_err(management_store_error)?;
-    let inspector = NativeProcessInspector::new(boot_identity);
-    let grace_duration = Duration::from_secs(grace.get());
-    let result = cancel_claimed_run(
-        store,
-        &NativeGroupCanceller::new(&inspector, grace_duration),
-        run.id(),
-        run.claim_token(),
-    )
-    .map_err(management_store_error)?;
-    if let CancelRunResult::CommittedBeforeSpawn(run) = result {
-        store
-            .record_run_terminal(
-                run.id(),
-                run.claim_token(),
-                clock.now_utc().map_err(management_store_error)?,
-                RunOutcome::Cancelled("cancelled before command start".to_owned()),
-            )
-            .map_err(management_store_error)?;
-    }
-
-    let deadline = std::time::Instant::now()
-        .checked_add(grace_duration + Duration::from_secs(2))
-        .ok_or(ManagementError::StateConflict("cancel wait overflowed"))?;
-    let terminal_run = loop {
-        let current = store
-            .load_run(run.id())
-            .map_err(management_store_error)?
-            .ok_or(ManagementError::StateConflict("active run disappeared"))?;
-        if current.state().is_terminal() {
-            break current;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(ManagementError::StateConflict(
-                "run did not stop before the cancellation deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Ok(terminal_run)
-}
-
-fn finish_job_cancellation(
-    store: &mut JobStore,
-    job_id: crate::domain::JobId,
-    run_state: RunState,
-    clock: NativeClock,
-) -> Result<Job, ManagementError> {
-    let target = match run_state {
-        RunState::Succeeded => JobState::Succeeded,
-        RunState::Cancelled => JobState::Cancelled,
-        RunState::Failed => JobState::Failed,
-        RunState::Interrupted => JobState::Interrupted,
-        _ => {
-            return Err(ManagementError::StateConflict(
-                "run remained nonterminal after cancellation",
-            ));
-        }
-    };
-    let current = store.load(job_id).map_err(management_store_error)?;
-    let current = current.ok_or(ManagementError::NotFound)?;
-    if current.state().is_terminal() {
-        return Ok(current);
-    }
-    // A concurrent canceller may finish the transition first, or the run may
-    // have completed naturally and the job moved on (a recurring job returns
-    // to Waiting); either way the terminal outcome the caller wanted already
-    // happened or no longer applies.
-    match store.transition_job(
-        current.id(),
-        current.revision(),
-        target,
-        false,
-        TransitionActor::Cli,
-        "cancellation finished",
-        clock.now_utc().map_err(management_store_error)?,
-    ) {
-        Ok(finished) => Ok(finished),
-        Err(StoreError::Domain(_) | StoreError::Conflict) => {
-            let final_state = store
-                .load(current.id())
-                .map_err(management_store_error)?
-                .ok_or(ManagementError::NotFound)?;
-            if final_state.state().is_terminal() || matches!(final_state.state(), JobState::Waiting)
-            {
-                return Ok(final_state);
-            }
-            Err(ManagementError::StateConflict(
-                "job changed state during cancellation",
-            ))
-        }
-        Err(error) => Err(management_store_error(error)),
+fn cancellation_error(error: CancelJobError) -> ManagementError {
+    match error {
+        CancelJobError::NotFound => ManagementError::NotFound,
+        CancelJobError::StateConflict(reason) => ManagementError::StateConflict(reason),
+        CancelJobError::Store(error) => management_store_error(error),
+        CancelJobError::Run(error) => management_store_error(error),
+        CancelJobError::Clock(error) => management_store_error(error),
     }
 }
 
@@ -1773,11 +1641,11 @@ mod tests {
     }
 
     use super::{
-        SessionAcknowledger, build_doctor_report, build_job, cancel_job, check_database,
-        check_live_supervisor, check_private_directory, check_supervisor, doctor_exit,
-        finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
-        render_processes, render_run_output, render_runs, render_submission,
-        resolve_submitting_tty, run, schedule, split_assignment,
+        SessionAcknowledger, build_doctor_report, build_job, cancel_job_with_progress,
+        check_database, check_live_supervisor, check_private_directory, check_supervisor,
+        doctor_exit, print_error, read_env_file, render_job, render_jobs, render_processes,
+        render_run_output, render_runs, render_submission, resolve_submitting_tty, run, schedule,
+        split_assignment,
     };
     use crate::application::{
         DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, ManagementStore,
@@ -1788,8 +1656,8 @@ mod tests {
     use crate::cli::exit;
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
-        MissedPolicy, ProcessIdentitySnapshot, Revision, RunId, RunOutcome, RunState, RuntimeTier,
-        Schedule, TransitionActor, UtcTimestamp,
+        MissedPolicy, ProcessIdentitySnapshot, Revision, Run, RunId, RunOutcome, RunState,
+        RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
     use crate::infrastructure::config::{ConfigOverrides, load_config};
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
@@ -1827,6 +1695,14 @@ mod tests {
         JobStore::new(database)
     }
 
+    fn cancel_job(
+        store: &mut JobStore,
+        prefix: &str,
+        grace: DurationSeconds,
+    ) -> Result<Job, ManagementError> {
+        cancel_job_with_progress(store, prefix, grace, &())
+    }
+
     fn global(json: bool, quiet: bool) -> GlobalArgs {
         GlobalArgs {
             quiet,
@@ -1835,6 +1711,65 @@ mod tests {
             color: Some(ColorArg::Never),
             state_dir: None,
         }
+    }
+
+    #[test]
+    fn cancellation_progress_is_only_for_a_nonquiet_human_tty() {
+        for (json, quiet, tty, expected) in [
+            (
+                false,
+                false,
+                true,
+                Some("Waiting up to 4s for cancellation."),
+            ),
+            (true, false, true, None),
+            (false, true, true, None),
+            (true, true, true, None),
+            (false, false, false, None),
+            (true, false, false, None),
+            (false, true, false, None),
+            (true, true, false, None),
+        ] {
+            let notice = super::cancellation_progress_line(
+                &global(json, quiet),
+                tty,
+                Duration::from_secs(4),
+            );
+            assert_eq!(
+                notice.as_deref(),
+                expected,
+                "json={json}, quiet={quiet}, tty={tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_notice_uses_a_real_tty_and_leaves_machine_output_empty() {
+        use crate::application::CancellationProgress;
+        use crate::run_monitor::Pty;
+
+        for (json, quiet, expected) in [
+            (false, false, "Waiting up to 4s for cancellation.\n"),
+            (true, false, ""),
+            (false, true, ""),
+            (true, true, ""),
+        ] {
+            let pty = Pty::open().expect("owned PTY");
+            let options = global(json, quiet);
+            let notice =
+                super::CancellationNotice::new(&options, pty.writer().expect("PTY writer"));
+            notice.waiting(Duration::from_secs(4));
+            assert_eq!(
+                pty.read_available().expect("PTY notice"),
+                expected.as_bytes()
+            );
+        }
+        let root = tempdir().expect("root");
+        let path = root.path().join("stderr");
+        let output = std::fs::File::create(&path).expect("regular output");
+        let options = global(false, false);
+        super::CancellationNotice::new(&options, output).waiting(Duration::from_secs(4));
+        assert!(std::fs::read(&path).expect("non-TTY output").is_empty());
     }
 
     /// Parse a schedule invocation, panicking on anything else.
@@ -2231,63 +2166,6 @@ mod tests {
         let done_id = done.id().to_string();
         assert!(matches!(
             cancel_job(&mut store, &done_id, grace),
-            Err(ManagementError::StateConflict(_))
-        ));
-    }
-
-    #[test]
-    fn finish_cancellation_maps_run_outcomes_to_terminal_jobs() {
-        for (run_state, expected) in [
-            (RunState::Succeeded, JobState::Succeeded),
-            (RunState::Cancelled, JobState::Cancelled),
-            (RunState::Failed, JobState::Failed),
-            (RunState::Interrupted, JobState::Interrupted),
-        ] {
-            let root = tempdir().expect("root");
-            let mut store = opened_store(root.path());
-            let job = fixture_job(3_000);
-            store.create(&job).expect("create");
-            let requested = store
-                .transition_job(
-                    job.id(),
-                    job.revision(),
-                    JobState::CancelRequested,
-                    false,
-                    TransitionActor::Cli,
-                    "seed",
-                    UtcTimestamp::from_second(3_001).expect("ts"),
-                )
-                .expect("cancel requested");
-            let finished = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
-                .expect("finish");
-            assert_eq!(finished.state(), expected);
-            // Already-terminal jobs return as-is instead of re-transitioning.
-            let again = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
-                .expect("repeat");
-            assert_eq!(again.revision(), finished.revision());
-            drop(requested);
-        }
-    }
-
-    #[test]
-    fn finish_cancellation_refuses_nonterminal_runs() {
-        let root = tempdir().expect("root");
-        let mut store = opened_store(root.path());
-        let job = fixture_job(4_000);
-        store.create(&job).expect("create");
-        store
-            .transition_job(
-                job.id(),
-                job.revision(),
-                JobState::CancelRequested,
-                false,
-                TransitionActor::Cli,
-                "seed",
-                UtcTimestamp::from_second(4_001).expect("ts"),
-            )
-            .expect("cancel requested");
-        assert!(matches!(
-            finish_job_cancellation(&mut store, job.id(), RunState::Starting, NativeClock),
             Err(ManagementError::StateConflict(_))
         ));
     }
@@ -3017,6 +2895,199 @@ mod tests {
         assert_eq!(run.state(), RunState::Cancelled);
     }
 
+    fn claim_after_cancellation_blocks(
+        path: &Path,
+        waiting: &Job,
+        locked: &std::sync::mpsc::SyncSender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+        committed: &std::sync::mpsc::SyncSender<()>,
+    ) -> Run {
+        let mut peer = opened_store(path);
+        peer.database()
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        locked.send(()).expect("signal locked writer");
+        release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation reached CAS");
+        peer.database()
+            .connection()
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+        let now = UtcTimestamp::from_second(6_030).expect("due timestamp");
+        let starting = peer
+            .transition_job(
+                waiting.id(),
+                waiting.revision(),
+                JobState::Starting,
+                false,
+                TransitionActor::Supervisor,
+                "deadline became due",
+                now,
+            )
+            .expect("starting");
+        let run = peer
+            .claim_run(starting.id(), starting.next_due_utc(), now)
+            .expect("claim");
+        peer.transition_job(
+            starting.id(),
+            starting.revision(),
+            JobState::Running,
+            false,
+            TransitionActor::Supervisor,
+            "run monitor claimed command",
+            now,
+        )
+        .expect("running job before monitor spawn");
+        committed.send(()).expect("signal committed claim");
+        run
+    }
+
+    #[test]
+    fn cancel_reloads_the_active_run_after_a_revision_conflict() {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
+        thread_local! {
+            static CLAIM_HANDSHAKE: RefCell<Option<(SyncSender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+        }
+        fn release_claim_writer(_attempt: i32) -> bool {
+            CLAIM_HANDSHAKE.with(|handshake| {
+                handshake
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|(release, committed)| {
+                        release.send(()).is_ok()
+                            && committed.recv_timeout(Duration::from_secs(2)).is_ok()
+                    })
+            })
+        }
+
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                UtcTimestamp::from_second(6_001).expect("waiting timestamp"),
+            )
+            .expect("waiting");
+        let path = root.path().to_owned();
+        let (locked_tx, locked_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (committed_tx, committed_rx) = sync_channel(1);
+        let (result, claimed) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                claim_after_cancellation_blocks(
+                    &path,
+                    &waiting,
+                    &locked_tx,
+                    &release_rx,
+                    &committed_tx,
+                )
+            });
+            locked_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer owns lock");
+            CLAIM_HANDSHAKE
+                .with(|handshake| *handshake.borrow_mut() = Some((release_tx, committed_rx)));
+            store
+                .database()
+                .connection()
+                .busy_handler(Some(release_claim_writer))
+                .expect("install controlled contention hook");
+            let result = cancel_job(
+                &mut store,
+                &job.id().to_string(),
+                DurationSeconds::new(1).expect("grace"),
+            );
+            store
+                .database()
+                .connection()
+                .busy_timeout(Duration::from_millis(100))
+                .expect("restore fixture timeout");
+            CLAIM_HANDSHAKE.with(|handshake| {
+                handshake.borrow_mut().take();
+            });
+            (result, writer.join().expect("claim writer"))
+        });
+        assert_eq!(
+            result.expect("cancel after concurrent claim").state(),
+            JobState::Cancelled
+        );
+        let run = store
+            .load_run(claimed.id())
+            .expect("load claimed run")
+            .expect("claimed run exists");
+        assert_eq!(run.state(), RunState::Cancelled);
+    }
+
+    fn assert_cancellation_blocks_claims(finish: bool) {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        if finish {
+            let cancelled = cancel_job(
+                &mut store,
+                &job.id().to_string(),
+                DurationSeconds::new(1).expect("grace"),
+            )
+            .expect("cancel before claim");
+            assert_eq!(cancelled.state(), JobState::Cancelled);
+        } else {
+            store
+                .transition_job(
+                    job.id(),
+                    job.revision(),
+                    JobState::CancelRequested,
+                    false,
+                    TransitionActor::Cli,
+                    "cancel requested",
+                    UtcTimestamp::from_second(6_001).expect("request timestamp"),
+                )
+                .expect("committed cancellation request");
+        }
+        let claim = store.claim_run(
+            job.id(),
+            job.next_due_utc(),
+            UtcTimestamp::from_second(6_030).expect("due timestamp"),
+        );
+        assert!(
+            matches!(
+                &claim,
+                Err(crate::infrastructure::sqlite::StoreError::Conflict)
+            ),
+            "unexpected claim after cancellation: {:?}",
+            claim.as_ref().map(Run::state)
+        );
+        assert!(
+            crate::application::JobCancellationStore::latest_active_run_for_cancellation(
+                &store,
+                job.id()
+            )
+            .expect("active run")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cancel_requested_jobs_reject_later_run_claims() {
+        assert_cancellation_blocks_claims(false);
+    }
+
+    #[test]
+    fn cancelled_jobs_reject_later_run_claims() {
+        assert_cancellation_blocks_claims(true);
+    }
+
     #[test]
     fn cancel_deadline_reports_conflict_when_the_run_never_stops() {
         let root = tempdir().expect("root");
@@ -3383,42 +3454,6 @@ mod tests {
             .find(|&(key, _)| key == "LC_ATX_RESIDUAL_TEST")
             .map(|(_, value)| value.expose().to_owned());
         assert_eq!(seeded.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn finish_cancellation_conflicts_when_the_reload_is_still_active() {
-        let root = tempdir().expect("root");
-        let mut store = opened_store(root.path());
-        let job = fixture_job(6_000);
-        store.create(&job).expect("create");
-        let requested = store
-            .transition_job(
-                job.id(),
-                job.revision(),
-                JobState::CancelRequested,
-                false,
-                TransitionActor::Cli,
-                "seed",
-                UtcTimestamp::from_second(6_001).expect("ts"),
-            )
-            .expect("cancel requested");
-        // RAISE(IGNORE) skips every UPDATE, so the cancellation transition
-        // conflicts and the reload still shows the active CancelRequested
-        // state instead of a terminal or waiting one.
-        store
-            .database()
-            .connection()
-            .execute_batch(
-                "CREATE TRIGGER stall_job_updates BEFORE UPDATE ON jobs
-                 BEGIN SELECT RAISE(IGNORE); END;",
-            )
-            .expect("trigger");
-
-        assert!(matches!(
-            finish_job_cancellation(&mut store, job.id(), RunState::Succeeded, NativeClock),
-            Err(ManagementError::StateConflict(_))
-        ));
-        drop(requested);
     }
 
     #[cfg(target_os = "linux")]

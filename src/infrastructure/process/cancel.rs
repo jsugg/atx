@@ -6,10 +6,47 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use thiserror::Error;
 
 use super::{IdentityStatus, NativeProcessInspector, ProcessError};
-use crate::application::{GroupCancellation, ProcessCancellationError, ProcessGroupCanceller};
+use crate::application::{
+    CancellationWait, ClockError, ElapsedClock, GroupCancellation, JobProcessCanceller,
+    ProcessCancellationError, ProcessGroupCanceller, WallClock,
+};
+use crate::domain::UtcTimestamp;
 use crate::domain::{ProcessIdentitySnapshot, Run};
+use crate::infrastructure::time::NativeClock;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NativeCancellationRuntime;
+
+impl WallClock for NativeCancellationRuntime {
+    fn now_utc(&self) -> Result<UtcTimestamp, ClockError> {
+        NativeClock.now_utc()
+    }
+}
+
+impl CancellationWait for NativeCancellationRuntime {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+impl JobProcessCanceller for NativeCancellationRuntime {
+    fn cancel_group(
+        &self,
+        run: &Run,
+        grace: Duration,
+    ) -> Result<GroupCancellation, ProcessCancellationError> {
+        let boot = NativeClock
+            .boot_identity()
+            .map_err(|error| ProcessCancellationError(error.to_string()))?;
+        let inspector = NativeProcessInspector::new(boot);
+        NativeGroupCanceller::new(&inspector, grace).cancel_group(run)
+    }
+}
 
 pub(crate) fn cancel_validated_group(
     inspector: &NativeProcessInspector,
