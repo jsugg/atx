@@ -996,41 +996,56 @@ fn cwd_runs_child_in_requested_directory() {
     let state = execution_state(&root);
     let workdir = root.path().join("workdir");
     fs::create_dir(&workdir).expect("create workdir");
-    let submitted = atx()
-        .arg("--json")
-        .arg("--state-dir")
-        .arg(&state)
-        .args(["1s", "--cwd"])
-        .arg(&workdir)
-        .args(["--", "/bin/pwd"])
-        .output()
+    let canonical = workdir.canonicalize().expect("canonical workdir");
+    for cwd in [workdir.as_path(), std::path::Path::new("workdir")] {
+        let submitted = support::bounded_probe_output(
+            atx()
+                .current_dir(root.path())
+                .arg("--json")
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["1s", "--cwd"])
+                .arg(cwd)
+                .args(["--", "/bin/pwd"]),
+            Instant::now() + Duration::from_secs(15),
+        )
         .expect("submit cwd job");
-    assert!(submitted.status.success(), "{submitted:?}");
-    let job = serde_json::from_slice::<serde_json::Value>(&submitted.stdout).expect("JSON")["data"]
-        ["job_id"]
-        .as_str()
-        .expect("job ID")
-        .to_owned();
-    wait_for_history(&state, &job);
+        assert!(submitted.status.success(), "{submitted:?}");
+        let submitted: serde_json::Value = serde_json::from_slice(&submitted.stdout).expect("JSON");
+        let job = submitted["data"]["job_id"]
+            .as_str()
+            .expect("job ID")
+            .to_owned();
+        let saved = support::bounded_probe_output(
+            atx()
+                .current_dir(&workdir)
+                .arg("--json")
+                .arg("--state-dir")
+                .arg(&state)
+                .args(["show", &job]),
+            Instant::now() + Duration::from_secs(15),
+        )
+        .expect("show saved cwd");
+        assert!(saved.status.success(), "{saved:?}");
+        let saved: serde_json::Value = serde_json::from_slice(&saved.stdout).expect("show JSON");
+        assert_eq!(
+            saved["data"]["execution"]["working_directory"],
+            canonical.to_str().expect("UTF-8 path")
+        );
+        wait_for_history(&state, &job);
 
-    let shown = atx()
-        .arg("--state-dir")
-        .arg(&state)
-        .arg("output")
-        .arg(job)
-        .output()
+        let shown = support::bounded_probe_output(
+            atx().arg("--state-dir").arg(&state).arg("output").arg(job),
+            Instant::now() + Duration::from_secs(15),
+        )
         .expect("read pwd output");
-    let text = String::from_utf8(shown.stdout).expect("UTF-8");
-    assert!(
-        text.contains(
-            workdir
-                .canonicalize()
-                .expect("canonical workdir")
-                .to_str()
-                .expect("UTF-8 path")
-        ),
-        "child did not run in --cwd directory: {text:?}"
-    );
+        assert!(shown.status.success(), "{shown:?}");
+        let text = String::from_utf8(shown.stdout).expect("UTF-8");
+        assert!(
+            text.contains(canonical.to_str().expect("UTF-8 path")),
+            "child did not run in --cwd directory: {text:?}"
+        );
+    }
 }
 
 #[test]

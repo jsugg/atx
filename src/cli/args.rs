@@ -81,7 +81,11 @@ pub(crate) struct ScheduleOptions {
     #[arg(long)]
     pub(crate) no_rollover: bool,
 
-    /// Run from this absolute directory.
+    /// Run from an absolute or relative directory.
+    ///
+    /// Resolve it from the submitting shell at submission.
+    ///
+    /// Store the canonical absolute path.
     #[arg(long, value_name = "DIRECTORY")]
     pub(crate) cwd: Option<PathBuf>,
 
@@ -1051,6 +1055,42 @@ mod manual_tests {
             cmd.get_after_long_help().map(ToString::to_string),
             Some(CLI_MANUAL.to_owned())
         );
+    }
+
+    #[test]
+    fn cwd_help_describes_submission_time_canonicalization() {
+        let mut command = RawCli::command();
+        let help = command.render_long_help().to_string();
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        for phrase in [
+            "absolute or relative",
+            "submitting shell",
+            "at submission",
+            "canonical absolute path",
+        ] {
+            assert!(
+                normalized.contains(phrase),
+                "missing {phrase:?} in help: {help}"
+            );
+        }
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn cwd_man_describes_submission_time_canonicalization() {
+        let mut bytes = Vec::new();
+        clap_mangen::Man::new(RawCli::command())
+            .render(&mut bytes)
+            .expect("render man");
+        let page = String::from_utf8(bytes).expect("UTF-8 man");
+        for phrase in [
+            "absolute or relative",
+            "submitting shell",
+            "at submission",
+            "canonical absolute path",
+        ] {
+            assert!(page.contains(phrase), "missing {phrase:?} in man: {page}");
+        }
     }
 }
 

@@ -91,7 +91,11 @@ rejected unless `--dst earlier` or `--dst later` chooses an offset.
   supervisor was running. `POLICY` is `hold`, `run-latest`, or `skip`.
 - `--durable` requires installed launchd or systemd integration. It never falls
   back to session mode.
-- `--cwd DIRECTORY` runs from an existing absolute working directory.
+- `--cwd DIRECTORY` runs from an existing directory. An absolute path is used
+  directly; a relative path is resolved from the submitting shell's current
+  directory at submission. ATX stores the canonical absolute path, so later
+  shell directory changes do not affect the job. Without this option, ATX
+  saves the submitting shell's current directory in the same form.
 - `--name NAME` sets a short display name; `--description TEXT` stores a longer
   note.
 - `--shell` runs one command string through the configured shell.
