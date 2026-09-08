@@ -124,6 +124,10 @@ output, and `doctor`.
 `JOB` and `RUN` accept a full ID or a unique prefix. A non-unique prefix is an
 error. Commands that produce a list default to 100 records.
 
+A close command typo such as `atx hisotry` gets a hint when one command is the
+clear match. Hints never rewrite the input or run a command. Time expressions
+and program arguments after `--` are not treated as command typos.
+
 - `atx list [--state STATE] [--limit N]` lists saved jobs (`ls` is an alias).
   States are `scheduled`, `waiting`, `starting`, `running`, `cancel-requested`,
   `succeeded`, `failed`, `cancelled`, `interrupted`, and `missed`.

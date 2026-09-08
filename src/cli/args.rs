@@ -332,6 +332,7 @@ pub(crate) fn parse_from(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<ParsedCli, clap::Error> {
     let mut args = args.into_iter().collect::<Vec<_>>();
+    let has_separator = args.iter().any(|value| value == "--");
     normalize_management_order(&mut args);
     let raw = RawCli::try_parse_from(args)?;
     if let Some(command) = raw.management {
@@ -341,6 +342,17 @@ pub(crate) fn parse_from(
         });
     }
     if raw.argv.is_empty() {
+        if !has_separator && raw.schedule.every.is_none() {
+            if let Some(command) = command_typo_hint(&raw.when) {
+                return Err(RawCli::command().error(
+                    clap::error::ErrorKind::InvalidSubcommand,
+                    format!(
+                        "unrecognized command `{}`; did you mean `{command}`?",
+                        raw.when[0]
+                    ),
+                ));
+            }
+        }
         return Err(RawCli::command().error(
             clap::error::ErrorKind::MissingRequiredArgument,
             "scheduling requires `-- PROGRAM [ARG ...]`",
@@ -358,6 +370,78 @@ pub(crate) fn parse_from(
         when: raw.when,
         argv: raw.argv,
     }))
+}
+
+const MAX_TYPO_BYTES: usize = 16;
+const MAX_TYPO_DISTANCE: usize = 2;
+
+fn command_typo_hint(when: &[String]) -> Option<String> {
+    let first = when.first()?;
+    if first.is_empty() || first.len() > MAX_TYPO_BYTES || !first.is_ascii() {
+        return None;
+    }
+    let is_time = |value: &str| {
+        value.parse::<crate::domain::DurationSeconds>().is_ok()
+            || crate::domain::parse_calendar(value).is_ok()
+    };
+    if is_time(first) || is_time(&when.join(" ")) {
+        return None;
+    }
+    let mut command = RawCli::command();
+    command.build();
+    let mut best = MAX_TYPO_DISTANCE + 1;
+    let mut hint = None;
+    let mut tied = false;
+    for candidate in command
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+    {
+        let name = candidate.get_name();
+        let Some(distance) = bounded_command_distance(first, name) else {
+            continue;
+        };
+        if distance == 0 {
+            return None;
+        }
+        if distance < best {
+            best = distance;
+            hint = Some(name.to_owned());
+            tied = false;
+        } else if distance == best {
+            tied = true;
+        }
+    }
+    if tied { None } else { hint }
+}
+
+/// Return a small ASCII edit distance without allocating a token-sized matrix.
+fn bounded_command_distance(left: &str, right: &str) -> Option<usize> {
+    if !left.is_ascii()
+        || !right.is_ascii()
+        || left.len() > MAX_TYPO_BYTES
+        || right.len() > MAX_TYPO_BYTES
+        || left.len().abs_diff(right.len()) > MAX_TYPO_DISTANCE
+    {
+        return None;
+    }
+    let mut previous: [usize; MAX_TYPO_BYTES + 1] = std::array::from_fn(|index| index);
+    let mut current = [0_usize; MAX_TYPO_BYTES + 1];
+    for (row, left) in left.bytes().enumerate() {
+        current[0] = row + 1;
+        for (column, right) in right.bytes().enumerate() {
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(previous[column] + usize::from(left != right));
+        }
+        if current[..=right.len()]
+            .iter()
+            .all(|distance| *distance > MAX_TYPO_DISTANCE)
+        {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[right.len()] <= MAX_TYPO_DISTANCE).then_some(previous[right.len()])
 }
 
 const CLI_MANUAL: &str = "\
@@ -674,6 +758,124 @@ mod tests {
         };
         assert_eq!(schedule.options.name.as_deref(), Some("list"));
         assert_eq!(schedule.options.description.as_deref(), Some("show"));
+    }
+
+    #[test]
+    fn close_management_typos_have_one_usage_hint() {
+        for (word, command) in [
+            ("lst", "list"),
+            ("hisotry", "history"),
+            ("docter", "doctor"),
+            ("hepl", "help"),
+            ("verison", "version"),
+            ("cancl", "cancel"),
+        ] {
+            for leading in [vec![], vec!["--json"], vec!["--state-dir", "/tmp/atx-hint"]] {
+                let mut args = vec!["atx"];
+                args.extend(leading);
+                args.push(word);
+                let error = parse_from(args.into_iter().map(Into::into)).expect_err("typo usage");
+                let text = error.to_string();
+                assert!(error.use_stderr());
+                assert!(
+                    text.contains(&format!("did you mean `{command}`")),
+                    "{word}: {text}"
+                );
+                assert_eq!(text.matches("did you mean").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn time_syntax_ambiguous_words_and_explicit_separators_have_no_typo_hint() {
+        for args in [
+            vec!["atx", "1s"],
+            vec!["atx", "1s", "unrelated"],
+            vec!["atx", "2099-01-01"],
+            vec!["atx", "2099-01-01", "10:30"],
+            vec!["atx", "10:30"],
+            vec!["atx", "--every", "5m"],
+            vec!["atx", "row"],
+            vec!["atx", "unrelated"],
+            vec!["atx", "__monitr"],
+            vec!["atx", "döcter"],
+            vec!["atx", "abcdefghijklmnopqrstuvwxyz"],
+            vec!["atx", "lst", "--"],
+        ] {
+            let error = parse_from(args.iter().map(Into::into)).expect_err("missing program");
+            assert!(
+                !error.to_string().contains("did you mean"),
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn suggestions_never_rewrite_or_inspect_program_arguments() {
+        for word in ["lst", "hisotry", "docter", "döcter", "row"] {
+            let ParsedCli::Schedule(schedule) =
+                parse_from(["atx", "1s", "--", word].map(Into::into)).expect("literal program")
+            else {
+                panic!("schedule expected");
+            };
+            assert_eq!(schedule.argv, [std::ffi::OsString::from(word)]);
+            let ParsedCli::Schedule(schedule) =
+                parse_from(["atx", word, "--", "true"].map(Into::into))
+                    .expect("time validation is later")
+            else {
+                panic!("schedule expected");
+            };
+            assert_eq!(schedule.when, [word]);
+        }
+    }
+
+    fn reference_distance(left: &str, right: &str) -> usize {
+        let mut row: Vec<usize> = (0..=right.len()).collect();
+        for (index, left) in left.bytes().enumerate() {
+            let mut diagonal = row[0];
+            row[0] = index + 1;
+            for (column, right) in right.bytes().enumerate() {
+                let above = row[column + 1];
+                row[column + 1] = (above + 1)
+                    .min(row[column] + 1)
+                    .min(diagonal + usize::from(left != right));
+                diagonal = above;
+            }
+        }
+        row[right.len()]
+    }
+
+    #[test]
+    fn distance_rejects_oversize_and_non_ascii_inputs() {
+        for value in ["x".repeat(17), "döcter".to_owned(), "💡".to_owned()] {
+            assert_eq!(super::bounded_command_distance(&value, "doctor"), None);
+            assert_eq!(super::bounded_command_distance("doctor", &value), None);
+        }
+        assert_eq!(
+            super::bounded_command_distance("hisotry", "history"),
+            Some(2)
+        );
+        assert_eq!(super::bounded_command_distance("", ""), Some(0));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+        #[test]
+        fn bounded_distance_matches_a_full_reference(left in "[a-z]{0,16}", right in "[a-z]{0,16}") {
+            let reference = reference_distance(&left, &right);
+            let expected = (reference <= 2).then_some(reference);
+            proptest::prop_assert_eq!(super::bounded_command_distance(&left, &right), expected);
+            proptest::prop_assert_eq!(super::bounded_command_distance(&right, &left), expected);
+        }
+
+        #[test]
+        fn arbitrary_words_cannot_panic_or_suggest_a_hidden_command(word in proptest::collection::vec(proptest::char::any(), 0..512)) {
+            let word: String = word.into_iter().collect();
+            if let Some(hint) = super::command_typo_hint(&[word]) {
+                proptest::prop_assert!(!hint.starts_with("__"));
+                proptest::prop_assert!(hint.is_ascii() && hint.len() <= 16);
+            }
+        }
     }
 }
 

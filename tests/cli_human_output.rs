@@ -20,6 +20,43 @@ fn atx() -> Command {
 }
 
 #[test]
+fn management_typos_keep_usage_exit_and_json_error_envelope() {
+    for (word, command) in [
+        ("lst", "list"),
+        ("hisotry", "history"),
+        ("docter", "doctor"),
+        ("hepl", "help"),
+        ("verison", "version"),
+    ] {
+        for json in [false, true] {
+            let mut child = atx();
+            child.args(["--color", "never"]);
+            if json {
+                child.arg("--json");
+            }
+            let output = child.arg(word).output().expect("typo diagnostic");
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let message = if json {
+                let value: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+                assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+                value["error"]["message"]
+                    .as_str()
+                    .expect("error message")
+                    .to_owned()
+            } else {
+                String::from_utf8(output.stderr).expect("human error")
+            };
+            assert!(
+                message.contains(&format!("did you mean `{command}`")),
+                "{message}"
+            );
+            assert_eq!(message.matches("did you mean").count(), 1);
+        }
+    }
+}
+
+#[test]
 fn relative_state_directory_is_usage_in_human_and_json_modes() {
     let root = tempdir().expect("root");
     let commands: &[&[&str]] = &[
