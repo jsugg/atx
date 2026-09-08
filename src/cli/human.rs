@@ -11,14 +11,45 @@ pub(crate) struct HumanRenderer {
     color: bool,
 }
 
+/// Give explicit CLI choices priority over environment disables and config defaults.
+pub(crate) fn effective_color(
+    explicit: Option<ColorArg>,
+    configured: ColorArg,
+    no_color: bool,
+    dumb_term: bool,
+) -> ColorArg {
+    explicit.unwrap_or({
+        if no_color || dumb_term {
+            ColorArg::Never
+        } else {
+            configured
+        }
+    })
+}
+
+/// Resolve a color mode without inspecting an output descriptor yet.
+pub(crate) fn output_color(explicit: Option<ColorArg>, configured: ColorArg) -> ColorArg {
+    effective_color(
+        explicit,
+        configured,
+        std::env::var_os("NO_COLOR").is_some(),
+        std::env::var_os("TERM").as_deref() == Some(std::ffi::OsStr::new("dumb")),
+    )
+}
+
+/// Apply automatic color to the destination that will receive the output.
+pub(crate) fn color_enabled(color: ColorArg, terminal: bool) -> bool {
+    match color {
+        ColorArg::Always => true,
+        ColorArg::Never => false,
+        ColorArg::Auto => terminal,
+    }
+}
+
 impl HumanRenderer {
     pub(crate) fn new(color: ColorArg) -> Self {
         Self {
-            color: match color {
-                ColorArg::Always => true,
-                ColorArg::Never => false,
-                ColorArg::Auto => std::io::stdout().is_terminal(),
-            },
+            color: color_enabled(color, std::io::stdout().is_terminal()),
         }
     }
 
@@ -346,6 +377,49 @@ mod tests {
             !HumanRenderer::new(ColorArg::Never)
                 .state(JobState::Scheduled)
                 .contains("\u{1b}[")
+        );
+    }
+
+    #[test]
+    fn explicit_color_precedes_environment_and_automatic_color_uses_its_stream() {
+        for no_color in [false, true] {
+            for dumb_term in [false, true] {
+                for mode in [ColorArg::Always, ColorArg::Never, ColorArg::Auto] {
+                    assert_eq!(
+                        super::effective_color(Some(mode), ColorArg::Never, no_color, dumb_term),
+                        mode
+                    );
+                }
+                let automatic = super::effective_color(None, ColorArg::Auto, no_color, dumb_term);
+                let expected = if no_color || dumb_term {
+                    ColorArg::Never
+                } else {
+                    ColorArg::Auto
+                };
+                assert_eq!(automatic, expected);
+                for stdout_tty in [false, true] {
+                    for stderr_tty in [false, true] {
+                        assert_eq!(
+                            super::color_enabled(automatic, stdout_tty),
+                            stdout_tty && !no_color && !dumb_term
+                        );
+                        assert_eq!(
+                            super::color_enabled(automatic, stderr_tty),
+                            stderr_tty && !no_color && !dumb_term
+                        );
+                        assert!(super::color_enabled(ColorArg::Always, stderr_tty));
+                        assert!(!super::color_enabled(ColorArg::Never, stdout_tty));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            super::effective_color(None, ColorArg::Always, true, false),
+            ColorArg::Never
+        );
+        assert_eq!(
+            super::effective_color(None, ColorArg::Always, false, false),
+            ColorArg::Always
         );
     }
 

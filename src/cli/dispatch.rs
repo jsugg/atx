@@ -55,6 +55,8 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         .iter()
         .take_while(|value| value.as_os_str() != "--")
         .any(|value| value == "--json");
+    let parser_color =
+        super::human::output_color(super::args::explicit_color_request(&args), ColorArg::Auto);
     let parsed = match parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -66,7 +68,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             if json_requested && error.use_stderr() {
                 print_error(true, "INVALID_ARGUMENT", &error.to_string());
             } else {
-                let _ = error.print();
+                print_parser_message(&error, parser_color);
             }
             return exit_code;
         }
@@ -82,6 +84,27 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         } => {
             resolve_output_policy(&mut global);
             run_management(&global, &command)
+        }
+    }
+}
+
+fn print_parser_message(error: &clap::Error, color: ColorArg) {
+    let message = error.render();
+    if error.use_stderr() {
+        let mut output = std::io::stderr();
+        let colored = super::human::color_enabled(color, output.is_terminal());
+        if colored {
+            let _ = write!(output, "{}", message.ansi());
+        } else {
+            let _ = write!(output, "{message}");
+        }
+    } else {
+        let mut output = std::io::stdout();
+        let colored = super::human::color_enabled(color, output.is_terminal());
+        if colored {
+            let _ = write!(output, "{}", message.ansi());
+        } else {
+            let _ = write!(output, "{message}");
         }
     }
 }
@@ -992,6 +1015,10 @@ fn load_effective_config(
 /// site observes a single policy without threading a second struct through
 /// dispatch.
 fn resolve_output_policy(global: &mut GlobalArgs) {
+    if global.color.is_none() && super::human::output_color(None, ColorArg::Auto) == ColorArg::Never
+    {
+        global.color = Some(ColorArg::Never);
+    }
     let Ok(paths) = platform_paths(global.state_dir.as_deref()) else {
         return;
     };

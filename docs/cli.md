@@ -43,7 +43,13 @@ not assemble this string from untrusted input.
   `--verbose`; diagnostics still go to stderr.
 - `-v`, `--verbose` requests extra diagnostics.
 - `--color MODE` chooses color behavior. `MODE` is `auto`, `always`, or `never`;
-  without the flag, the configured color mode applies.
+  an explicit flag takes priority over configuration and environment defaults.
+  Without it, `NO_COLOR` being present, even empty, or `TERM=dumb` disables
+  color. Otherwise the configured mode applies. `auto` checks the destination
+  stream: stdout for human results and help, stderr for parser errors.
+  Explicit `--color auto` uses that TTY check even with either environment
+  disable set. `always` forces color and `never` disables it. JSON output and
+  plain runtime diagnostics do not gain color.
 - `-h`, `--help` prints help and exits successfully. `atx help` is also
   available.
 - `-V`, `--version` prints the program version and exits successfully.

@@ -2073,7 +2073,8 @@ fn describe_processes(processes: &[OwnedProcess]) -> String {
         .join("; ")
 }
 
-fn wait_until(
+/// Poll a bounded test predicate without changing process or fixture ownership.
+pub(crate) fn wait_until(
     timeout: Duration,
     mut predicate: impl FnMut() -> Result<bool, String>,
 ) -> Result<bool, String> {

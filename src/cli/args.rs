@@ -375,6 +375,34 @@ pub(crate) fn parse_from(
 const MAX_TYPO_BYTES: usize = 16;
 const MAX_TYPO_DISTANCE: usize = 2;
 
+/// Inspect only global color flags, without treating option values or argv as flags.
+pub(crate) fn explicit_color_request(args: &[OsString]) -> Option<ColorArg> {
+    let command = RawCli::command();
+    let mut values = args.iter().skip(1).take_while(|value| *value != "--");
+    let mut color = None;
+    while let Some(value) = values.next() {
+        let Some(value) = value.to_str() else {
+            continue;
+        };
+        let choice = if value == "--color" {
+            values.next().and_then(|value| value.to_str())
+        } else {
+            value.strip_prefix("--color=")
+        };
+        if let Some(choice) = choice {
+            color = match choice {
+                "always" => Some(ColorArg::Always),
+                "never" => Some(ColorArg::Never),
+                "auto" => Some(ColorArg::Auto),
+                _ => None,
+            };
+        } else if !value.contains('=') && option_takes_value(&command, value) {
+            values.next();
+        }
+    }
+    color
+}
+
 fn command_typo_hint(when: &[String]) -> Option<String> {
     let first = when.first()?;
     if first.is_empty() || first.len() > MAX_TYPO_BYTES || !first.is_ascii() {
@@ -858,6 +886,34 @@ mod tests {
         assert_eq!(super::bounded_command_distance("", ""), Some(0));
     }
 
+    #[test]
+    fn early_color_flags_never_come_from_option_values_or_program_argv() {
+        for (args, expected) in [
+            (
+                vec!["atx", "--color", "always", "--wat"],
+                Some(super::ColorArg::Always),
+            ),
+            (
+                vec!["atx", "--color=never", "--wat"],
+                Some(super::ColorArg::Never),
+            ),
+            (
+                vec!["atx", "--json", "--color", "auto", "--wat"],
+                Some(super::ColorArg::Auto),
+            ),
+            (vec!["atx", "1s", "--", "--color", "always"], None),
+            (vec!["atx", "--name", "--color=always", "1s"], None),
+            (vec!["atx", "--description=--color=always", "1s"], None),
+            (vec!["atx", "--color", "invalid"], None),
+            (vec!["atx", "--color"], None),
+            (vec!["atx", "--color", "--", "--color=always"], None),
+            (vec!["atx", "--name", "--", "--color=always"], None),
+        ] {
+            let args: Vec<_> = args.into_iter().map(Into::into).collect();
+            assert_eq!(super::explicit_color_request(&args), expected);
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::test_runner::Config::with_cases(128))]
         #[test]
@@ -874,6 +930,15 @@ mod tests {
             if let Some(hint) = super::command_typo_hint(&[word]) {
                 proptest::prop_assert!(!hint.starts_with("__"));
                 proptest::prop_assert!(hint.is_ascii() && hint.len() <= 16);
+            }
+        }
+
+        #[test]
+        fn early_color_never_reads_past_a_separator(word in ".{0,128}") {
+            for option in ["--name", "--color"] {
+                let args: Vec<_> = ["atx", "--color=never", option, "--", &word, "--color=always"]
+                    .into_iter().map(Into::into).collect();
+                proptest::prop_assert_eq!(super::explicit_color_request(&args), Some(super::ColorArg::Never));
             }
         }
     }
