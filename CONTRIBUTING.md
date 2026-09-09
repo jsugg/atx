@@ -12,6 +12,9 @@ correct change, then clean it up. Bug fixes need a regression test.
 
 ## Local checks
 
+The [acceptance scenarios](docs/acceptance.md) link each public contract to its
+test and separate local checks from release checks.
+
 ```console
 ./scripts/check.sh quick
 ./scripts/check.sh pre-merge

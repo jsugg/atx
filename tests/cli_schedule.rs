@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -10,6 +12,8 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 use jiff::{SignedDuration, Timestamp, tz::TimeZone};
+#[path = "../src/run_monitor/pty_fixture.rs"]
+mod pty_fixture;
 mod support;
 
 use support::tempdir;
@@ -311,6 +315,110 @@ fn relative_job_survives_submitter_terminal_closure() {
 
     assert!(output.status.success(), "{output:?}");
     wait_for_file(&marker);
+}
+
+/// Give only the child an owned controlling terminal on its already-wired stdin.
+fn attach_controlling_terminal(command: &mut Command) {
+    // SAFETY: the child hook uses only async-signal-safe syscalls on its PTY stdin.
+    unsafe {
+        command.pre_exec(|| {
+            #[cfg(target_os = "macos")]
+            let request = libc::c_ulong::from(libc::TIOCSCTTY);
+            #[cfg(target_os = "linux")]
+            let request = libc::TIOCSCTTY;
+            if libc::setsid() == -1 || libc::ioctl(libc::STDIN_FILENO, request, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn session_job_survives_a_controlling_terminal_hangup() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let started = root.path().join("started");
+    let release = root.path().join("release");
+    let done = root.path().join("done");
+    let pty = pty_fixture::Pty::open().expect("owned PTY");
+    assert!(
+        fs::metadata(pty.path())
+            .expect("PTY metadata")
+            .file_type()
+            .is_char_device()
+    );
+    pty.set_mode(0o600).expect("private PTY");
+    let script = r#"trap 'exit 129' HUP
+"$1" --json --state-dir "$2" 2s -- /bin/sh -c 'printf started > "$1"; while [ ! -f "$2" ]; do sleep 0.1; done; printf finished > "$3"' fixture "$3" "$4" "$5" || exit 1
+printf 'SUBMITTED\n'
+while :; do read ignored || :; done"#;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", script, "terminal-owner", env!("CARGO_BIN_EXE_atx")])
+        .arg(&state)
+        .arg(&started)
+        .arg(&release)
+        .arg(&done)
+        .stdin(Stdio::from(pty.writer().expect("PTY stdin")))
+        .stdout(Stdio::from(pty.writer().expect("PTY stdout")))
+        .stderr(Stdio::from(pty.writer().expect("PTY stderr")));
+    attach_controlling_terminal(&mut command);
+    let mut terminal_owner = root.spawn_owned(&mut command).expect("terminal owner");
+    drop(command);
+    let mut captured = Vec::new();
+    assert!(
+        support::wait_until(Duration::from_secs(15), || {
+            captured.extend(pty.read_available().map_err(|error| error.to_string())?);
+            if captured.len() > 65_536 {
+                return Err("terminal capture exceeded 64 KiB".into());
+            }
+            if let Some(status) = terminal_owner
+                .try_wait()
+                .map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "terminal owner exited before submission: {status}; {captured:?}"
+                ));
+            }
+            Ok(captured
+                .windows(b"SUBMITTED".len())
+                .any(|bytes| bytes == b"SUBMITTED"))
+        })
+        .expect("bounded terminal submission")
+    );
+    let submitted: serde_json::Value = serde_json::from_slice(
+        captured
+            .split(|byte| *byte == b'\n')
+            .next()
+            .expect("submission line"),
+    )
+    .expect("terminal submission JSON");
+    assert_eq!(submitted["schema_version"], 1);
+    assert_eq!(submitted["ok"], true);
+    let job = submitted["data"]["job_id"].as_str().expect("job ID");
+    wait_for_file(&started);
+    assert!(!done.exists(), "command finished before terminal closure");
+    drop(pty);
+    let mut status = None;
+    assert!(
+        support::wait_until(Duration::from_secs(5), || {
+            status = terminal_owner
+                .try_wait()
+                .map_err(|error| error.to_string())?;
+            Ok(status.is_some())
+        })
+        .expect("bounded hangup wait")
+    );
+    assert_eq!(
+        status.expect("terminal owner exit").code(),
+        Some(129),
+        "SIGHUP trap did not run"
+    );
+    fs::write(&release, b"release").expect("release after actual hangup");
+    wait_for_file(&done);
+    assert_eq!(fs::read(&done).expect("command marker"), b"finished");
+    wait_for_history(&state, job);
 }
 
 #[test]

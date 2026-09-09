@@ -488,6 +488,19 @@ mod tests {
             monitor.execute(&run, &execution),
             Err(MonitorError::AlreadyStarted)
         ));
+        let snapshot = completed.snapshot();
+        let started = snapshot.started_at_utc.expect("started timestamp");
+        assert!(snapshot.finished_at_utc.expect("finished timestamp") >= started);
+        assert_eq!(
+            fs::read(root.path().join(snapshot.stdout_path.expect("stdout path")))
+                .expect("captured stdout"),
+            vec![b'x'; 128]
+        );
+        assert!(
+            fs::read(root.path().join(snapshot.stderr_path.expect("stderr path")))
+                .expect("captured stderr")
+                .is_empty()
+        );
         let stdout_truncated: bool = store
             .database()
             .connection()
