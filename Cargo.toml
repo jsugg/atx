@@ -9,6 +9,8 @@ edition = "2024"
 rust-version = "1.85"
 description = "Reliable per-user command scheduler for macOS and Linux"
 repository = "https://github.com/jsugg/atx"
+homepage = "https://github.com/jsugg/atx"
+documentation = "https://github.com/jsugg/atx"
 readme = "README.md"
 license = "MIT"
 keywords = ["scheduler", "cli", "jobs", "timer", "automation"]
@@ -25,8 +27,11 @@ include = [
     "/LICENSE-MIT",
 ]
 
-[package.metadata.docs.rs]
-all-features = true
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/atx-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
 
 [[bin]]
 name = "atx"
