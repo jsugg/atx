@@ -350,9 +350,9 @@ mod tests {
 
     use rusqlite::Connection;
     use rustix::fs::OpenOptionsExt as _;
-    use tempfile::tempdir;
 
     use super::{CURRENT_SCHEMA_VERSION, Database, StoreError, apply_migrations, map_read_error};
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     #[test]
     fn schema_has_expected_constraints_and_indexes() {
@@ -600,6 +600,21 @@ mod tests {
         let path = root.path().join("atx.db");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777))
             .expect("loose directory");
+        let result = Database::open(&path, Duration::from_secs(5));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private fixture");
+        assert!(
+            matches!(result, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn initialization_refuses_a_group_writable_directory() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775))
+            .expect("group-writable directory");
         let result = Database::open(&path, Duration::from_secs(5));
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
             .expect("restore private fixture");

@@ -661,8 +661,6 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::{
         DaemonError, WakeDisposition, execute_due_jobs, load_wake, load_wake_with_retry,
         request_ipc_shutdown, serve_ipc, stop_signal_set,
@@ -671,6 +669,7 @@ mod tests {
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
         MissedPolicy, Revision, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
     use crate::infrastructure::sqlite::{Database, JobStore};
     use crate::supervisor::ipc::{IpcMessage, read_frame, write_frame};
     use crate::supervisor::loop_driver::SupervisorEvent;

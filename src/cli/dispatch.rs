@@ -1616,7 +1616,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
-    use tempfile::tempdir;
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     #[test]
     fn path_error_variants_keep_usage_and_permission_classifications() {

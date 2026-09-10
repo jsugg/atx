@@ -212,14 +212,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::{MonitorError, RunMonitor};
     use crate::application::ElapsedClock;
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, MissedPolicy, RunOutcome,
         RunState, RuntimeTier, Schedule, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
     use crate::run_monitor::tty::test_support::Pty;
     use rusqlite::params;

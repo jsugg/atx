@@ -211,6 +211,13 @@ pub(crate) fn open_or_create_private_append_log(
     Ok(File::from(file))
 }
 
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+}
+
 fn validate_leaf_name(name: &str) -> Result<(), PathError> {
     let mut components = Path::new(name).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -251,9 +258,22 @@ mod tests {
 
     use super::{
         PathEnvironment, PathError, Platform, create_new_private_file, ensure_private_dir,
-        open_or_create_private_append_log, open_private_file, resolve_paths,
+        open_or_create_private_append_log, open_private_file, private_tempdir, resolve_paths,
         validate_private_dir_for_uid,
     };
+
+    #[test]
+    fn private_tempdir_creates_owner_only_directory() {
+        let root = private_tempdir().expect("private tempdir");
+        let mode = fs::symlink_metadata(root.path())
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        validate_private_dir_for_uid(root.path(), super::geteuid().as_raw())
+            .expect("private tempdir must satisfy private dir invariants");
+    }
 
     #[test]
     fn platform_path_tables_match_conventions() {

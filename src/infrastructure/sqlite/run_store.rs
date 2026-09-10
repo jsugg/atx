@@ -439,14 +439,13 @@ mod tests {
 
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::super::JobStore;
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, StoreError};
     use crate::domain::{
         ClaimToken, ProcessIdentitySnapshot, RunId, RunOutcome, RunState, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
     use rusqlite::params;
 
     fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {

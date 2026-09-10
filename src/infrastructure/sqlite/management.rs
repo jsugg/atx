@@ -372,13 +372,12 @@ mod tests {
 
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore, StoreError};
     use super::{Job, hide_job};
     use crate::application::{ManagementStore as _, RunOutputStore as _};
     use crate::domain::{JobId, JobState, ProcessIdentitySnapshot, RunId, RunState, UtcTimestamp};
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     fn identity(pid: u32, start_token: u64, process_group_id: i32) -> ProcessIdentitySnapshot {
         ProcessIdentitySnapshot {
