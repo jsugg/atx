@@ -93,7 +93,10 @@ pub(crate) struct CapturedStream<W> {
 
 impl<W> CapturedStream<W> {
     #[cfg(test)]
-    #[allow(clippy::used_underscore_binding)]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "Tests inspect the writer retained for capture ownership."
+    )]
     pub(crate) const fn writer(&self) -> &W {
         &self._writer
     }

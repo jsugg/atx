@@ -59,7 +59,10 @@ pub(crate) struct GlobalArgs {
 }
 
 #[derive(Clone, Debug, Args, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent command-line switches are intentionally represented as booleans."
+)]
 pub(crate) struct ScheduleOptions {
     /// Validate and print the job without saving it.
     #[arg(long)]
@@ -435,12 +438,14 @@ fn command_typo_hint(when: &[String]) -> Option<String> {
         if distance == 0 {
             return None;
         }
-        if distance < best {
-            best = distance;
-            hint = Some(name.to_owned());
-            tied = false;
-        } else if distance == best {
-            tied = true;
+        match distance.cmp(&best) {
+            std::cmp::Ordering::Less => {
+                best = distance;
+                hint = Some(name.to_owned());
+                tied = false;
+            }
+            std::cmp::Ordering::Equal => tied = true,
+            std::cmp::Ordering::Greater => {}
         }
     }
     if tied { None } else { hint }

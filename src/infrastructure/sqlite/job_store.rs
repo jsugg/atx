@@ -124,7 +124,6 @@ impl JobStore {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transition_job(
         &mut self,
         id: JobId,

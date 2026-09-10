@@ -97,7 +97,6 @@ impl JobStore {
         load_run(self.database.connection(), id)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mark_run_running(
         &mut self,
         id: RunId,

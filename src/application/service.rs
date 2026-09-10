@@ -262,7 +262,10 @@ mod tests {
         ));
     }
 
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "Each boolean enables an independent service fault or state in tests."
+    )]
     struct FakeManager {
         available: bool,
         installed: bool,
