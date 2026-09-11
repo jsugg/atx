@@ -124,42 +124,9 @@ fn generate_completions(shell: crate::cli::args::CompletionShell) {
     generate(shell, &mut cmd, "atx", &mut stdout());
 }
 
-/// Write `atx.1` plus one page per subcommand as roff into `out_dir`.
+/// Write `atx.1` plus one page per public command and nested subcommand as roff into `out_dir`.
 #[cfg(feature = "man")]
 fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
-    use clap::CommandFactory;
-    use std::io::Write;
-
-    fn render(man: &clap_mangen::Man, path: &std::path::Path) -> Result<(), String> {
-        let mut generated = Vec::new();
-        man.render(&mut generated)
-            .map_err(|error| format!("render {}: {error}", path.display()))?;
-        let generated = String::from_utf8(generated)
-            .map_err(|error| format!("render {} as UTF-8: {error}", path.display()))?;
-        let mut normalized = generated
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        normalized.push('\n');
-        while normalized.contains(".br\n\n.br\n") {
-            normalized = normalized.replace(".br\n\n.br\n", ".br\n");
-        }
-        while normalized.contains("\n\n.br\n") {
-            normalized = normalized.replace("\n\n.br\n", "\n.br\n");
-        }
-        let file = std::fs::File::create(path)
-            .map_err(|error| format!("create {}: {error}", path.display()))?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer
-            .write_all(normalized.as_bytes())
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
-        writer.flush().map_err(|error| format!("flush: {error}"))
-    }
-
-    std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
-    let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
-    cmd.build();
     // mandoc rejects an empty or non-date TH date, so stamp a real date;
     // SOURCE_DATE_EPOCH keeps distro reproducible builds deterministic.
     let date = std::env::var("SOURCE_DATE_EPOCH")
@@ -169,23 +136,182 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
         .unwrap_or_else(jiff::Timestamp::now)
         .strftime("%Y-%m-%d")
         .to_string();
-    let name = cmd.get_name().to_owned();
-    render(
-        &clap_mangen::Man::new(cmd.clone())
-            .title(name.to_ascii_uppercase())
-            .date(&date),
-        &out_dir.join(format!("{name}.1")),
-    )?;
-    for sub in cmd.get_subcommands() {
+    export_man_pages_with_date(out_dir, &date)
+}
+
+#[cfg(feature = "man")]
+fn collect_man_pages(
+    parent: &clap::Command,
+    prefix: &str,
+    is_root: bool,
+    pages: &mut Vec<(String, clap::Command)>,
+) {
+    for sub in parent.get_subcommands() {
         if sub.is_hide_set() {
             continue;
         }
-        let path = out_dir.join(format!("{name}-{}.1", sub.get_name()));
-        render(
-            &clap_mangen::Man::new(sub.clone())
-                .title(name.to_ascii_uppercase())
-                .date(&date),
+        let sub_name = sub.get_name();
+        if sub_name == "help" && !is_root {
+            continue;
+        }
+        let page_name = format!("{prefix}-{sub_name}");
+        pages.push((page_name.clone(), sub.clone()));
+        if sub_name != "help" {
+            collect_man_pages(sub, &page_name, false, pages);
+        }
+    }
+}
+
+#[cfg(feature = "man")]
+fn normalize_man_page(raw: &str, root_name: &str) -> String {
+    let escaped_root = root_name.replace('-', "\\-");
+    let help_prefix = format!("{escaped_root}\\-help\\-");
+    let help_page = format!("{escaped_root}\\-help(1)");
+    let help_self = format!("{help_prefix}help(1)");
+    let root_prefix = format!("{escaped_root}\\-");
+    let nested_help_suffix = "\\-help(1)";
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_extra = false;
+    let mut extra_header_index: Option<usize> = None;
+
+    for raw_line in raw.lines() {
+        let trimmed = raw_line.trim_end();
+        if trimmed == ".SH EXTRA" {
+            in_extra = true;
+            extra_header_index = Some(lines.len());
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        if trimmed.starts_with(".SH ") {
+            in_extra = false;
+            extra_header_index = None;
+            while lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        if in_extra {
+            let promoted = match trimmed {
+                "EXAMPLES:" => Some(".SH EXAMPLES"),
+                "EXIT STATUS:" => Some(".SH EXIT STATUS"),
+                "FILES:" => Some(".SH FILES"),
+                "SEE ALSO:" => Some(".SH SEE ALSO"),
+                _ => None,
+            };
+            if let Some(section) = promoted {
+                if let Some(index) = extra_header_index.take() {
+                    if lines[index + 1..].iter().all(String::is_empty) {
+                        lines.truncate(index);
+                    }
+                }
+                while lines.last().is_some_and(String::is_empty) {
+                    lines.pop();
+                }
+                lines.push(section.to_owned());
+                continue;
+            }
+        }
+
+        let line = if trimmed == help_self {
+            help_page.clone()
+        } else if let Some(rest) = trimmed.strip_prefix(&help_prefix) {
+            if rest.ends_with("(1)") {
+                format!("{root_prefix}{rest}")
+            } else {
+                trimmed.to_owned()
+            }
+        } else if trimmed.starts_with(&root_prefix)
+            && trimmed.ends_with(nested_help_suffix)
+            && trimmed != help_page
+        {
+            help_page.clone()
+        } else {
+            trimmed.to_owned()
+        };
+        lines.push(line);
+    }
+
+    let mut normalized = lines.join("\n");
+    normalized.push('\n');
+    while normalized.contains(".br\n\n.br\n") {
+        normalized = normalized.replace(".br\n\n.br\n", ".br\n");
+    }
+    while normalized.contains("\n\n.br\n") {
+        normalized = normalized.replace("\n\n.br\n", "\n.br\n");
+    }
+    normalized
+}
+
+#[cfg(feature = "man")]
+fn render_man_page(
+    man: &clap_mangen::Man,
+    path: &std::path::Path,
+    root_name: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut generated = Vec::new();
+    man.render(&mut generated)
+        .map_err(|error| format!("render {}: {error}", path.display()))?;
+    let generated = String::from_utf8(generated)
+        .map_err(|error| format!("render {} as UTF-8: {error}", path.display()))?;
+    let normalized = normalize_man_page(&generated, root_name);
+    let file = std::fs::File::create(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer
+        .write_all(normalized.as_bytes())
+        .map_err(|error| format!("write {}: {error}", path.display()))?;
+    writer.flush().map_err(|error| format!("flush: {error}"))
+}
+
+#[cfg(feature = "man")]
+fn remove_stale_man_pages(out_dir: &std::path::Path, root_name: &str) -> Result<(), String> {
+    let stale_prefix = format!("{root_name}-");
+    let root_file = format!("{root_name}.1");
+    for entry in std::fs::read_dir(out_dir)
+        .map_err(|error| format!("read {}: {error}", out_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read entry: {error}"))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if (file_name == root_file
+            || (file_name.starts_with(&stale_prefix) && file_name.ends_with(".1")))
+            && entry.path().is_file()
+        {
+            std::fs::remove_file(entry.path())
+                .map_err(|error| format!("remove stale {}: {error}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "man")]
+fn export_man_pages_with_date(out_dir: &std::path::Path, date: &str) -> Result<(), String> {
+    use clap::CommandFactory;
+
+    std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
+    let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
+    cmd.build();
+    let name = cmd.get_name().to_owned();
+    let source = format!("{name} {}", env!("CARGO_PKG_VERSION"));
+    remove_stale_man_pages(out_dir, &name)?;
+
+    let mut pages = vec![(name.clone(), cmd.clone())];
+    collect_man_pages(&cmd, &name, true, &mut pages);
+    for (page_name, page_cmd) in pages {
+        let path = out_dir.join(format!("{page_name}.1"));
+        render_man_page(
+            &clap_mangen::Man::new(page_cmd)
+                .title(page_name.to_ascii_uppercase())
+                .date(date)
+                .source(&source),
             &path,
+            &name,
         )?;
     }
     Ok(())
@@ -1991,6 +2117,107 @@ mod tests {
         let blocker = root.path().join("blocker");
         fs::write(&blocker, b"").expect("file");
         assert!(super::export_man_pages(&blocker).is_err());
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn man_pages_use_conventional_titles_sections_and_shipped_references() {
+        let first = tempdir().expect("first");
+        let second = tempdir().expect("second");
+        let stale = first.path().join("atx-obsolete.1");
+        let unrelated = first.path().join("keep.txt");
+        fs::write(&stale, b"stale").expect("stale page");
+        fs::write(&unrelated, b"keep").expect("unrelated file");
+        super::export_man_pages_with_date(first.path(), "2026-09-10").expect("first export");
+        super::export_man_pages_with_date(second.path(), "2026-09-10").expect("second export");
+        assert!(!stale.exists(), "stale atx man page must be removed");
+        assert!(unrelated.exists(), "unrelated files must be preserved");
+
+        let mut pages = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(first.path()).expect("read first dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".1") {
+                let bytes = fs::read(entry.path()).expect("read page");
+                let second_bytes = fs::read(second.path().join(&name)).expect("read second page");
+                assert_eq!(bytes, second_bytes, "nondeterministic page {name}");
+                let text = String::from_utf8(bytes).expect("utf8 page");
+                pages.insert(name, text);
+            }
+        }
+
+        // Nested service subcommands must ship alongside top-level pages.
+        for required in [
+            "atx.1",
+            "atx-list.1",
+            "atx-service.1",
+            "atx-service-install.1",
+            "atx-service-status.1",
+            "atx-service-uninstall.1",
+            "atx-help.1",
+        ] {
+            assert!(
+                pages.contains_key(required),
+                "missing generated page {required}"
+            );
+        }
+
+        let expected_source = format!("\"atx {}\"", env!("CARGO_PKG_VERSION"));
+        for (file, text) in &pages {
+            let stem = file.strip_suffix(".1").expect(".1 suffix");
+            let expected_th = format!(
+                ".TH {} 1 2026-09-10 {expected_source}",
+                stem.to_ascii_uppercase()
+            );
+            assert!(
+                text.lines().any(|line| line == expected_th),
+                "{file}: expected header {expected_th:?}, got {:?}",
+                text.lines().find(|line| line.starts_with(".TH "))
+            );
+            assert!(
+                !text.lines().any(|line| line == ".SH EXTRA"),
+                "{file}: unexpected .SH EXTRA section"
+            );
+
+            // Every atx*(1) cross-reference must resolve to a generated page.
+            let unescaped = text.replace("\\-", "-");
+            let mut rest = unescaped.as_str();
+            while let Some(pos) = rest.find("(1)") {
+                let prefix = &rest[..pos];
+                let token_start = prefix
+                    .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+                    .map_or(0, |index| index + 1);
+                let target = &prefix[token_start..];
+                if target == "atx" || target.starts_with("atx-") {
+                    let target_file = format!("{target}.1");
+                    assert!(
+                        pages.contains_key(&target_file),
+                        "{file}: unresolved manual reference {target}(1)"
+                    );
+                }
+                rest = &rest[pos + 3..];
+            }
+        }
+
+        // Root manual must expose standard Unix sections instead of EXTRA.
+        let root_page = &pages["atx.1"];
+        for section in [
+            ".SH EXAMPLES",
+            ".SH EXIT STATUS",
+            ".SH FILES",
+            ".SH SEE ALSO",
+        ] {
+            assert!(
+                root_page.lines().any(|line| line == section),
+                "atx.1 missing {section}"
+            );
+        }
+        assert!(
+            pages["atx-service.1"]
+                .lines()
+                .any(|line| line == ".SH EXAMPLES"),
+            "atx-service.1 missing .SH EXAMPLES"
+        );
     }
 
     #[test]
