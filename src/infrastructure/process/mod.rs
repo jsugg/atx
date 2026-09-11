@@ -271,6 +271,9 @@ fn inspect_zombie_via_sysctl(
     // SAFETY-CONTRACT: 648 bytes matches sizeof(struct kinfo_proc) on arm64
     // and x86_64; sysctl rejects smaller buffers with ENOMEM. Field offsets
     // verified with offsetof() against <sys/sysctl.h>.
+    // `kp_proc.p_starttime.tv_sec` at offset 0 is an 8-byte little-endian
+    // `time_t`; reading 4 bytes intentionally takes its low 32 bits as an
+    // equality token alongside `tv_usec`, not a general-purpose timestamp.
     const KINFO_PROC_SIZE: usize = 648;
     const STARTTIME_SEC_OFFSET: usize = 0;
     const STARTTIME_USEC_OFFSET: usize = 8;
