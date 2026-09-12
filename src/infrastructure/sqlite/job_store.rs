@@ -36,6 +36,11 @@ impl JobStore {
         &self.database
     }
 
+    #[cfg(test)]
+    pub(crate) const fn database_mut(&mut self) -> &mut Database {
+        &mut self.database
+    }
+
     pub(crate) fn create(&mut self, job: &Job) -> Result<(), StoreError> {
         let snapshot = job.snapshot();
         let schedule = serde_json::to_string(&snapshot.schedule)

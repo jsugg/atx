@@ -201,10 +201,10 @@ fn normalize_man_page(raw: &str, root_name: &str) -> String {
                 _ => None,
             };
             if let Some(section) = promoted {
-                if let Some(index) = extra_header_index.take() {
-                    if lines[index + 1..].iter().all(String::is_empty) {
-                        lines.truncate(index);
-                    }
+                if let Some(index) = extra_header_index.take()
+                    && lines[index + 1..].iter().all(String::is_empty)
+                {
+                    lines.truncate(index);
                 }
                 while lines.last().is_some_and(String::is_empty) {
                     lines.pop();
@@ -267,10 +267,10 @@ fn stage_man_pages(
 
     for (file_name, _) in rendered {
         let dest = out_dir.join(file_name);
-        if let Ok(meta) = std::fs::symlink_metadata(&dest) {
-            if meta.is_dir() {
-                return Err(format!("cannot overwrite directory {}", dest.display()));
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&dest)
+            && meta.is_dir()
+        {
+            return Err(format!("cannot overwrite directory {}", dest.display()));
         }
     }
 
@@ -1565,21 +1565,20 @@ fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<
             ("monitor", run.monitor_identity()),
             ("command", run.command_identity()),
         ] {
-            if let Some(identity) = identity {
-                if inspector
+            if let Some(identity) = identity
+                && inspector
                     .classify(identity)
                     .map_err(|error| CliError::internal(global.json, error))?
                     == NativeIdentityStatus::Alive
-                {
-                    processes.push(ProcessView {
-                        job_id: run.job_id().to_string(),
-                        run_id: run.id().to_string(),
-                        role,
-                        pid: identity.pid,
-                        process_group_id: identity.process_group_id,
-                        state: run.state(),
-                    });
-                }
+            {
+                processes.push(ProcessView {
+                    job_id: run.job_id().to_string(),
+                    run_id: run.id().to_string(),
+                    role,
+                    pid: identity.pid,
+                    process_group_id: identity.process_group_id,
+                    state: run.state(),
+                });
             }
         }
     }
@@ -3349,8 +3348,8 @@ mod tests {
             CLAIM_HANDSHAKE
                 .with(|handshake| *handshake.borrow_mut() = Some((release_tx, committed_rx)));
             store
-                .database()
-                .connection()
+                .database_mut()
+                .connection_mut()
                 .busy_handler(Some(release_claim_writer))
                 .expect("install controlled contention hook");
             let result = cancel_job(

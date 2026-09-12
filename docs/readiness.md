@@ -10,12 +10,12 @@ commit hash.
 ## Build and tests
 
 - `./scripts/check.sh full` covers formatting, warnings, clippy, the full test
-  suite, Rust 1.85, docs, dependency checks, Markdown, links, the package file
+  suite, Rust 1.89, docs, dependency checks, Markdown, links, the package file
   list, and a crates.io dry run.
 - Required checks run tests on Linux and native Apple Silicon and Intel macOS.
   Linux also runs the full suite once as root and once as the ordinary runner
   user.
-- Clippy, the Rust 1.85 check, docs, coverage, and CodeQL run on both Linux and
+- Clippy, the Rust 1.89 check, docs, coverage, and CodeQL run on both Linux and
   macOS.
 - The S15 late-cancellation regression waits for a terminal run and passes ten
   repeated runs on macOS.

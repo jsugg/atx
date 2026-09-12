@@ -49,18 +49,18 @@ quick() {
 }
 
 msrv() {
-    compiler=$(rustup which --toolchain 1.85.0 rustc) || return $?
+    compiler=$(rustup which --toolchain 1.89.0 rustc) || return $?
     version=$("$compiler" --version) || return $?
     case "$version" in
-        'rustc 1.85.0 '*) ;;
+        'rustc 1.89.0 '*) ;;
         *)
-            printf 'wrong MSRV compiler: expected Rust 1.85.0, got %s\n' "$version" >&2
+            printf 'wrong MSRV compiler: expected Rust 1.89.0, got %s\n' "$version" >&2
             return 2
             ;;
     esac
     printf '%s\n' "$version"
     RUSTC="$compiler" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' \
-        cargo +1.85.0 check --workspace --all-targets --all-features --locked || return $?
+        cargo +1.89.0 check --workspace --all-targets --all-features --locked || return $?
 }
 
 dependencies() {
@@ -133,7 +133,7 @@ case "$mode" in
     *)
         printf 'usage: %s pre-merge|full|quick|static|fmt|check|test|clippy|msrv|docs|dependencies|package|hygiene|man|markdown|links-offline|links-online\n' "$0" >&2
         printf '  quick  fmt+check+test+clippy (pre-merge)\n' >&2
-        printf '  msrv   verify and check with Rust 1.85.0 (no compiler wrappers)\n' >&2
+        printf '  msrv   verify and check with Rust 1.89.0 (no compiler wrappers)\n' >&2
         printf '  markdown pinned CLI2+canonical config over tracked Markdown\n' >&2
         printf '  static MSRV+doc+audit+deny+markdown+lychee+package (extended)\n' >&2
         printf '  pre-merge/full quick+static+hygiene+man (local contributor gate)\n' >&2

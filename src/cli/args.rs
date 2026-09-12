@@ -349,16 +349,17 @@ pub(crate) fn parse_from(
         });
     }
     if raw.argv.is_empty() {
-        if !has_separator && raw.schedule.every.is_none() {
-            if let Some(command) = command_typo_hint(&raw.when) {
-                return Err(RawCli::command().error(
-                    clap::error::ErrorKind::InvalidSubcommand,
-                    format!(
-                        "unrecognized command `{}`; did you mean `{command}`?",
-                        raw.when[0]
-                    ),
-                ));
-            }
+        if !has_separator
+            && raw.schedule.every.is_none()
+            && let Some(command) = command_typo_hint(&raw.when)
+        {
+            return Err(RawCli::command().error(
+                clap::error::ErrorKind::InvalidSubcommand,
+                format!(
+                    "unrecognized command `{}`; did you mean `{command}`?",
+                    raw.when[0]
+                ),
+            ));
         }
         return Err(RawCli::command().error(
             clap::error::ErrorKind::MissingRequiredArgument,

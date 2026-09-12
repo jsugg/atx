@@ -336,13 +336,12 @@ fn serve_ipc(
                 // contention, then nack with the reason.
                 let reply = match load_wake_with_retry(database_path, job_id) {
                     Ok(disposition) => {
-                        if let WakeDisposition::Schedule(deadline) = disposition {
-                            if sender
+                        if let WakeDisposition::Schedule(deadline) = disposition
+                            && sender
                                 .send(SupervisorEvent::Schedule { job_id, deadline })
                                 .is_err()
-                            {
-                                break;
-                            }
+                        {
+                            break;
                         }
                         IpcMessage::Ack {
                             protocol: 1,

@@ -4,19 +4,19 @@
 man stages; `full` is its compatibility alias. Every failed command stops the
 gate and keeps its status. CI uses the same named stages on its runners.
 
-`check.sh msrv` selects the installed Rust 1.85.0 compiler, checks and prints its
+`check.sh msrv` selects the installed Rust 1.89.0 compiler, checks and prints its
 version, then checks every workspace member, target and feature with that compiler. It ignores
 compiler overrides and wrappers for this check. CI and `check.sh full` use the
 same stage.
 
 Run pre-merge from a clean checkout because Cargo rejects dirty publish
-rehearsals. Install Rust 1.85.0, Node.js 22+/npm, Git, ShellCheck, actionlint
+rehearsals. Install Rust 1.89.0, Node.js 22+/npm, Git, ShellCheck, actionlint
 1.7.12, mandoc and sqlite3, plus the pinned Rust tools below.
 
 | Stage | Work |
 | --- | --- |
 | `fmt`, `check`, `test`, `clippy` | Format/build/test/lint the workspace |
-| `msrv`, `docs`, `dependencies` | Actual Rust 1.85, rustdoc, audit/deny |
+| `msrv`, `docs`, `dependencies` | Actual Rust 1.89, rustdoc, audit/deny |
 | `markdown`, `links-offline` | Tracked Markdown rules and local links |
 | `links-online` | Live URLs, 20-second timeout, two retries, concurrency eight |
 | `package` | File policy and publish dry run |
@@ -82,7 +82,7 @@ wrong required tool versions fail with an actionable message.
   Limits are 256 KiB input, 64 container levels, 20,000 nodes and 8 MiB of
   scalar text, including anchor and alias copies.
   Script and issue-template prose checks stay separate. It reads files and makes
-  no remote change; Rust 1.85 or newer must be installed before the hygiene stage.
+  no remote change; Rust 1.89 or newer must be installed before the hygiene stage.
 - `mock_registry.py [PORT [WORKDIR]]` binds the loopback test registry with
   dummy credentials, recording `state.json` and `requests.log` in its work dir.
   It never talks to crates.io and is not a real credential exchange.

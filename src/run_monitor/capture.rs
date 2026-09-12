@@ -177,10 +177,10 @@ fn drain_stream<R: Read, W: Write>(
         }
         budget.record_chunk(written, read);
     }
-    if let Err(error) = writer.flush() {
-        if first_error.is_none() {
-            first_error = Some(error);
-        }
+    if let Err(error) = writer.flush()
+        && first_error.is_none()
+    {
+        first_error = Some(error);
     }
     CapturedStream {
         _writer: writer,

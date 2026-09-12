@@ -658,13 +658,13 @@ mod tests {
         struct OwnedRoot(std::path::PathBuf);
         impl Drop for OwnedRoot {
             fn drop(&mut self) {
-                if let Err(error) = std::fs::remove_dir_all(&self.0) {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!(
-                            "workflow fixture cleanup failed: {}: {error}",
-                            self.0.display()
-                        );
-                    }
+                if let Err(error) = std::fs::remove_dir_all(&self.0)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "workflow fixture cleanup failed: {}: {error}",
+                        self.0.display()
+                    );
                 }
             }
         }

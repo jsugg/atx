@@ -34,7 +34,7 @@ case "$*" in
     'check --workspace --all-targets --all-features --locked') stage=cargo-check ;;
     'test --workspace --all-targets --all-features --locked') stage=cargo-test ;;
     'clippy --workspace --all-targets --all-features --locked -- -D warnings') stage=cargo-clippy ;;
-    '+1.85.0 check --workspace --all-targets --all-features --locked') stage=cargo-msrv ;;
+    '+1.89.0 check --workspace --all-targets --all-features --locked') stage=cargo-msrv ;;
     'doc --no-deps --all-features') stage=cargo-doc ;;
     audit) stage=cargo-audit ;;
     'deny check') stage=cargo-deny ;;
@@ -83,13 +83,13 @@ printf '%s\n' rustc-msrv >>"$ATX_FAKE_LOG"
 if [ "${ATX_FAKE_FAIL_STAGE:-}" = rustc-msrv ]; then
     exit "${ATX_FAKE_FAIL_STATUS:-41}"
 fi
-printf '%s\n' "${ATX_FAKE_RUSTC_VERSION-rustc 1.85.0 (fixture)}"
+printf '%s\n' "${ATX_FAKE_RUSTC_VERSION-rustc 1.89.0 (fixture)}"
 SCRIPT
 chmod 0700 "$tmp/rustc"
 
 cat >"$tmp/rustup" <<'SCRIPT'
 #!/bin/sh
-if [ "$*" != 'which --toolchain 1.85.0 rustc' ]; then
+if [ "$*" != 'which --toolchain 1.89.0 rustc' ]; then
     printf 'unexpected rustup command: %s\n' "$*" >&2
     exit 97
 fi
@@ -285,7 +285,7 @@ assert_failure msrv rustc-msrv 41
 assert_failure msrv cargo-msrv 41
 
 for mode in msrv static full pre-merge; do
-    for version in 'rustc 1.97.0 (fixture)' 'rustc 1.85.1 (fixture)' ''; do
+    for version in 'rustc 1.97.0 (fixture)' 'rustc 1.89.1 (fixture)' ''; do
         : >"$ATX_FAKE_LOG"
         status=0
         ATX_FAKE_RUSTC_VERSION="$version" PATH="$tmp:$PATH" \

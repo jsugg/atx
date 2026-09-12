@@ -332,10 +332,10 @@ fn map_write_error(error: rusqlite::Error) -> StoreError {
 }
 
 fn map_read_error(error: rusqlite::Error) -> StoreError {
-    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error {
-        if let Some(StoreError::Corrupt(message)) = source.downcast_ref::<StoreError>() {
-            return StoreError::Corrupt(message.clone());
-        }
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error
+        && let Some(StoreError::Corrupt(message)) = source.downcast_ref::<StoreError>()
+    {
+        return StoreError::Corrupt(message.clone());
     }
     StoreError::Sqlite(error)
 }

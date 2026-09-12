@@ -101,7 +101,7 @@ not a record that they have passed.
 
 | ID | Requirement | Where it is checked |
 | --- | --- | --- |
-| R1 | Current-toolchain and actual Rust 1.85 MSRV gates pass. | [Shared check stages](../scripts/check.sh) and [CI](../.github/workflows/ci.yml) |
+| R1 | Current-toolchain and actual Rust 1.89 MSRV gates pass. | [Shared check stages](../scripts/check.sh) and [CI](../.github/workflows/ci.yml) |
 | R2 | All Tier 1 targets build and their native/user variants pass. | [Platform workflow](../.github/workflows/platform.yml) and [supported targets](platform-support.md) |
 | R3 | Dependency, license, source and security checks pass. | [Dependency policy](../deny.toml), [security workflow](../.github/workflows/security.yml), and [CodeQL](../.github/workflows/codeql.yml) |
 | R4 | Clean package dry-run and fresh extracted-bin tests pass. | [Package stage](../scripts/check.sh) and [CI package job](../.github/workflows/ci.yml) |

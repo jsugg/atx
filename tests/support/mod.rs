@@ -778,13 +778,14 @@ pub(crate) fn kill_session_supervisor(state: &Path) -> Result<(), String> {
     if wait_until(CLEANUP_TIMEOUT, || process_identity_is_terminal(&identity))? {
         let pid = i32::try_from(identity.pid).map_err(|error| error.to_string())?;
         let parent = i32::try_from(std::process::id()).map_err(|error| error.to_string())?;
-        if let Some(row) = process_row_with_deadline(pid, Instant::now() + CENSUS_TIMEOUT)? {
-            if row.is_terminal() && row.parent_pid == parent {
-                let current = inspect_process_identity(pid, &boot_identity()?)?;
-                // Crash fixtures own adopted session children; observers never consume their status.
-                if !reap_terminal_with_identity(&identity, &row, current, reap_terminal_child)? {
-                    return Err(format!("cannot safely reap stopped supervisor PID {pid}"));
-                }
+        if let Some(row) = process_row_with_deadline(pid, Instant::now() + CENSUS_TIMEOUT)?
+            && row.is_terminal()
+            && row.parent_pid == parent
+        {
+            let current = inspect_process_identity(pid, &boot_identity()?)?;
+            // Crash fixtures own adopted session children; observers never consume their status.
+            if !reap_terminal_with_identity(&identity, &row, current, reap_terminal_child)? {
+                return Err(format!("cannot safely reap stopped supervisor PID {pid}"));
             }
         }
         Ok(())

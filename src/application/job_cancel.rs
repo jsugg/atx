@@ -453,10 +453,10 @@ mod tests {
             now: UtcTimestamp,
         ) -> Result<Job, JobCancellationStoreError> {
             assert_eq!(id, self.job.id());
-            if state != JobState::CancelRequested {
-                if let Some(error) = &self.completion_failure {
-                    return Err(error.clone());
-                }
+            if state != JobState::CancelRequested
+                && let Some(error) = &self.completion_failure
+            {
+                return Err(error.clone());
             }
             if state == JobState::CancelRequested {
                 self.request_attempts += 1;
