@@ -245,30 +245,68 @@ fn normalize_man_page(raw: &str, root_name: &str) -> String {
 }
 
 #[cfg(feature = "man")]
-fn render_man_page(
+fn render_man_page_text(
     man: &clap_mangen::Man,
-    path: &std::path::Path,
+    page_name: &str,
     root_name: &str,
-) -> Result<(), String> {
-    use std::io::Write;
-
+) -> Result<String, String> {
     let mut generated = Vec::new();
     man.render(&mut generated)
-        .map_err(|error| format!("render {}: {error}", path.display()))?;
+        .map_err(|error| format!("render {page_name}.1: {error}"))?;
     let generated = String::from_utf8(generated)
-        .map_err(|error| format!("render {} as UTF-8: {error}", path.display()))?;
-    let normalized = normalize_man_page(&generated, root_name);
-    let file = std::fs::File::create(path)
-        .map_err(|error| format!("create {}: {error}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
-    writer
-        .write_all(normalized.as_bytes())
-        .map_err(|error| format!("write {}: {error}", path.display()))?;
-    writer.flush().map_err(|error| format!("flush: {error}"))
+        .map_err(|error| format!("render {page_name}.1 as UTF-8: {error}"))?;
+    Ok(normalize_man_page(&generated, root_name))
 }
 
 #[cfg(feature = "man")]
-fn remove_stale_man_pages(out_dir: &std::path::Path, root_name: &str) -> Result<(), String> {
+fn stage_man_pages(
+    out_dir: &std::path::Path,
+    rendered: &[(String, String)],
+) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String> {
+    use std::io::Write;
+
+    for (file_name, _) in rendered {
+        let dest = out_dir.join(file_name);
+        if let Ok(meta) = std::fs::symlink_metadata(&dest) {
+            if meta.is_dir() {
+                return Err(format!("cannot overwrite directory {}", dest.display()));
+            }
+        }
+    }
+
+    let pid = std::process::id();
+    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        Vec::with_capacity(rendered.len());
+    for (index, (file_name, content)) in rendered.iter().enumerate() {
+        let tmp_path = out_dir.join(format!(".atx-man-{pid}-{index}.tmp"));
+        let dest_path = out_dir.join(file_name);
+        let write_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .and_then(|file| {
+                let mut writer = std::io::BufWriter::new(file);
+                writer.write_all(content.as_bytes())?;
+                writer.flush()
+            });
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            for (staged_tmp, _) in &staged {
+                let _ = std::fs::remove_file(staged_tmp);
+            }
+            return Err(format!("stage {}: {error}", dest_path.display()));
+        }
+        staged.push((tmp_path, dest_path));
+    }
+    Ok(staged)
+}
+
+#[cfg(feature = "man")]
+fn remove_stale_man_pages(
+    out_dir: &std::path::Path,
+    root_name: &str,
+    keep: &std::collections::BTreeSet<&str>,
+) -> Result<(), String> {
     let stale_prefix = format!("{root_name}-");
     let root_file = format!("{root_name}.1");
     for entry in std::fs::read_dir(out_dir)
@@ -279,10 +317,15 @@ fn remove_stale_man_pages(out_dir: &std::path::Path, root_name: &str) -> Result<
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        if (file_name == root_file
-            || (file_name.starts_with(&stale_prefix) && file_name.ends_with(".1")))
-            && entry.path().is_file()
-        {
+        let managed = file_name == root_file
+            || (file_name.starts_with(&stale_prefix) && file_name.ends_with(".1"));
+        if !managed || keep.contains(file_name) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("stat stale {}: {error}", entry.path().display()))?;
+        if file_type.is_file() || file_type.is_symlink() {
             std::fs::remove_file(entry.path())
                 .map_err(|error| format!("remove stale {}: {error}", entry.path().display()))?;
         }
@@ -299,22 +342,36 @@ fn export_man_pages_with_date(out_dir: &std::path::Path, date: &str) -> Result<(
     cmd.build();
     let name = cmd.get_name().to_owned();
     let source = format!("{name} {}", env!("CARGO_PKG_VERSION"));
-    remove_stale_man_pages(out_dir, &name)?;
 
     let mut pages = vec![(name.clone(), cmd.clone())];
     collect_man_pages(&cmd, &name, true, &mut pages);
+
+    let mut rendered = Vec::with_capacity(pages.len());
     for (page_name, page_cmd) in pages {
-        let path = out_dir.join(format!("{page_name}.1"));
-        render_man_page(
+        let text = render_man_page_text(
             &clap_mangen::Man::new(page_cmd)
                 .title(page_name.to_ascii_uppercase())
                 .date(date)
                 .source(&source),
-            &path,
+            &page_name,
             &name,
         )?;
+        rendered.push((format!("{page_name}.1"), text));
     }
-    Ok(())
+
+    let staged = stage_man_pages(out_dir, &rendered)?;
+    for (index, (tmp_path, dest_path)) in staged.iter().enumerate() {
+        if let Err(error) = std::fs::rename(tmp_path, dest_path) {
+            for (remaining_tmp, _) in &staged[index..] {
+                let _ = std::fs::remove_file(remaining_tmp);
+            }
+            return Err(format!("install {}: {error}", dest_path.display()));
+        }
+    }
+
+    let keep: std::collections::BTreeSet<&str> =
+        rendered.iter().map(|(file, _)| file.as_str()).collect();
+    remove_stale_man_pages(out_dir, &name, &keep)
 }
 
 fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode {
@@ -2217,6 +2274,45 @@ mod tests {
                 .lines()
                 .any(|line| line == ".SH EXAMPLES"),
             "atx-service.1 missing .SH EXAMPLES"
+        );
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn man_page_export_preserves_existing_pages_on_failure_and_replaces_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("root");
+        let existing = root.path().join("atx.1");
+        fs::write(&existing, b"working manual").expect("existing page");
+        let blocker_dir = root.path().join("atx-list.1");
+        fs::create_dir(&blocker_dir).expect("blocking directory");
+        assert!(super::export_man_pages_with_date(root.path(), "2026-09-10").is_err());
+        assert_eq!(
+            fs::read(&existing).expect("existing page preserved"),
+            b"working manual"
+        );
+        fs::remove_dir(&blocker_dir).expect("remove blocker");
+
+        let external_target = root.path().join("outside-target.txt");
+        let dangling_link = root.path().join("atx-obsolete.1");
+        let current_link = root.path().join("atx-show.1");
+        symlink(root.path().join("missing-target"), &dangling_link).expect("dangling link");
+        symlink(&external_target, &current_link).expect("current link");
+
+        super::export_man_pages_with_date(root.path(), "2026-09-10").expect("export");
+        assert!(
+            fs::symlink_metadata(&dangling_link).is_err(),
+            "dangling stale symlink must be removed"
+        );
+        assert!(
+            !external_target.exists(),
+            "export must not write through an existing symlink"
+        );
+        let show_meta = fs::symlink_metadata(&current_link).expect("installed page");
+        assert!(
+            show_meta.file_type().is_file(),
+            "installed page must be a regular file, not a symlink"
         );
     }
 

@@ -553,7 +553,8 @@ EXAMPLES:
       given as a unique prefix.
 
   atx show <job> --json
-      Same data as a single JSON object.
+      Job metadata as a single JSON object; read run outcomes from history
+      or output.
 ";
 
 const CANCEL_EXAMPLES: &str = "\

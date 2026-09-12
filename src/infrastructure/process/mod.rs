@@ -272,8 +272,10 @@ fn inspect_zombie_via_sysctl(
     // and x86_64; sysctl rejects smaller buffers with ENOMEM. Field offsets
     // verified with offsetof() against <sys/sysctl.h>.
     // `kp_proc.p_starttime.tv_sec` at offset 0 is an 8-byte little-endian
-    // `time_t`; reading 4 bytes intentionally takes its low 32 bits as an
-    // equality token alongside `tv_usec`, not a general-purpose timestamp.
+    // `time_t`. Reading 4 bytes as signed `i32` yields a low-32-bit equality
+    // token that matches `proc_pidinfo`'s full `pbi_start_tvsec` while
+    // `tv_sec < 2^31`; starting at `2^31` (year 2038), `start_token` becomes
+    // negative and this fallback returns `Malformed` instead of matching.
     const KINFO_PROC_SIZE: usize = 648;
     const STARTTIME_SEC_OFFSET: usize = 0;
     const STARTTIME_USEC_OFFSET: usize = 8;
