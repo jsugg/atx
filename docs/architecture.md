@@ -29,6 +29,10 @@ The CLI creates jobs with direct argv execution by default. The supervisor claim
 due occurrences; the monitor owns process creation, output capture, completion,
 and the final run record.
 
+The supervisor keeps each monitor's child handle and reaps it on an exit
+notification. A still-running monitor does not delay reaping the others.
+Monitor startup restores the signal mask from before supervisor setup.
+
 ## State machines
 
 A job starts as `scheduled`, then the supervisor moves it to `waiting` and,

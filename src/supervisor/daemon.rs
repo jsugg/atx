@@ -2,13 +2,15 @@
 
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::os::unix::thread::JoinHandleExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use thiserror::Error;
 
+use super::children::MonitorChildren;
 use super::heap::DeadlineHeap;
 use super::ipc::{IpcMessage, RuntimeGuard, read_frame, write_frame};
 use super::loop_driver::{SupervisorEvent, reconcile_wall_schedule, run_loop};
@@ -35,6 +37,131 @@ fn stop_signal_set() -> libc::sigset_t {
         libc::sigaddset(set_ptr, libc::SIGINT);
     }
     set
+}
+
+fn supervisor_signal_set() -> libc::sigset_t {
+    let mut set = stop_signal_set();
+    // SAFETY: set is initialized and its pointer remains valid for the call.
+    unsafe { libc::sigaddset(&raw mut set, libc::SIGCHLD) };
+    set
+}
+
+fn current_signal_mask() -> std::io::Result<libc::sigset_t> {
+    // SAFETY: the output pointer is valid; a null input only queries this thread's mask.
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &raw mut mask) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result));
+    }
+    Ok(mask)
+}
+
+// A caught disposition keeps macOS from discarding blocked SIGCHLD notifications.
+extern "C" fn child_exit_notification(_: libc::c_int) {}
+
+fn start_signal_worker(
+    children: Arc<MonitorChildren>,
+    sender: mpsc::Sender<SupervisorEvent>,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
+    start_signal_worker_with_configuration(children, sender, configure_supervisor_signals)
+}
+
+fn configure_supervisor_signals() -> std::io::Result<()> {
+    let mask = supervisor_signal_set();
+    // SAFETY: the initialized mask pointer is valid for this call.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const mask, std::ptr::null_mut()) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result));
+    }
+    // SAFETY: a zeroed sigaction is initialized with a valid handler and signal set below.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = child_exit_notification as *const () as usize;
+    action.sa_flags = libc::SA_NOCLDSTOP;
+    // SAFETY: both pointers are valid and the handler makes no async-signal-unsafe calls.
+    if unsafe {
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(libc::SIGCHLD, &raw const action, std::ptr::null_mut())
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn start_signal_worker_with_configuration(
+    children: Arc<MonitorChildren>,
+    sender: mpsc::Sender<SupervisorEvent>,
+    configure: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
+    configure()?;
+    std::thread::Builder::new()
+        .name("atx-signals".into())
+        .spawn(move || {
+            let result = watch_signals(&children, &sender);
+            if let Err(error) = &result {
+                eprintln!("atx supervisor: monitor reaping or signal wait failed: {error}");
+                let _ = sender.send(SupervisorEvent::Shutdown);
+            }
+            result
+        })
+}
+
+fn stop_signal_worker(
+    worker: std::thread::JoinHandle<std::io::Result<()>>,
+) -> Result<(), DaemonError> {
+    if !worker.is_finished() {
+        #[cfg(target_env = "musl")]
+        // musl libc uses a pointer typedef; std exposes the same handle as a word.
+        let pthread = worker.as_pthread_t() as libc::pthread_t;
+        #[cfg(not(target_env = "musl"))]
+        let pthread = worker.as_pthread_t();
+        // SAFETY: the join handle owns the target thread until it is joined below.
+        let result = unsafe { libc::pthread_kill(pthread, libc::SIGTERM) };
+        if result != 0 && result != libc::ESRCH {
+            return Err(std::io::Error::from_raw_os_error(result).into());
+        }
+    }
+    worker
+        .join()
+        .map_err(|_| DaemonError::SignalThreadPanicked)??;
+    Ok(())
+}
+
+/// Process child exits and stop signals on the same bounded worker.
+fn watch_signals(
+    children: &MonitorChildren,
+    sender: &mpsc::Sender<SupervisorEvent>,
+) -> std::io::Result<()> {
+    let set = supervisor_signal_set();
+    watch_signals_with(
+        sender,
+        || {
+            let mut delivered = 0;
+            // SAFETY: both pointers are valid; these signals are blocked before threads start.
+            let result = unsafe { libc::sigwait(&raw const set, &raw mut delivered) };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+            Ok(delivered)
+        },
+        || children.reap(),
+    )
+}
+
+fn watch_signals_with(
+    sender: &mpsc::Sender<SupervisorEvent>,
+    mut wait: impl FnMut() -> std::io::Result<libc::c_int>,
+    mut reap: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    loop {
+        let delivered = wait()?;
+        reap()?;
+        if delivered != libc::SIGCHLD {
+            let _ = sender.send(SupervisorEvent::Shutdown);
+            return Ok(());
+        }
+    }
 }
 
 /// Startup recovery: open the store, apply operator-configured retention,
@@ -97,38 +224,30 @@ pub(crate) fn run_session_supervisor(
     // thread so the loop unwinds cleanly: the IPC thread is joined and the
     // runtime socket removed, instead of dying mid-write on the default
     // disposition.
-    let mask = stop_signal_set();
-    let mask_ptr = std::ptr::addr_of!(mask);
-    // SAFETY: takes only stack pointers and no pointer preconditions.
-    unsafe {
-        let _ = libc::pthread_sigmask(libc::SIG_SETMASK, mask_ptr.cast(), std::ptr::null_mut());
-    }
-    let (sender, receiver) = mpsc::channel();
-    let signal_sender = sender.clone();
-    std::thread::spawn(move || {
-        let mut delivered: i32 = 0;
-        let delivered_ptr = std::ptr::addr_of_mut!(delivered);
-        let mut set = stop_signal_set();
-        let set = std::ptr::addr_of_mut!(set);
-        // SAFETY: sigwait takes only stack pointers; the stop signals are
-        // blocked process-wide above, so no other thread can steal them.
-        unsafe {
-            libc::sigwait(set, delivered_ptr);
-        }
-        let _ = signal_sender.send(SupervisorEvent::Shutdown);
-    });
     let listener = runtime.listener().try_clone()?;
+    let fallback_elapsed = clock.now_elapsed()?;
+    let child_mask = current_signal_mask()?;
+    let children = Arc::new(MonitorChildren::default());
+    let (sender, receiver) = mpsc::channel();
+    let signal_thread = start_signal_worker(Arc::clone(&children), sender.clone())?;
     let ipc_database = database_path.clone();
     let event_sender = sender.clone();
-    let ipc_thread = std::thread::spawn(move || {
-        serve_ipc(&listener, &ipc_database, &event_sender);
-    });
+    let ipc_thread = match std::thread::Builder::new()
+        .name("atx-ipc".into())
+        .spawn(move || {
+            serve_ipc(&listener, &ipc_database, &event_sender);
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            stop_signal_worker(signal_thread)?;
+            return Err(error.into());
+        }
+    };
 
     let execution_database = database_path;
     let execution_state = state_directory.to_owned();
     let mut retries = DueFailureRetries::default();
     // Fallback clock reading if the elapsed clock fails mid-loop.
-    let fallback_elapsed = clock.now_elapsed()?;
     run_loop(
         &receiver,
         &mut heap,
@@ -149,6 +268,8 @@ pub(crate) fn run_session_supervisor(
                 &execution_state,
                 runtime_directory,
                 &jobs,
+                &children,
+                child_mask,
             );
             let now_elapsed = clock.now_elapsed().unwrap_or(fallback_elapsed);
             for (job_id, error) in failures {
@@ -175,9 +296,12 @@ pub(crate) fn run_session_supervisor(
     );
 
     request_ipc_shutdown(runtime_directory);
-    ipc_thread
+    let ipc_result = ipc_thread
         .join()
-        .map_err(|_| DaemonError::IpcThreadPanicked)?;
+        .map_err(|_| DaemonError::IpcThreadPanicked);
+    let signal_result = stop_signal_worker(signal_thread);
+    ipc_result?;
+    signal_result?;
     Ok(())
 }
 
@@ -339,12 +463,19 @@ fn execute_due_jobs(
     state_directory: &Path,
     runtime_directory: &Path,
     jobs: &[crate::domain::JobId],
+    children: &MonitorChildren,
+    child_mask: libc::sigset_t,
 ) -> Vec<(crate::domain::JobId, DaemonError)> {
     let mut failures = Vec::new();
     for &job_id in jobs {
-        if let Err(error) =
-            execute_single_due_job(database_path, state_directory, runtime_directory, job_id)
-        {
+        if let Err(error) = execute_single_due_job(
+            database_path,
+            state_directory,
+            runtime_directory,
+            job_id,
+            children,
+            child_mask,
+        ) {
             failures.push((job_id, error));
         }
     }
@@ -356,6 +487,8 @@ fn execute_single_due_job(
     state_directory: &Path,
     runtime_directory: &Path,
     job_id: crate::domain::JobId,
+    children: &MonitorChildren,
+    child_mask: libc::sigset_t,
 ) -> Result<(), DaemonError> {
     let clock = NativeClock;
     let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
@@ -396,7 +529,14 @@ fn execute_single_due_job(
         "run monitor claimed command",
         now,
     )?;
-    if let Err(error) = spawn_run_monitor(state_directory, runtime_directory, job.id(), run.id()) {
+    if let Err(error) = spawn_run_monitor(
+        state_directory,
+        runtime_directory,
+        job.id(),
+        run.id(),
+        children,
+        child_mask,
+    ) {
         let finished = clock.now_utc()?;
         store.record_run_terminal(
             run.id(),
@@ -422,6 +562,8 @@ fn spawn_run_monitor(
     runtime_directory: &Path,
     job_id: crate::domain::JobId,
     run_id: crate::domain::RunId,
+    children: &MonitorChildren,
+    child_mask: libc::sigset_t,
 ) -> Result<(), std::io::Error> {
     use crate::infrastructure::paths::open_or_create_private_append_log;
 
@@ -446,10 +588,17 @@ fn spawn_run_monitor(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
-    // SAFETY: `setsid` has no pointer preconditions and runs in the child just
-    // before exec.
+    // SAFETY: both syscalls are async-signal-safe and the mask pointer is valid after fork.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
+            if libc::sigprocmask(
+                libc::SIG_SETMASK,
+                &raw const child_mask,
+                std::ptr::null_mut(),
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::setsid() == -1 {
                 Err(std::io::Error::last_os_error())
             } else {
@@ -457,7 +606,7 @@ fn spawn_run_monitor(
             }
         });
     }
-    command.spawn().map(|_| ())
+    children.spawn(&mut command)
 }
 
 fn request_ipc_shutdown(runtime_directory: &Path) {
@@ -486,6 +635,8 @@ pub(crate) enum DaemonError {
     MissingJob,
     #[error("IPC thread panicked")]
     IpcThreadPanicked,
+    #[error("signal worker panicked")]
+    SignalThreadPanicked,
 }
 
 #[cfg(test)]
@@ -551,6 +702,97 @@ mod tests {
             assert_eq!(libc::sigismember(set_ptr, libc::SIGTERM), 1);
             assert_eq!(libc::sigismember(set_ptr, libc::SIGINT), 1);
         }
+    }
+
+    #[test]
+    fn signal_setup_failure_does_not_start_a_worker() {
+        let children = std::sync::Arc::new(super::MonitorChildren::default());
+        let (sender, receiver) = mpsc::channel();
+        let result = super::start_signal_worker_with_configuration(children, sender, || {
+            Err(std::io::Error::other("injected signal setup failure"))
+        });
+        assert_eq!(
+            result.expect_err("startup failure").to_string(),
+            "injected signal setup failure"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn signal_wait_failure_is_reported_without_reaping() {
+        let (sender, _receiver) = mpsc::channel();
+        let result = super::watch_signals_with(
+            &sender,
+            || Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            || panic!("failed wait must not try reaping"),
+        );
+        assert_eq!(
+            result.expect_err("wait failure").raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
+
+    #[test]
+    fn coalesced_child_notifications_reap_before_shutdown() {
+        let (sender, receiver) = mpsc::channel();
+        let mut signals = [libc::SIGCHLD, libc::SIGCHLD, libc::SIGTERM].into_iter();
+        let mut reaps = 0;
+        super::watch_signals_with(
+            &sender,
+            || Ok(signals.next().expect("signal")),
+            || {
+                reaps += 1;
+                Ok(())
+            },
+        )
+        .expect("watch signals");
+        assert_eq!(reaps, 3);
+        assert!(matches!(receiver.try_recv(), Ok(SupervisorEvent::Shutdown)));
+    }
+
+    #[test]
+    fn child_reaping_failure_is_reported() {
+        let (sender, _receiver) = mpsc::channel();
+        let error = super::watch_signals_with(
+            &sender,
+            || Ok(libc::SIGCHLD),
+            || Err(std::io::Error::other("injected reaping failure")),
+        )
+        .expect_err("reaping failure");
+        assert_eq!(error.to_string(), "injected reaping failure");
+    }
+
+    #[test]
+    fn signal_worker_can_be_stopped_and_joined() {
+        let (ready, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mask = super::stop_signal_set();
+            // SAFETY: this worker's initialized mask has a valid stack pointer.
+            let result = unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut())
+            };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+            ready.send(()).map_err(std::io::Error::other)?;
+            let mut signal = 0;
+            // SAFETY: both pointers are valid and these signals are blocked in this worker.
+            let result = unsafe { libc::sigwait(&raw const mask, &raw mut signal) };
+            if result != 0 {
+                return Err(std::io::Error::from_raw_os_error(result));
+            }
+            if signal != libc::SIGTERM {
+                return Err(std::io::Error::other("unexpected stop signal"));
+            }
+            Ok(())
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("signal worker ready");
+        super::stop_signal_worker(worker).expect("stop and join signal worker");
     }
 
     #[test]
@@ -942,6 +1184,8 @@ mod tests {
             root.path(),
             &runtime,
             &[JobId::new(), terminal.id()],
+            &super::MonitorChildren::default(),
+            super::current_signal_mask().expect("signal mask"),
         );
         assert!(failures.is_empty(), "{failures:?}");
     }
@@ -954,7 +1198,14 @@ mod tests {
         fs::create_dir_all(&runtime).expect("runtime dir");
         let _store = store_in(root.path());
         let db_path = root.path().join("atx.db");
-        let failures = execute_due_jobs(&db_path, root.path(), &runtime, &[]);
+        let failures = execute_due_jobs(
+            &db_path,
+            root.path(),
+            &runtime,
+            &[],
+            &super::MonitorChildren::default(),
+            super::current_signal_mask().expect("signal mask"),
+        );
         assert!(failures.is_empty());
     }
 
@@ -988,7 +1239,14 @@ mod tests {
         // The failure arm runs inside run_loop's due-callback; drive it
         // directly with one due job.
         let db_path = root.path().join("atx.db");
-        let failures = execute_due_jobs(&db_path, root.path(), &runtime, &[job.id()]);
+        let failures = execute_due_jobs(
+            &db_path,
+            root.path(),
+            &runtime,
+            &[job.id()],
+            &super::MonitorChildren::default(),
+            super::current_signal_mask().expect("signal mask"),
+        );
         assert!(
             failures.is_empty(),
             "spawn failures are contained: {failures:?}"
@@ -1053,6 +1311,8 @@ mod tests {
             root.path(),
             &runtime,
             &[corrupt.id(), healthy_a.id(), healthy_b.id()],
+            &super::MonitorChildren::default(),
+            super::current_signal_mask().expect("signal mask"),
         );
         assert_eq!(
             failures.len(),

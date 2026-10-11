@@ -5,6 +5,7 @@
 mod support;
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::Command;
@@ -23,7 +24,7 @@ fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
 }
 
-fn submit(state: &Path, delay: &str, command: &[&str]) {
+fn submit(state: &Path, delay: &str, command: &[&str]) -> String {
     let output = atx()
         .arg("--json")
         .arg("--state-dir")
@@ -34,6 +35,8 @@ fn submit(state: &Path, delay: &str, command: &[&str]) {
         .output()
         .expect("submit job");
     assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("submission JSON");
+    value["data"]["job_id"].as_str().expect("job ID").to_owned()
 }
 
 fn supervisor_pid(state: &Path) -> i32 {
@@ -229,9 +232,11 @@ fn teardown_covers_a_monitor_that_finishes_before_cleanup() {
     let state = root.path().join("state");
     let started = root.path().join("started");
     let marker = root.path().join("finished");
+    let release = root.path().join("release");
     let script = format!(
-        "'/usr/bin/touch' '{}' && '/bin/sleep' '1' && '/usr/bin/touch' '{}'",
+        "touch '{}' && while [ ! -f '{}' ]; do sleep 0.01; done && touch '{}'",
         started.display(),
+        release.display(),
         marker.display()
     );
     submit(&state, "1s", &["/bin/sh", "-c", &script]);
@@ -256,6 +261,7 @@ fn teardown_covers_a_monitor_that_finishes_before_cleanup() {
         },
         "supervisor, monitor, and command processes",
     );
+    fs::write(&release, b"").expect("release command");
     wait_for(|| marker.exists(), "short job to finish");
     let monitor_pid = monitor_pids[0];
     wait_for(
@@ -310,5 +316,195 @@ fn unwind_stops_supervisor_monitor_and_command_processes() {
         fixture_process_count(&fixture_path.expect("fixture path"))
             .expect("fixture process census"),
         0
+    );
+}
+
+fn assert_supervisor_reaps_monitors(service_managed: bool) {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let mut daemon = service_managed.then(|| {
+        let log = fs::File::create(root.path().join("daemon.err")).expect("daemon log");
+        atx()
+            .arg("__supervisor")
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--runtime-dir")
+            .arg(state.join("runtime"))
+            .arg("--service-managed")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("start service supervisor")
+    });
+    if service_managed {
+        wait_for(
+            || state.join("runtime/supervisor.sock").exists(),
+            "service supervisor socket",
+        );
+    }
+    submit(&state, "30m", &["/bin/true"]);
+    let supervisor = supervisor_pid(&state);
+
+    let long_started = root.path().join("long-started");
+    let long_release = root.path().join("long-release");
+    let long_script = format!(
+        "touch '{}' && while [ ! -f '{}' ]; do sleep 0.01; done",
+        long_started.display(),
+        long_release.display()
+    );
+    submit(&state, "1s", &["/bin/sh", "-c", &long_script]);
+    wait_for(|| long_started.exists(), "older monitor to start");
+    let long_monitors = fixture_monitor_process_ids(root.path()).expect("older monitor census");
+    assert_eq!(long_monitors.len(), 1);
+    let long_monitor = long_monitors[0];
+
+    for iteration in 0..3 {
+        let mut releases = Vec::new();
+        for child in 0..3 {
+            let started = root.path().join(format!("started-{iteration}-{child}"));
+            let release = root.path().join(format!("release-{iteration}-{child}"));
+            let script = format!(
+                "touch '{}' && while [ ! -f '{}' ]; do sleep 0.01; done",
+                started.display(),
+                release.display()
+            );
+            submit(&state, "1s", &["/bin/sh", "-c", &script]);
+            wait_for(|| started.exists(), "monitor to start its command");
+            releases.push(release);
+        }
+        let monitors = fixture_monitor_process_ids(root.path()).expect("monitor census");
+        assert_eq!(monitors.len(), 4, "{monitors:?}");
+        for release in releases {
+            fs::write(&release, b"").expect("release command");
+        }
+        for monitor in monitors.into_iter().filter(|pid| *pid != long_monitor) {
+            assert_process_gone(monitor);
+        }
+        assert!(process_exists(long_monitor).expect("older monitor census"));
+        assert!(process_exists(supervisor).expect("supervisor census"));
+        assert_eq!(supervisor_pid(&state), supervisor);
+    }
+    fs::write(&long_release, b"").expect("release older command");
+    assert_process_gone(long_monitor);
+    if let Some(daemon) = daemon.as_mut() {
+        assert!(daemon.try_wait().expect("daemon status").is_none());
+    }
+}
+
+#[test]
+fn session_supervisors_reap_monitors_while_future_work_remains() {
+    assert_supervisor_reaps_monitors(false);
+}
+
+#[test]
+fn service_supervisors_reap_monitors_without_restarting() {
+    assert_supervisor_reaps_monitors(true);
+}
+
+#[test]
+fn offline_aging_rejects_a_live_supervisor() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let job_id = submit(&state, "30m", &["/usr/bin/true"]);
+    let error = support::age_stopped_one_shot(&state, &job_id).expect_err("live supervisor");
+    assert_eq!(error, "cannot age a fixture while its supervisor is alive");
+}
+
+#[test]
+fn offline_aging_rejects_a_claimed_job() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    submit(&state, "30m", &["/usr/bin/true"]);
+    let marker = root.path().join("executed");
+    let job_id = submit(
+        &state,
+        "1s",
+        &["/usr/bin/touch", marker.to_str().expect("marker")],
+    );
+    wait_for(|| marker.exists(), "command to execute");
+    kill_session_supervisor(&state).expect("stop supervisor");
+    let error = support::age_stopped_one_shot(&state, &job_id).expect_err("claimed job");
+    assert!(
+        error.starts_with("offline fixture requires an unclaimed job:"),
+        "{error}"
+    );
+}
+
+fn block_probe_signal(command: &mut Command) {
+    // SAFETY: only async-signal-safe signal operations use stack pointers after fork.
+    unsafe {
+        command.pre_exec(|| {
+            let mut mask: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&raw mut mask) == -1
+                || libc::sigaddset(&raw mut mask, libc::SIGUSR1) == -1
+                || libc::sigprocmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut()) == -1
+            {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+#[test]
+fn monitors_restore_the_inherited_signal_mask_for_commands() {
+    let root = tempdir().expect("root");
+    let source = root.path().join("mask.c");
+    let probe = root.path().join("mask");
+    fs::write(
+        &source,
+        r#"
+#define _POSIX_C_SOURCE 200809L
+#include <signal.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    sigset_t mask;
+    if (argc != 2 || sigprocmask(SIG_SETMASK, NULL, &mask) != 0) return 2;
+    FILE *file = fopen(argv[1], "w");
+    if (file == NULL) return 3;
+    int written = fprintf(file, "%d %d %d %d\n", sigismember(&mask, SIGCHLD),
+        sigismember(&mask, SIGTERM), sigismember(&mask, SIGINT), sigismember(&mask, SIGUSR1));
+    int closed = fclose(file);
+    return written < 0 || closed != 0;
+}
+"#,
+    )
+    .expect("write signal probe");
+    let compiled = Command::new("cc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&probe)
+        .output()
+        .expect("compile signal probe");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let baseline_path = root.path().join("baseline");
+    let mut baseline = Command::new(&probe);
+    baseline.arg(&baseline_path);
+    block_probe_signal(&mut baseline);
+    assert!(baseline.status().expect("baseline probe").success());
+    let expected = fs::read_to_string(&baseline_path).expect("baseline mask");
+
+    let state = root.path().join("state");
+    let result_path = root.path().join("scheduled");
+    let mut submitted = atx();
+    submitted
+        .arg("--json")
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["1s", "--missed", "run-latest", "--"])
+        .arg(&probe)
+        .arg(&result_path);
+    block_probe_signal(&mut submitted);
+    let output = submitted.output().expect("submit signal probe");
+    assert!(output.status.success(), "{output:?}");
+    wait_for(
+        || fs::read_to_string(&result_path).is_ok_and(|value| value.ends_with('\n')),
+        "scheduled signal probe",
+    );
+    assert_eq!(
+        fs::read_to_string(&result_path).expect("scheduled mask"),
+        expected
     );
 }
