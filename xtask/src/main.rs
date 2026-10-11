@@ -1,23 +1,22 @@
 //! Repository maintenance tasks. Run with `cargo xtask <task>`.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("dist-man") => match dist_man() {
-            Ok(path) => {
-                println!("{}", path.display());
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("xtask dist-man: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        _ => {
-            eprintln!("usage: cargo xtask dist-man");
-            ExitCode::from(2)
+    if std::env::args().nth(1).as_deref() != Some("dist-man") {
+        eprintln!("usage: cargo xtask dist-man");
+        return ExitCode::from(2);
+    }
+    match dist_man() {
+        Ok(path) => {
+            println!("{}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("xtask dist-man: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -33,16 +32,30 @@ fn dist_man() -> Result<PathBuf, String> {
     // Instead it rebuilds the binary with the `man` feature, which unlocks a
     // hidden `__man <OUT_DIR>` export rendered by clap_mangen. This keeps
     // shipped binaries free of any roff-generation code.
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--bin", "atx", "--features", "man"])
+    let build = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--locked",
+            "--bin",
+            "atx",
+            "--features",
+            "man",
+            "--message-format=json-render-diagnostics",
+        ])
         .current_dir(&root)
-        .status()
+        .output()
         .map_err(|error| format!("cargo build: {error}"))?;
-    if !status.success() {
-        return Err("cargo build --features man failed".to_owned());
+    std::io::stderr()
+        .write_all(&build.stderr)
+        .map_err(|error| format!("write build diagnostics: {error}"))?;
+    if !build.status.success() {
+        return Err(format!(
+            "cargo build --features man failed: {}",
+            build.status
+        ));
     }
 
-    let atx = root.join("target").join("debug").join("atx");
+    let atx = artifact_executable(&build.stdout)?;
     let output = std::process::Command::new(&atx)
         .arg("__man")
         .arg(&out_dir)
@@ -59,10 +72,103 @@ fn dist_man() -> Result<PathBuf, String> {
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .map_err(|_| "CARGO_MANIFEST_DIR not set; run via `cargo xtask`".to_owned())?;
-    std::path::Path::new(&manifest)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| "xtask has no parent directory".to_owned())
+}
+
+/// Find the exact executable Cargo built, independent of target-directory settings.
+fn artifact_executable(output: &[u8]) -> Result<PathBuf, String> {
+    let text = std::str::from_utf8(output)
+        .map_err(|error| format!("Cargo output is not UTF-8: {error}"))?;
+    let mut executable = None;
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let message: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid Cargo build message: {error}"))?;
+        let reason = message
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Cargo build message has no reason")?;
+        if reason != "compiler-artifact" {
+            continue;
+        }
+        let target = message
+            .get("target")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("Cargo artifact has no target")?;
+        let name = target
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Cargo artifact has no target name")?;
+        if name != "atx" {
+            continue;
+        }
+        let kinds = target
+            .get("kind")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Cargo artifact has no target kinds")?;
+        if kinds.iter().any(|kind| !kind.is_string()) {
+            return Err("Cargo target kinds must be strings".into());
+        }
+        if !kinds.iter().any(|kind| kind.as_str() == Some("bin")) {
+            continue;
+        }
+        let value = message
+            .get("executable")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Cargo did not report the atx executable")?;
+        let path = Path::new(value);
+        if !path.is_absolute() || value.contains('\0') {
+            return Err("Cargo reported an invalid executable path".into());
+        }
+        if executable.replace(path.to_path_buf()).is_some() {
+            return Err("Cargo reported multiple atx executables".into());
+        }
+    }
+    executable.ok_or_else(|| "Cargo did not build an atx executable".into())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use proptest::prelude::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn cargo_reports_the_custom_binary_path() {
+        let messages = br#"{"reason":"compiler-artifact","target":{"name":"dependency","kind":["lib"]},"executable":null}
+{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":"/tmp/custom/debug/atx"}
+{"reason":"build-finished","success":true}"#;
+        assert_eq!(
+            super::artifact_executable(messages).expect("binary path"),
+            PathBuf::from("/tmp/custom/debug/atx")
+        );
+    }
+
+    #[test]
+    fn cargo_output_requires_one_valid_atx_binary() {
+        for messages in [
+            b"not JSON".as_slice(),
+            br#"{"reason":"build-finished","success":true}"#,
+            br#"{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":null}"#,
+            br#"{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":"relative/atx"}"#,
+            br#"{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":"/tmp/atx\u0000"}"#,
+            br#"{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":"/tmp/a"}
+{"reason":"compiler-artifact","target":{"name":"atx","kind":["bin"]},"executable":"/tmp/b"}"#,
+        ] {
+            assert!(super::artifact_executable(messages).is_err());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_cargo_output_never_panics(output in prop::collection::vec(any::<u8>(), 0..4096)) {
+            if let Ok(path) = super::artifact_executable(&output) {
+                prop_assert!(path.is_absolute());
+                prop_assert!(!path.as_os_str().as_encoded_bytes().contains(&0));
+            }
+        }
+    }
 }

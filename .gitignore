@@ -9,4 +9,5 @@ fuzz/coverage/
 mutants.out/
 .DS_Store
 .smoke-*
-.cargo/
+/.cargo/*
+!/.cargo/config.toml

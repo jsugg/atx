@@ -80,7 +80,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mandoc shellcheck
       - name: Generate and lint man pages
         run: |
-          cargo run --locked -p xtask -- dist-man
+          cargo test --locked --package xtask
+          cargo clippy --locked --package xtask --all-targets -- -D warnings
+          cargo xtask dist-man
+          CARGO_TARGET_DIR="$RUNNER_TEMP/man-target" cargo xtask dist-man
           mandoc -T lint dist/man/*.1
 
   fmt:
