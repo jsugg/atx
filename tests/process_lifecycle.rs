@@ -319,6 +319,114 @@ fn unwind_stops_supervisor_monitor_and_command_processes() {
     );
 }
 
+#[test]
+fn service_readiness_requires_a_healthy_initialized_database() {
+    let ready = serde_json::json!({
+        "schema_version":1, "ok":true,
+        "data":{"healthy":true, "schema_version":1},
+    });
+    assert!(support::service_report_is_ready(&ready));
+    for database_schema in [
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!("1"),
+    ] {
+        let mut report = ready.clone();
+        report["data"]["schema_version"] = database_schema;
+        assert!(!support::service_report_is_ready(&report));
+    }
+    let mut failed = ready.clone();
+    failed["data"]["healthy"] = serde_json::json!(false);
+    assert!(!support::service_report_is_ready(&failed));
+    failed = ready;
+    failed["ok"] = serde_json::json!(false);
+    assert!(!support::service_report_is_ready(&failed));
+    assert!(!support::service_report_is_ready(&serde_json::json!({})));
+}
+
+#[test]
+fn service_readiness_reports_early_exit_and_reaps_the_child() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let log = root.path().join("daemon.err");
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "echo startup-fault >&2; exit 9"])
+        .stderr(fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("failing service");
+    let error = support::wait_for_service(&mut child, &state, &state.join("runtime"), &log)
+        .expect_err("early service exit");
+    assert!(error.contains("startup-fault"), "{error}");
+    assert!(error.contains("exited before readiness"), "{error}");
+    assert_eq!(
+        child
+            .try_wait()
+            .expect("reaped child")
+            .expect("exit")
+            .code(),
+        Some(9)
+    );
+}
+
+#[test]
+fn terminal_aging_rejects_live_and_unclaimed_fixtures_without_changes() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let job_id = submit(&state, "30m", &["/bin/true"]);
+    assert!(support::age_stopped_terminal_job(&state, &job_id, 2).is_err());
+    assert!(support::age_stopped_terminal_job(&state, &job_id, 0).is_err());
+    root.stop_background().expect("stop fixture");
+    let before = fs::read(state.join("atx.db")).expect("database");
+    assert!(support::age_stopped_terminal_job(&state, &job_id, 2).is_err());
+    assert_eq!(
+        fs::read(state.join("atx.db")).expect("database after guard"),
+        before
+    );
+}
+
+#[test]
+fn service_readiness_timeout_is_bounded_and_does_not_signal_the_child() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let log = root.path().join("daemon.err");
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "read token"])
+        .stdin(std::process::Stdio::piped())
+        .stderr(fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("held service");
+    let started = Instant::now();
+    let result = support::wait_for_service_with_timeout(
+        &mut child,
+        &state,
+        &state.join("runtime"),
+        &log,
+        Duration::from_millis(1),
+    );
+    let elapsed = started.elapsed();
+    let still_running = child.try_wait().expect("child status").is_none();
+    if still_running {
+        child.kill().expect("stop held child");
+        child.wait().expect("reap held child");
+    }
+    assert!(still_running);
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert!(
+        result
+            .expect_err("readiness timeout")
+            .contains("readiness timed out")
+    );
+}
+
+#[test]
+fn terminal_aging_never_creates_a_missing_database() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    fs::create_dir(&state).expect("state directory");
+    assert!(support::age_stopped_terminal_job(&state, "00000000000000000000000000", 2).is_err());
+    assert!(!state.join("atx.db").exists());
+}
+
 fn assert_supervisor_reaps_monitors(service_managed: bool) {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
@@ -337,11 +445,14 @@ fn assert_supervisor_reaps_monitors(service_managed: bool) {
             .spawn()
             .expect("start service supervisor")
     });
-    if service_managed {
-        wait_for(
-            || state.join("runtime/supervisor.sock").exists(),
-            "service supervisor socket",
-        );
+    if let Some(daemon) = daemon.as_mut() {
+        support::wait_for_service(
+            daemon,
+            &state,
+            &state.join("runtime"),
+            &root.path().join("daemon.err"),
+        )
+        .expect("service supervisor readiness");
     }
     submit(&state, "30m", &["/bin/true"]);
     let supervisor = supervisor_pid(&state);
