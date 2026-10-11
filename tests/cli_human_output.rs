@@ -187,6 +187,13 @@ fn documented_version_example_matches_the_binary() {
 }
 
 #[test]
+fn documented_outcome_examples_match_the_serializer_fixture() {
+    let expected: Value = serde_json::from_str(include_str!("fixtures/json-outcomes-v1.json"))
+        .expect("outcome contract fixture");
+    assert_eq!(documented_example("### Outcome examples"), expected);
+}
+
+#[test]
 fn documented_error_example_matches_the_binary() {
     let root = tempdir().expect("root");
     let output = tools(root.path())

@@ -27,3 +27,6 @@ wrong tool versions fail with an actionable message.
 `check-package-list.sh PACKAGE_LIST` checks Cargo's package file list. Embedded
 test fixtures are required and allowed; other tests and internal directories are
 excluded. Paths must be relative and contain no traversal components.
+
+The required CI package job also tests the bin from a freshly extracted source
+archive. Workspace tests alone cannot catch a missing packaged test fixture.

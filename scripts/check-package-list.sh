@@ -10,7 +10,7 @@ fi
 list=$1
 
 for required in Cargo.toml Cargo.lock README.md CHANGELOG.md LICENSE-MIT src/main.rs \
-    tests/fixtures/exit-codes-v1.json; do
+    tests/fixtures/exit-codes-v1.json tests/fixtures/json-outcomes-v1.json; do
     if ! grep -Fx "$required" "$list" >/dev/null; then
         printf 'package is missing %s\n' "$required" >&2
         exit 1
