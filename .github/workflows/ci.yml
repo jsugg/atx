@@ -128,8 +128,8 @@ jobs:
         with:
           toolchain: 1.85.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: cargo check at MSRV
-        run: cargo check --all-targets --all-features --locked
+      - name: Check minimum supported Rust
+        run: scripts/check.sh msrv
 
   test-linux:
     name: tests (linux)

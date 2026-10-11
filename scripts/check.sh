@@ -40,11 +40,26 @@ quick() {
     cargo clippy --all-targets --all-features --locked -- -D warnings || return $?
 }
 
+msrv() {
+    compiler=$(rustup which --toolchain 1.85.0 rustc) || return $?
+    version=$("$compiler" --version) || return $?
+    case "$version" in
+        'rustc 1.85.0 '*) ;;
+        *)
+            printf 'wrong MSRV compiler: expected Rust 1.85.0, got %s\n' "$version" >&2
+            return 2
+            ;;
+    esac
+    printf '%s\n' "$version"
+    RUSTC="$compiler" RUSTC_WRAPPER='' RUSTC_WORKSPACE_WRAPPER='' \
+        cargo +1.85.0 check --all-targets --all-features --locked || return $?
+}
+
 # Extended static evidence on top of quick. Still not the release gate:
 # coverage floors, mutation, fuzz budgets, and performance evidence run as
 # dedicated scheduled/release workflows (see .github/workflows).
 static() {
-    cargo +1.85.0 check --all-targets --all-features --locked || return $?
+    msrv || return $?
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features || return $?
 
     require_version cargo-audit 0.22.2 || return $?
@@ -75,9 +90,11 @@ case "$mode" in
         static || exit $?
         ;;
     static) static || exit $? ;;
+    msrv) msrv || exit $? ;;
     *)
-        printf 'usage: %s quick|static|full\n' "$0" >&2
+        printf 'usage: %s quick|msrv|static|full\n' "$0" >&2
         printf '  quick  fmt+check+test+clippy (pre-merge)\n' >&2
+        printf '  msrv   verify and check with Rust 1.85.0 (no compiler wrappers)\n' >&2
         printf '  static MSRV+doc+audit+deny+mdlint+lychee+package (extended)\n' >&2
         printf '  full   quick+static (kept as an alias)\n' >&2
         exit 2

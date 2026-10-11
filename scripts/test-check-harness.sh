@@ -31,11 +31,46 @@ printf '%s\n' "$stage" >>"$ATX_FAKE_LOG"
 if [ "${ATX_FAKE_FAIL_STAGE:-}" = "$stage" ]; then
     exit "${ATX_FAKE_FAIL_STATUS:-41}"
 fi
+if [ "$stage" = cargo-msrv ]; then
+    if [ "${RUSTC:-}" != "$ATX_FAKE_COMPILER_PATH" ] \
+        || [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${RUSTC_WORKSPACE_WRAPPER:-}" ]; then
+        printf 'msrv did not bind Cargo to the verified compiler\n' >&2
+        exit 97
+    fi
+fi
 if [ "$stage" = cargo-package ]; then
     cat "$ATX_PACKAGE_LIST"
 fi
 SCRIPT
 chmod 0700 "$tmp/cargo"
+
+cat >"$tmp/rustc" <<'SCRIPT'
+#!/bin/sh
+if [ "$*" != '--version' ]; then
+    printf 'unexpected rustc command: %s\n' "$*" >&2
+    exit 97
+fi
+printf '%s\n' rustc-msrv >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = rustc-msrv ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
+fi
+printf '%s\n' "${ATX_FAKE_RUSTC_VERSION-rustc 1.85.0 (fixture)}"
+SCRIPT
+chmod 0700 "$tmp/rustc"
+
+cat >"$tmp/rustup" <<'SCRIPT'
+#!/bin/sh
+if [ "$*" != 'which --toolchain 1.85.0 rustc' ]; then
+    printf 'unexpected rustup command: %s\n' "$*" >&2
+    exit 97
+fi
+printf '%s\n' rustup-msrv >>"$ATX_FAKE_LOG"
+if [ "${ATX_FAKE_FAIL_STAGE:-}" = rustup-msrv ]; then
+    exit "${ATX_FAKE_FAIL_STATUS:-41}"
+fi
+printf '%s\n' "$ATX_FAKE_COMPILER_PATH"
+SCRIPT
+chmod 0700 "$tmp/rustup"
 
 cat >"$tmp/versioned-tool" <<'SCRIPT'
 #!/bin/sh
@@ -75,6 +110,7 @@ ln -s remote-command "$tmp/git"
 ln -s remote-command "$tmp/gh"
 
 export ATX_FAKE_LOG="$tmp/calls"
+export ATX_FAKE_COMPILER_PATH="$tmp/rustc"
 export ATX_PACKAGE_LIST="$tmp/package-good"
 cat >"$ATX_PACKAGE_LIST" <<'LIST'
 .cargo_vcs_info.json
@@ -139,7 +175,7 @@ for stage in cargo-fmt cargo-check cargo-test cargo-clippy; do
 done
 
 for stage in \
-    cargo-msrv cargo-doc \
+    rustup-msrv rustc-msrv cargo-msrv cargo-doc \
     cargo-audit-version cargo-deny-version mdlint-version lychee-version \
     cargo-audit cargo-deny mdlint lychee cargo-package cargo-publish
 do
@@ -147,13 +183,43 @@ do
     assert_failure full "$stage" 41
 done
 
+assert_failure msrv rustup-msrv 41
+assert_failure msrv rustc-msrv 41
+assert_failure msrv cargo-msrv 41
+
+for mode in msrv static full; do
+    for version in 'rustc 1.97.0 (fixture)' 'rustc 1.85.1 (fixture)' ''; do
+        : >"$ATX_FAKE_LOG"
+        status=0
+        ATX_FAKE_RUSTC_VERSION="$version" PATH="$tmp:$PATH" \
+            scripts/check.sh "$mode" >/dev/null 2>&1 || status=$?
+        if [ "$status" -ne 2 ] || [ "$(tail -n 1 "$ATX_FAKE_LOG")" != rustc-msrv ]; then
+            printf '%s accepted an invalid MSRV compiler: %s\n' "$mode" "$version" >&2
+            exit 1
+        fi
+    done
+done
+
 assert_package_policy_failure static
 assert_package_policy_failure full
 
-for mode in quick static full; do
+for mode in quick static full msrv; do
     : >"$ATX_FAKE_LOG"
     PATH="$tmp:$PATH" scripts/check.sh "$mode"
 done
+expected_calls=$(printf 'rustup-msrv\nrustc-msrv\ncargo-msrv')
+if [ "$(cat "$ATX_FAKE_LOG")" != "$expected_calls" ]; then
+    printf 'msrv did not use the explicit compiler and Cargo toolchain\n' >&2
+    exit 1
+fi
+
+: >"$ATX_FAKE_LOG"
+RUSTC=wrong-compiler RUSTC_WRAPPER=wrong-wrapper RUSTC_WORKSPACE_WRAPPER=wrong-wrapper \
+    PATH="$tmp:$PATH" scripts/check.sh msrv >/dev/null
+if [ "$(cat "$ATX_FAKE_LOG")" != "$expected_calls" ]; then
+    printf 'msrv did not isolate inherited compiler overrides\n' >&2
+    exit 1
+fi
 scripts/check-package-list.sh "$ATX_PACKAGE_LIST"
 
 printf 'quality-harness-tests: PASS\n'
