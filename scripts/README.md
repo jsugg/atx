@@ -23,3 +23,7 @@ cargo install lychee --version 0.24.2 --locked
 
 The scripts install nothing and never write to GitHub or crates.io. Missing or
 wrong tool versions fail with an actionable message.
+
+`check-package-list.sh PACKAGE_LIST` checks Cargo's package file list. Embedded
+test fixtures are required and allowed; other tests and internal directories are
+excluded. Paths must be relative and contain no traversal components.
