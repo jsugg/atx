@@ -20,6 +20,11 @@ cargo test --all-targets --all-features --locked
 
 Run `./scripts/check.sh full` before calling a phase complete.
 
+For Markdown-only edits, run `./scripts/check.sh markdown`. It uses the same
+pinned tool, config, and tracked-file scope as CI. Node.js 22+ and npm are
+required; `npx` can download the tool into its cache. Stage new Markdown files
+with `git add` so the shared check includes them.
+
 The retention integration test uses the `sqlite3` command. Install it before
 running the full suite.
 

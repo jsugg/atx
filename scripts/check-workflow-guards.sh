@@ -29,7 +29,9 @@ for workflow in .github/workflows/*.yml; do
     actionlint "$workflow"
 done
 
-require_pattern .github/workflows/ci.yml 'markdownlint-cli2@[0-9]+\.[0-9]+\.[0-9]+'
+require_literal .github/workflows/ci.yml '          scripts/check.sh markdown'
+require_literal .github/workflows/ci.yml '          scripts/test-markdown-harness.sh --real'
+require_pattern scripts/check-markdown.sh 'markdownlint-cli2@0\.23\.2'
 require_pattern .github/workflows/ci.yml 'ACTIONLINT_VERSION:[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+'
 require_pattern .github/workflows/ci.yml 'rhysd/actionlint/releases/download/'
 require_pattern .github/workflows/ci.yml 'sha256sum --check'
