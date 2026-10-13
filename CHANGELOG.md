@@ -4,34 +4,11 @@ This file tracks user-visible changes. It follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning.
 
-## Unreleased
+## [0.1.1] - Unreleased
 
-### Added
-
-## [0.1.1] - 2026-08-26
-
-### Changed
-
-- Human-readable job and run output now uses local timestamps with a numeric
-  offset, clearer outcome text, and short messages for empty lists.
-- `-v` is a single verbose switch; repeated `-vv` is rejected instead of
-  implying additional undocumented verbosity levels.
-
-### Fixed
-
-- Run updates now use the same checked transition table as the rest of the
-  scheduler, including cancellation precedence.
-- Late cancellation no longer races against an unfinished history row in the
-  acceptance test.
-- `list`, `history`, and `ps` return an empty result on a fresh install instead
-  of reporting a missing database.
-- Invalid relative durations keep their duration-specific error messages.
-- Cancellation update conflicts return the documented state-conflict status,
-  and `show` no longer hides run-history storage errors.
-- Release archives now include checked SBOMs, checksums, and provenance, and
-  both protected release environments accept version tags.
-
-## [0.1.0] - 2026-08-26
+First public release candidate. No GitHub release or crate has been published
+yet. The public `v0.1.0` tag below was an unpublished rehearsal, not a supported
+release. The publication date will be recorded when this version ships.
 
 ### Added
 
@@ -49,33 +26,19 @@ versioning.
   process identity, supervisor state, timezone data, configuration, and
   durable-service support.
 - Stable human and `--json` output envelopes.
+- Local timestamps with numeric offsets in human output, bounded log tails,
+  and `atx output` for captured streams. Optional `--tty` echo validates the
+  terminal and sanitizes a limited tail without changing raw capture files.
 - Shell completion scripts (`atx completions`) for bash, zsh, fish, and
   PowerShell.
 - Man-page generation from CLI metadata (`cargo xtask dist-man`).
 - Embedded SQLite storage: WAL, revision-safe transactions, run
   history, retention limits, and corruption detection.
-
-### Changed
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-- The supervisor now stops cleanly when a service manager sends
-  `SIGTERM`/`SIGINT`: the runtime socket and lock are removed and the
-  process exits with status 0 instead of dying on the default signal
-  disposition. It also creates its state directory when the service
-  unit did not provide one.
-- Two supervisors or clients initializing the same new state
-  directory concurrently no longer race: the loser briefly waits for
-  the winner's schema transaction instead of reporting corruption.
-- `atx rm` now honors its documented history contract: removing a job
-  deletes its completed-run history unless `--keep-history` is given;
-  previously the flag was accepted but ignored.
-- launchd availability probing no longer depends on the host
-  environment during tests.
+- Defined exit codes and a stable exit-70 diagnostic for unexpected CLI
+  unwinding panics. Normal command errors keep their human or JSON form.
+- Six native release-archive targets, embedded Rust dependency metadata,
+  validated CycloneDX inventories, and SHA-256 checksums. Tag builds also
+  attest archives, inventories, and the checksum manifest before draft release.
 
 ### Security
 
@@ -87,3 +50,9 @@ versioning.
   the socket owner's process.
 - Environment values are stored protected and redacted from all normal
   output.
+
+## [0.1.0] - 2026-08-26
+
+Unpublished release rehearsal. No GitHub release or crates.io publication was
+made for this version. The public tag remains unchanged; its source is
+historical rehearsal code, not a supported release.
