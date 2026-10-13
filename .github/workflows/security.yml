@@ -6,6 +6,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      - "scripts/check.sh"
       - ".github/workflows/security.yml"
   push:
     branches: [main]
@@ -42,10 +43,8 @@ jobs:
         run: |
           cargo install --locked cargo-audit --version 0.22.2
           cargo install --locked cargo-deny --version 0.20.2
-      - name: cargo audit
-        run: cargo audit
-      - name: cargo deny
-        run: cargo deny check
+      - name: Dependency policy
+        run: scripts/check.sh dependencies
 
   dependency-review:
     name: dependency review
