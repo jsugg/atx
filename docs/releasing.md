@@ -22,6 +22,25 @@ a reproducible `.tar.gz` with fixed timestamps and ownership. The workflow adds
 a `SHA256SUMS` file and a CycloneDX SBOM for every archive, then creates a draft
 GitHub release. Publishing the draft is a manual click.
 
+Release builds use `cargo-auditable` 0.7.7 to embed the Rust dependency graph in
+the stripped binary. The existing SBOM action uses pinned Syft 1.42.3 to scan
+that archive. `cargo xtask check-sbom FILE TARGET` checks the root package,
+locked crate versions, and exact default-feature direct runtime dependencies.
+Empty inventories, missing crates, duplicate references, and broken edges fail
+before upload and again before checksums are generated.
+
+The inventory covers Rust crates recorded by the build, not bundled C source
+or operating-system libraries. It is not a complete native-library inventory.
+Scanner timestamps can vary; the checksum manifest covers the exact SBOM files
+attached to that run. Temporary extraction-file records are omitted, while
+crate locations and the archive hash remain in the document.
+
+PRs that change release inputs run these same six native archive jobs against
+the exact PR head. This rehearsal creates workflow artifacts and checksums,
+not tags, attestations, releases, or registry uploads. Tag checks remain required
+for actual tag builds and manual dispatches. Only a tag push can attest files
+or enter the protected draft-release job.
+
 The workflow also signs build attestations for each archive, SBOM, and the
 checksum file, so anyone can check that a file came from this repository's
 release workflow:
