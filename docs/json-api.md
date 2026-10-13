@@ -9,6 +9,9 @@ newline. Command errors print an error envelope to stderr and leave stdout empty
 Warnings and other diagnostics also use stderr. Check the exit status before
 reading stdout. See [the CLI guide](cli.md) for exit codes.
 
+An unexpected CLI panic exits `70` and writes `atx: unexpected internal failure`
+as text to stderr, not an error envelope. Ignore stdout in that case.
+
 `completions`, `--help`, and the built-in `--version` print text, not JSON.
 Use the `version` subcommand for machine-readable version information. The optional
 `man` command writes manual files rather than a JSON result.

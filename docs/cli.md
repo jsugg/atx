@@ -213,6 +213,12 @@ error instead of being ignored.
 - `12`: ownership or permission failure.
 - `70`: unexpected internal failure.
 
+If CLI dispatch panics, ATX writes `atx: unexpected internal failure` to stderr
+and exits 70. It does not print the panic details or a backtrace, even in verbose
+or JSON mode. Normal typed errors keep their usual human or JSON output.
+This catches unwinding panics on the CLI thread, not process aborts or a second
+panic during cleanup.
+
 ## Completions and man pages
 
 ```console
