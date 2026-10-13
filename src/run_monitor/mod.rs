@@ -8,6 +8,7 @@ use thiserror::Error;
 
 mod capture;
 mod lifecycle;
+mod tty;
 
 pub(crate) use lifecycle::RunMonitor;
 

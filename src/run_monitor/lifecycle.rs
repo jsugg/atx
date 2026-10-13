@@ -136,9 +136,7 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
             finished_at_utc,
             outcome.clone(),
         );
-        // Fire-and-forget echo to the submitting terminal: purely additive,
-        // never affects the recorded outcome. Any failure (terminal closed,
-        // rebooted, revoked) is silently skipped by design.
+        // Echo remains best effort and cannot change the recorded outcome.
         if let (Some(echo), Some(tty)) = (echo, execution.notify_tty()) {
             echo_tty(
                 tty,
@@ -165,27 +163,9 @@ impl<'a, Clock: WallClock> RunMonitor<'a, Clock> {
 
 /// Best-effort append of captured log files to a terminal device.
 fn echo_tty(tty: &Path, stdout_log: &Path, stderr_log: &Path, truncated: bool) {
-    use std::io::Write;
-    let (Ok(stdout), Ok(stderr)) = (
-        std::fs::read(stdout_log),
-        std::fs::OpenOptions::new().append(true).open(tty),
-    ) else {
-        return;
-    };
-    let mut file = stderr;
-    if truncated {
-        let _ = writeln!(file, "[atx: output truncated at capture cap]");
+    if let Err(error) = super::tty::echo_tty(tty, stdout_log, stderr_log, truncated) {
+        eprintln!("atx monitor: terminal echo failed: {error}");
     }
-    let _ = writeln!(file);
-    if !stdout.is_empty() {
-        let _ = file.write_all(&stdout);
-    }
-    if let Ok(stderr) = std::fs::read(stderr_log) {
-        if !stderr.is_empty() {
-            let _ = file.write_all(&stderr);
-        }
-    }
-    let _ = file.flush();
 }
 
 fn completion_outcome(
@@ -241,6 +221,7 @@ mod tests {
         RunState, RuntimeTier, Schedule, UtcTimestamp,
     };
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
+    use crate::run_monitor::tty::test_support::Pty;
     use rusqlite::params;
 
     use crate::infrastructure::sqlite::{Database, JobStore};
@@ -274,14 +255,34 @@ mod tests {
     }
 
     #[test]
+    fn echo_tty_rejects_regular_files_and_links() {
+        let root = tempdir().expect("root");
+        let target = root.path().join("not-a-tty");
+        let stdout = root.path().join("stdout.log");
+        let stderr = root.path().join("stderr.log");
+        fs::write(&target, b"unchanged").expect("target");
+        fs::write(&stdout, b"untrusted output").expect("stdout");
+        fs::write(&stderr, b"").expect("stderr");
+        super::echo_tty(&target, &stdout, &stderr, false);
+        assert_eq!(fs::read(&target).expect("target after echo"), b"unchanged");
+        let link = root.path().join("tty-link");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        super::echo_tty(&link, &stdout, &stderr, false);
+        assert_eq!(
+            fs::read(&target).expect("target after linked echo"),
+            b"unchanged"
+        );
+    }
+
+    #[test]
     fn terminal_run_echoes_streams_to_notify_tty() {
         let root = tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
             .expect("database");
         let mut store = JobStore::new(database);
-        let tty = root.path().join("fake-tty");
-        fs::write(&tty, b"").expect("seed tty file");
+        let pty = Pty::open().expect("pty");
+        let tty = pty.path().to_owned();
         let mut execution = execution(ExecutionMode::Shell, &["printf out; printf err >&2"]);
         execution
             .set_notify_tty(tty.clone())
@@ -302,7 +303,8 @@ mod tests {
         let completed = monitor.execute(&run, &execution).expect("execute");
 
         assert_eq!(completed.state(), RunState::Succeeded);
-        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        let echoed =
+            String::from_utf8(pty.read_available().expect("echoed output")).expect("UTF-8");
         assert!(echoed.contains("out"), "stdout missing: {echoed:?}");
         assert!(echoed.contains("err"), "stderr missing: {echoed:?}");
     }
@@ -394,8 +396,8 @@ mod tests {
         let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
             .expect("database");
         let mut store = JobStore::new(database);
-        let tty = root.path().join("fake-tty");
-        fs::write(&tty, b"").expect("seed tty file");
+        let pty = Pty::open().expect("pty");
+        let tty = pty.path().to_owned();
         let mut execution = execution(
             ExecutionMode::Shell,
             &["i=0; while [ \"$i\" -lt 4096 ]; do printf x; i=$((i+1)); done"],
@@ -419,7 +421,8 @@ mod tests {
         let completed = monitor.execute(&run, &execution).expect("execute");
 
         assert_eq!(completed.state(), RunState::Succeeded);
-        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        let echoed =
+            String::from_utf8(pty.read_available().expect("echoed output")).expect("UTF-8");
         assert!(
             echoed.to_lowercase().contains("truncated"),
             "truncation notice missing: {echoed:?}"
@@ -429,28 +432,28 @@ mod tests {
     #[test]
     fn echo_tty_skips_unreadable_streams_without_touching_the_terminal() {
         let root = tempdir().expect("root");
-        let tty = root.path().join("tty");
-        fs::write(&tty, b"before").expect("seed tty");
+        let pty = Pty::open().expect("pty");
+        let tty = pty.path();
 
         // Unreadable stdout log: nothing may be appended.
         super::echo_tty(
-            &tty,
+            tty,
             &root.path().join("missing-stdout.log"),
             &root.path().join("also-missing.log"),
             false,
         );
-        assert_eq!(fs::read_to_string(&tty).expect("tty"), "before");
+        assert!(pty.read_available().expect("unchanged tty").is_empty());
 
         // Empty stdout, unreadable stderr log, no truncation: only the newline.
         let stdout_log = root.path().join("stdout.log");
         fs::write(&stdout_log, b"").expect("empty stdout");
         super::echo_tty(
-            &tty,
+            tty,
             &stdout_log,
             &root.path().join("missing-stderr.log"),
             false,
         );
-        assert_eq!(fs::read_to_string(&tty).expect("tty"), "before\n");
+        assert_eq!(pty.read_available().expect("tty"), b"\n");
     }
 
     #[test]
@@ -594,8 +597,8 @@ mod tests {
         let database = Database::open(&root.path().join("atx.db"), Duration::from_millis(100))
             .expect("database");
         let mut store = JobStore::new(database);
-        let tty = root.path().join("fake-tty");
-        fs::write(&tty, b"").expect("seed tty file");
+        let pty = Pty::open().expect("pty");
+        let tty = pty.path().to_owned();
         let mut execution = execution(
             ExecutionMode::Shell,
             &["i=0; while [ \"$i\" -lt 4096 ]; do printf x >&2; i=$((i+1)); done"],
@@ -619,7 +622,8 @@ mod tests {
         let completed = monitor.execute(&run, &execution).expect("execute");
 
         assert_eq!(completed.state(), RunState::Succeeded);
-        let echoed = fs::read_to_string(&tty).expect("echoed output");
+        let echoed =
+            String::from_utf8(pty.read_available().expect("echoed output")).expect("UTF-8");
         assert!(
             echoed.to_lowercase().contains("truncated"),
             "truncation notice missing: {echoed:?}"
