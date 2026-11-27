@@ -22,15 +22,34 @@ pub(crate) enum SupervisorEvent {
     Shutdown,
 }
 
+/// Wait for deadlines and channel events until shutdown or an empty-session timeout.
 pub(crate) fn run_loop<Now, Due>(
     receiver: &Receiver<SupervisorEvent>,
     heap: &mut DeadlineHeap,
     idle_timeout: Option<Duration>,
-    mut now: Now,
-    mut on_due: Due,
+    now: Now,
+    on_due: Due,
 ) where
     Now: FnMut() -> ElapsedInstant,
     Due: FnMut(Vec<JobId>),
+{
+    drive_loop(heap, idle_timeout, now, on_due, |wait| match wait {
+        Some(wait) => receiver.recv_timeout(wait),
+        None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+    });
+}
+
+/// Apply the scheduling policy before receiving the next event.
+fn drive_loop<Now, Due, Receive>(
+    heap: &mut DeadlineHeap,
+    idle_timeout: Option<Duration>,
+    mut now: Now,
+    mut on_due: Due,
+    mut receive: Receive,
+) where
+    Now: FnMut() -> ElapsedInstant,
+    Due: FnMut(Vec<JobId>),
+    Receive: FnMut(Option<Duration>) -> Result<SupervisorEvent, RecvTimeoutError>,
 {
     loop {
         let due = heap.pop_due(now());
@@ -40,10 +59,7 @@ pub(crate) fn run_loop<Now, Due>(
         }
         let empty = heap.is_empty();
         let wait = wait_until(now(), heap.next_deadline(), idle_timeout);
-        let event = match wait {
-            Some(wait) => receiver.recv_timeout(wait),
-            None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
-        };
+        let event = receive(wait);
         match event {
             Ok(SupervisorEvent::Schedule { job_id, deadline }) => heap.upsert(job_id, deadline),
             Ok(SupervisorEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
@@ -53,6 +69,7 @@ pub(crate) fn run_loop<Now, Due>(
     }
 }
 
+/// Use the empty-heap idle policy only when there is no queued deadline.
 pub(crate) fn wait_until(
     now: ElapsedInstant,
     deadline: Option<ElapsedInstant>,
@@ -63,7 +80,7 @@ pub(crate) fn wait_until(
     };
     let nanos = deadline.as_nanos().saturating_sub(now.as_nanos());
     let deadline_wait = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
-    Some(idle_timeout.map_or(deadline_wait, |idle| deadline_wait.min(idle)))
+    Some(deadline_wait)
 }
 
 /// Maps a persisted wall-clock schedule onto the current elapsed clock.
@@ -98,7 +115,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{SupervisorEvent, reconcile_wall_schedule, run_loop, wait_until};
+    use super::{SupervisorEvent, drive_loop, reconcile_wall_schedule, run_loop, wait_until};
     use crate::domain::{ElapsedInstant, JobId, UtcTimestamp};
     use crate::supervisor::heap::DeadlineHeap;
 
@@ -115,6 +132,126 @@ mod tests {
             wait_until(now, Some(ElapsedInstant::from_nanos(999)), idle),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn future_deadlines_do_not_use_the_session_idle_timer() {
+        let now = ElapsedInstant::from_nanos(0);
+        let deadline = ElapsedInstant::from_nanos(86_400_000_000_000);
+        for idle in [Some(Duration::from_secs(30)), Some(Duration::ZERO), None] {
+            assert_eq!(
+                wait_until(now, Some(deadline), idle),
+                Some(Duration::from_secs(86_400))
+            );
+            assert_eq!(
+                wait_until(now, Some(ElapsedInstant::from_nanos(1)), idle),
+                Some(Duration::from_nanos(1))
+            );
+            assert_eq!(
+                wait_until(now, Some(ElapsedInstant::from_nanos(u128::MAX)), idle),
+                Some(Duration::from_nanos(u64::MAX))
+            );
+        }
+    }
+
+    #[test]
+    fn populated_loop_observes_only_real_deadlines_and_queued_events() {
+        let (sender, receiver) = mpsc::channel();
+        let job = JobId::new();
+        let earlier = ElapsedInstant::from_nanos(3_600_000_000_000);
+        sender
+            .send(SupervisorEvent::Schedule {
+                job_id: job,
+                deadline: earlier,
+            })
+            .expect("queued schedule");
+        sender
+            .send(SupervisorEvent::Shutdown)
+            .expect("queued shutdown");
+        let mut heap = DeadlineHeap::default();
+        heap.upsert(job, ElapsedInstant::from_nanos(7_200_000_000_000));
+        let clock_reads = AtomicU64::new(0);
+        let mut waits = Vec::new();
+        drive_loop(
+            &mut heap,
+            Some(Duration::from_secs(30)),
+            || {
+                clock_reads.fetch_add(1, Ordering::Relaxed);
+                ElapsedInstant::from_nanos(0)
+            },
+            |_| panic!("future jobs are not due"),
+            |wait| {
+                let expected = if waits.is_empty() { 7_200 } else { 3_600 };
+                assert_eq!(
+                    wait,
+                    Some(Duration::from_secs(expected)),
+                    "an idle tick would wake the populated loop"
+                );
+                waits.push(wait);
+                receiver.recv_timeout(wait.expect("populated heap has a deadline"))
+            },
+        );
+        assert_eq!(waits.len(), 2);
+        assert_eq!(clock_reads.load(Ordering::Relaxed), 4);
+        assert_eq!(heap.next_deadline(), Some(earlier));
+    }
+
+    #[test]
+    fn empty_modes_keep_the_session_and_service_wait_policies() {
+        for idle in [Some(Duration::from_secs(30)), Some(Duration::ZERO), None] {
+            let (sender, receiver) = mpsc::channel();
+            if idle.is_none() {
+                sender
+                    .send(SupervisorEvent::Shutdown)
+                    .expect("service shutdown");
+            }
+            let mut heap = DeadlineHeap::default();
+            let clock_reads = AtomicU64::new(0);
+            let mut wait_calls = 0;
+            drive_loop(
+                &mut heap,
+                idle,
+                || {
+                    clock_reads.fetch_add(1, Ordering::Relaxed);
+                    ElapsedInstant::from_nanos(0)
+                },
+                |_| panic!("empty heap cannot produce work"),
+                |wait| {
+                    wait_calls += 1;
+                    assert_eq!(wait, idle);
+                    match wait {
+                        Some(_) => {
+                            assert!(matches!(
+                                receiver.try_recv(),
+                                Err(mpsc::TryRecvError::Empty)
+                            ));
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        }
+                        None => receiver
+                            .recv()
+                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                    }
+                },
+            );
+            assert_eq!(wait_calls, 1);
+            assert_eq!(clock_reads.load(Ordering::Relaxed), 2);
+            assert!(heap.is_empty());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+        #[test]
+        fn deadline_waits_ignore_idle_policy_and_keep_saturated_bounds(
+            now in proptest::num::u128::ANY,
+            deadline in proptest::num::u128::ANY,
+            idle in proptest::num::u64::ANY,
+        ) {
+            let expected = Some(Duration::from_nanos(u64::try_from(deadline.saturating_sub(now)).unwrap_or(u64::MAX)));
+            for policy in [Some(Duration::from_nanos(idle)), Some(Duration::ZERO), None] {
+                proptest::prop_assert_eq!(wait_until(ElapsedInstant::from_nanos(now), Some(ElapsedInstant::from_nanos(deadline)), policy), expected);
+            }
+        }
     }
 
     #[test]

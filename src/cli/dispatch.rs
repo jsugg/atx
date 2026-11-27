@@ -1,8 +1,10 @@
 //! Top-level command dispatch.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,29 +18,28 @@ use super::exit;
 use super::human::HumanRenderer;
 use super::view::{JobView, ProcessView, RunOutputView, RunView, SubmissionView};
 use crate::application::{
-    CancelRunResult, DiagnosticStatus, DoctorReport, DoctorReportBuilder, ElapsedClock,
-    ManagementError, ManagementStore, RunOutput, RunOutputError, ServiceManager, SubmissionOutcome,
-    SubmissionStore, SubmissionStoreError, SupervisorAckError, SupervisorAcknowledger, WallClock,
-    cancel_claimed_run, install_service, list_jobs, list_runs, read_run_output, remove_job,
-    rerun_job, resolve_job, submit_job, uninstall_service,
+    CancelJobError, CancellationProgress, DiagnosticStatus, DoctorReport, DoctorReportBuilder,
+    ElapsedClock, ManagementError, ManagementStore, RunOutput, RunOutputError, ServiceManager,
+    SubmissionOutcome, SubmissionStore, SubmissionStoreError, SupervisorAckError,
+    SupervisorAcknowledger, WallClock, install_service, list_jobs, list_runs, read_run_output,
+    remove_job, rerun_job, resolve_job, submit_job, uninstall_service,
 };
 use crate::domain::{
     CalendarSyntax, Description, DstResolution, DurationSeconds, Environment, ExecutionMode,
-    ExecutionSpec, Job, JobState, MissedPolicy, Name, Run, RunOutcome, RunState, RuntimeTier,
-    Schedule, TimeZoneSelection, TransitionActor, UtcTimestamp, parse_calendar, relative_deadline,
-    resolve_calendar,
+    ExecutionSpec, Job, MissedPolicy, Name, RuntimeTier, Schedule, TimeZoneSelection, UtcTimestamp,
+    parse_calendar, relative_deadline, resolve_calendar,
 };
 use crate::infrastructure::config::{ColorMode, Config, ConfigOverrides, Verbosity, load_config};
 use crate::infrastructure::paths::{
-    PathEnvironment, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
+    PathEnvironment, PathError, Platform, PlatformPaths, ensure_private_dir, resolve_paths,
     validate_private_dir_for_uid,
 };
 use crate::infrastructure::process::{
-    IdentityStatus as NativeIdentityStatus, NativeGroupCanceller, NativeProcessInspector,
+    IdentityStatus as NativeIdentityStatus, NativeCancellationRuntime, NativeProcessInspector,
 };
 use crate::infrastructure::runtime::start_session_supervisor;
 use crate::infrastructure::service::NativeServiceManager;
-use crate::infrastructure::sqlite::{Database, JobStore, StoreError};
+use crate::infrastructure::sqlite::{DATABASE_BUSY_TIMEOUT, Database, JobStore};
 use crate::infrastructure::time::NativeClock;
 use crate::run_monitor::run_monitor_process;
 use crate::supervisor::{SocketAcknowledger, run_session_supervisor};
@@ -54,6 +55,8 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         .iter()
         .take_while(|value| value.as_os_str() != "--")
         .any(|value| value == "--json");
+    let parser_color =
+        super::human::output_color(super::args::explicit_color_request(&args), ColorArg::Auto);
     let parsed = match parse_from(args) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -65,7 +68,7 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             if json_requested && error.use_stderr() {
                 print_error(true, "INVALID_ARGUMENT", &error.to_string());
             } else {
-                let _ = error.print();
+                print_parser_message(&error, parser_color);
             }
             return exit_code;
         }
@@ -85,6 +88,27 @@ pub(crate) fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     }
 }
 
+fn print_parser_message(error: &clap::Error, color: ColorArg) {
+    let message = error.render();
+    if error.use_stderr() {
+        let mut output = std::io::stderr();
+        let colored = super::human::color_enabled(color, output.is_terminal());
+        if colored {
+            let _ = write!(output, "{}", message.ansi());
+        } else {
+            let _ = write!(output, "{message}");
+        }
+    } else {
+        let mut output = std::io::stdout();
+        let colored = super::human::color_enabled(color, output.is_terminal());
+        if colored {
+            let _ = write!(output, "{}", message.ansi());
+        } else {
+            let _ = write!(output, "{message}");
+        }
+    }
+}
+
 fn generate_completions(shell: crate::cli::args::CompletionShell) {
     use clap_complete::{Shell, generate};
     use std::io::stdout;
@@ -100,42 +124,9 @@ fn generate_completions(shell: crate::cli::args::CompletionShell) {
     generate(shell, &mut cmd, "atx", &mut stdout());
 }
 
-/// Write `atx.1` plus one page per subcommand as roff into `out_dir`.
+/// Write `atx.1` plus one page per public command and nested subcommand as roff into `out_dir`.
 #[cfg(feature = "man")]
 fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
-    use clap::CommandFactory;
-    use std::io::Write;
-
-    fn render(man: &clap_mangen::Man, path: &std::path::Path) -> Result<(), String> {
-        let mut generated = Vec::new();
-        man.render(&mut generated)
-            .map_err(|error| format!("render {}: {error}", path.display()))?;
-        let generated = String::from_utf8(generated)
-            .map_err(|error| format!("render {} as UTF-8: {error}", path.display()))?;
-        let mut normalized = generated
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n");
-        normalized.push('\n');
-        while normalized.contains(".br\n\n.br\n") {
-            normalized = normalized.replace(".br\n\n.br\n", ".br\n");
-        }
-        while normalized.contains("\n\n.br\n") {
-            normalized = normalized.replace("\n\n.br\n", "\n.br\n");
-        }
-        let file = std::fs::File::create(path)
-            .map_err(|error| format!("create {}: {error}", path.display()))?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer
-            .write_all(normalized.as_bytes())
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
-        writer.flush().map_err(|error| format!("flush: {error}"))
-    }
-
-    std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
-    let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
-    cmd.build();
     // mandoc rejects an empty or non-date TH date, so stamp a real date;
     // SOURCE_DATE_EPOCH keeps distro reproducible builds deterministic.
     let date = std::env::var("SOURCE_DATE_EPOCH")
@@ -145,26 +136,242 @@ fn export_man_pages(out_dir: &std::path::Path) -> Result<(), String> {
         .unwrap_or_else(jiff::Timestamp::now)
         .strftime("%Y-%m-%d")
         .to_string();
-    let name = cmd.get_name().to_owned();
-    render(
-        &clap_mangen::Man::new(cmd.clone())
-            .title(name.to_ascii_uppercase())
-            .date(&date),
-        &out_dir.join(format!("{name}.1")),
-    )?;
-    for sub in cmd.get_subcommands() {
+    export_man_pages_with_date(out_dir, &date)
+}
+
+#[cfg(feature = "man")]
+fn collect_man_pages(
+    parent: &clap::Command,
+    prefix: &str,
+    is_root: bool,
+    pages: &mut Vec<(String, clap::Command)>,
+) {
+    for sub in parent.get_subcommands() {
         if sub.is_hide_set() {
             continue;
         }
-        let path = out_dir.join(format!("{name}-{}.1", sub.get_name()));
-        render(
-            &clap_mangen::Man::new(sub.clone())
-                .title(name.to_ascii_uppercase())
-                .date(&date),
-            &path,
-        )?;
+        let sub_name = sub.get_name();
+        if sub_name == "help" && !is_root {
+            continue;
+        }
+        let page_name = format!("{prefix}-{sub_name}");
+        pages.push((page_name.clone(), sub.clone()));
+        if sub_name != "help" {
+            collect_man_pages(sub, &page_name, false, pages);
+        }
+    }
+}
+
+#[cfg(feature = "man")]
+fn normalize_man_page(raw: &str, root_name: &str) -> String {
+    let escaped_root = root_name.replace('-', "\\-");
+    let help_prefix = format!("{escaped_root}\\-help\\-");
+    let help_page = format!("{escaped_root}\\-help(1)");
+    let help_self = format!("{help_prefix}help(1)");
+    let root_prefix = format!("{escaped_root}\\-");
+    let nested_help_suffix = "\\-help(1)";
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_extra = false;
+    let mut extra_header_index: Option<usize> = None;
+
+    for raw_line in raw.lines() {
+        let trimmed = raw_line.trim_end();
+        if trimmed == ".SH EXTRA" {
+            in_extra = true;
+            extra_header_index = Some(lines.len());
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        if trimmed.starts_with(".SH ") {
+            in_extra = false;
+            extra_header_index = None;
+            while lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        if in_extra {
+            let promoted = match trimmed {
+                "EXAMPLES:" => Some(".SH EXAMPLES"),
+                "EXIT STATUS:" => Some(".SH EXIT STATUS"),
+                "FILES:" => Some(".SH FILES"),
+                "SEE ALSO:" => Some(".SH SEE ALSO"),
+                _ => None,
+            };
+            if let Some(section) = promoted {
+                if let Some(index) = extra_header_index.take()
+                    && lines[index + 1..].iter().all(String::is_empty)
+                {
+                    lines.truncate(index);
+                }
+                while lines.last().is_some_and(String::is_empty) {
+                    lines.pop();
+                }
+                lines.push(section.to_owned());
+                continue;
+            }
+        }
+
+        let line = if trimmed == help_self {
+            help_page.clone()
+        } else if let Some(rest) = trimmed.strip_prefix(&help_prefix) {
+            if rest.ends_with("(1)") {
+                format!("{root_prefix}{rest}")
+            } else {
+                trimmed.to_owned()
+            }
+        } else if trimmed.starts_with(&root_prefix)
+            && trimmed.ends_with(nested_help_suffix)
+            && trimmed != help_page
+        {
+            help_page.clone()
+        } else {
+            trimmed.to_owned()
+        };
+        lines.push(line);
+    }
+
+    let mut normalized = lines.join("\n");
+    normalized.push('\n');
+    while normalized.contains(".br\n\n.br\n") {
+        normalized = normalized.replace(".br\n\n.br\n", ".br\n");
+    }
+    while normalized.contains("\n\n.br\n") {
+        normalized = normalized.replace("\n\n.br\n", "\n.br\n");
+    }
+    normalized
+}
+
+#[cfg(feature = "man")]
+fn render_man_page_text(
+    man: &clap_mangen::Man,
+    page_name: &str,
+    root_name: &str,
+) -> Result<String, String> {
+    let mut generated = Vec::new();
+    man.render(&mut generated)
+        .map_err(|error| format!("render {page_name}.1: {error}"))?;
+    let generated = String::from_utf8(generated)
+        .map_err(|error| format!("render {page_name}.1 as UTF-8: {error}"))?;
+    Ok(normalize_man_page(&generated, root_name))
+}
+
+#[cfg(feature = "man")]
+fn stage_man_pages(
+    out_dir: &std::path::Path,
+    rendered: &[(String, String)],
+) -> Result<Vec<(std::path::PathBuf, std::path::PathBuf)>, String> {
+    use std::io::Write;
+
+    for (file_name, _) in rendered {
+        let dest = out_dir.join(file_name);
+        if let Ok(meta) = std::fs::symlink_metadata(&dest)
+            && meta.is_dir()
+        {
+            return Err(format!("cannot overwrite directory {}", dest.display()));
+        }
+    }
+
+    let pid = std::process::id();
+    let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        Vec::with_capacity(rendered.len());
+    for (index, (file_name, content)) in rendered.iter().enumerate() {
+        let tmp_path = out_dir.join(format!(".atx-man-{pid}-{index}.tmp"));
+        let dest_path = out_dir.join(file_name);
+        let write_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .and_then(|file| {
+                let mut writer = std::io::BufWriter::new(file);
+                writer.write_all(content.as_bytes())?;
+                writer.flush()
+            });
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            for (staged_tmp, _) in &staged {
+                let _ = std::fs::remove_file(staged_tmp);
+            }
+            return Err(format!("stage {}: {error}", dest_path.display()));
+        }
+        staged.push((tmp_path, dest_path));
+    }
+    Ok(staged)
+}
+
+#[cfg(feature = "man")]
+fn remove_stale_man_pages(
+    out_dir: &std::path::Path,
+    root_name: &str,
+    keep: &std::collections::BTreeSet<&str>,
+) -> Result<(), String> {
+    let stale_prefix = format!("{root_name}-");
+    let root_file = format!("{root_name}.1");
+    for entry in std::fs::read_dir(out_dir)
+        .map_err(|error| format!("read {}: {error}", out_dir.display()))?
+    {
+        let entry = entry.map_err(|error| format!("read entry: {error}"))?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let managed = file_name == root_file
+            || (file_name.starts_with(&stale_prefix) && file_name.ends_with(".1"));
+        if !managed || keep.contains(file_name) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("stat stale {}: {error}", entry.path().display()))?;
+        if file_type.is_file() || file_type.is_symlink() {
+            std::fs::remove_file(entry.path())
+                .map_err(|error| format!("remove stale {}: {error}", entry.path().display()))?;
+        }
     }
     Ok(())
+}
+
+#[cfg(feature = "man")]
+fn export_man_pages_with_date(out_dir: &std::path::Path, date: &str) -> Result<(), String> {
+    use clap::CommandFactory;
+
+    std::fs::create_dir_all(out_dir).map_err(|error| format!("create dir: {error}"))?;
+    let mut cmd = <crate::cli::args::RawCli as CommandFactory>::command();
+    cmd.build();
+    let name = cmd.get_name().to_owned();
+    let source = format!("{name} {}", env!("CARGO_PKG_VERSION"));
+
+    let mut pages = vec![(name.clone(), cmd.clone())];
+    collect_man_pages(&cmd, &name, true, &mut pages);
+
+    let mut rendered = Vec::with_capacity(pages.len());
+    for (page_name, page_cmd) in pages {
+        let text = render_man_page_text(
+            &clap_mangen::Man::new(page_cmd)
+                .title(page_name.to_ascii_uppercase())
+                .date(date)
+                .source(&source),
+            &page_name,
+            &name,
+        )?;
+        rendered.push((format!("{page_name}.1"), text));
+    }
+
+    let staged = stage_man_pages(out_dir, &rendered)?;
+    for (index, (tmp_path, dest_path)) in staged.iter().enumerate() {
+        if let Err(error) = std::fs::rename(tmp_path, dest_path) {
+            for (remaining_tmp, _) in &staged[index..] {
+                let _ = std::fs::remove_file(remaining_tmp);
+            }
+            return Err(format!("install {}: {error}", dest_path.display()));
+        }
+    }
+
+    let keep: std::collections::BTreeSet<&str> =
+        rendered.iter().map(|(file, _)| file.as_str()).collect();
+    remove_stale_man_pages(out_dir, &name, &keep)
 }
 
 fn run_management(global: &GlobalArgs, command: &ManagementCommand) -> ExitCode {
@@ -237,12 +444,12 @@ fn run_service(global: &GlobalArgs, action: ServiceAction) -> ExitCode {
 
 fn service_operation(global: &GlobalArgs, action: ServiceAction) -> Result<(), CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     if action == ServiceAction::Install {
         ensure_private_dir(paths.state_dir())
-            .map_err(|error| CliError::permission(global.json, error))?;
+            .map_err(|error| CliError::path(global.json, error))?;
         ensure_private_dir(paths.runtime_dir())
-            .map_err(|error| CliError::permission(global.json, error))?;
+            .map_err(|error| CliError::path(global.json, error))?;
     }
     let mut manager = native_service_manager(&paths, global.json)?;
     match action {
@@ -320,7 +527,7 @@ fn run_doctor(global: &GlobalArgs) -> ExitCode {
 
 fn build_doctor_report(global: &GlobalArgs) -> Result<DoctorReport, CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     let uid = rustix::process::geteuid().as_raw();
     let mut builder = DoctorReportBuilder::default();
     check_private_directory(&mut builder, "state directory", paths.state_dir(), uid);
@@ -483,7 +690,7 @@ fn check_database(builder: &mut DoctorReportBuilder, state_directory: &Path) -> 
         );
         return None;
     }
-    match Database::open(&database_path, Duration::from_secs(2))
+    match Database::open(&database_path, DATABASE_BUSY_TIMEOUT)
         .and_then(|database| database.schema_version())
     {
         Ok(version) => {
@@ -616,6 +823,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
     let Some(mut store) = store else {
         return manage_without_database(global, command);
     };
+    let progress = CancellationNotice::new(global, std::io::stderr());
     match command {
         ManagementCommand::List { state, limit } => {
             let state = state.map(crate::domain::JobState::from);
@@ -664,7 +872,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
                 .transpose()
                 .map_err(|error| CliError::usage(global.json, error))?
                 .unwrap_or(config.cancel_grace());
-            let cancelled = cancel_job(&mut store, job, grace)
+            let cancelled = cancel_job_with_progress(&mut store, job, grace, &progress)
                 .map_err(|error| management_cli_error(global.json, error))?;
             render_job(&cancelled, None, global);
         }
@@ -676,7 +884,7 @@ fn manage(global: &GlobalArgs, command: &ManagementCommand) -> Result<(), CliErr
             let current = resolve_job(&store, job)
                 .map_err(|error| management_cli_error(global.json, error))?;
             if !current.state().is_terminal() && *cancel {
-                cancel_job(&mut store, job, config.cancel_grace())
+                cancel_job_with_progress(&mut store, job, config.cancel_grace(), &progress)
                     .map_err(|error| management_cli_error(global.json, error))?;
             }
             let removed = remove_job(&mut store, job, *keep_history)
@@ -732,203 +940,69 @@ fn open_management(
     global: &GlobalArgs,
 ) -> Result<(Option<JobStore>, PlatformPaths, Config), CliError> {
     let paths = platform_paths(global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(global.json, error))?;
+        .map_err(|error| CliError::path(global.json, error))?;
     let config = load_effective_config(&paths, global, false)
         .map_err(|error| CliError::usage(global.json, error))?;
     let database_path = paths.state_dir().join("atx.db");
     if !database_path.is_file() {
         return Ok((None, paths, config));
     }
-    let database = Database::open(&database_path, Duration::from_secs(2))
+    let database = Database::open(&database_path, DATABASE_BUSY_TIMEOUT)
         .map_err(|error| CliError::storage(global.json, error))?;
     Ok((Some(JobStore::new(database)), paths, config))
 }
 
-fn cancel_job(
+struct CancellationNotice<'a, Output> {
+    global: &'a GlobalArgs,
+    output: RefCell<Output>,
+}
+
+impl<'a, Output> CancellationNotice<'a, Output> {
+    fn new(global: &'a GlobalArgs, output: Output) -> Self {
+        Self {
+            global,
+            output: RefCell::new(output),
+        }
+    }
+}
+
+impl<Output: Write + IsTerminal> CancellationProgress for CancellationNotice<'_, Output> {
+    fn waiting(&self, maximum: Duration) {
+        let tty = self.output.borrow().is_terminal();
+        if let Some(line) = cancellation_progress_line(self.global, tty, maximum) {
+            let _ = writeln!(&mut *self.output.borrow_mut(), "{line}");
+        }
+    }
+}
+
+fn cancellation_progress_line(global: &GlobalArgs, tty: bool, maximum: Duration) -> Option<String> {
+    if global.json || global.quiet || !tty {
+        return None;
+    }
+    Some(format!(
+        "Waiting up to {}s for cancellation.",
+        maximum.as_secs()
+    ))
+}
+
+fn cancel_job_with_progress(
     store: &mut JobStore,
     prefix: &str,
     grace: DurationSeconds,
+    progress: &impl CancellationProgress,
 ) -> Result<Job, ManagementError> {
     let job = resolve_job(store, prefix)?;
-    if matches!(job.state(), JobState::Cancelled | JobState::CancelRequested) {
-        // Already cancelled or another canceller is mid-flight; either way
-        // the request is satisfied.
-        return Ok(job);
-    }
-    if job.state().is_terminal() {
-        return Err(ManagementError::StateConflict(
-            "completed job cannot be cancelled",
-        ));
-    }
-    let clock = NativeClock;
-    let mut now = clock.now_utc().map_err(management_store_error)?;
-    let active = store
-        .latest_active_run(job.id())
-        .map_err(ManagementError::from)?;
-    // A concurrent cancel may win the revision race, and the monitor may have
-    // advanced a recurring job (raising its update time past our snapshot's);
-    // re-reading with a fresh timestamp turns both races into the same
-    // idempotent outcome instead of a storage error.
-    let mut current = job;
-    let mut requested = None;
-    for _ in 0..8 {
-        if matches!(
-            current.state(),
-            JobState::CancelRequested | JobState::Cancelled
-        ) {
-            return Ok(current);
-        }
-        if current.state().is_terminal() {
-            break;
-        }
-        now = clock.now_utc().map_err(management_store_error)?;
-        match store.transition_job(
-            current.id(),
-            current.revision(),
-            JobState::CancelRequested,
-            false,
-            TransitionActor::Cli,
-            "cancel requested",
-            now,
-        ) {
-            Ok(pending) => {
-                requested = Some(pending);
-                break;
-            }
-            Err(error @ (StoreError::Conflict | StoreError::Domain(_))) => {
-                // Conflict: another writer moved the revision. Domain: the
-                // fresh snapshot carries a later update time than our stale
-                // `now`. Both resolve by reloading and retrying.
-                let _ = error;
-                current = store
-                    .load(current.id())
-                    .map_err(management_store_error)?
-                    .ok_or(ManagementError::NotFound)?;
-            }
-            Err(error) => return Err(management_store_error(error)),
-        }
-    }
-    let Some(requested) = requested else {
-        return Err(ManagementError::StateConflict(
-            "job changed state during cancellation",
-        ));
-    };
-
-    let Some(run) = active else {
-        return store
-            .transition_job(
-                requested.id(),
-                requested.revision(),
-                JobState::Cancelled,
-                false,
-                TransitionActor::Cli,
-                "cancelled before command start",
-                now,
-            )
-            .map_err(management_store_error);
-    };
-    let terminal_run = cancel_active_run(store, &run, grace, clock)?;
-    finish_job_cancellation(store, requested.id(), terminal_run.state(), clock)
+    crate::application::cancel_job(store, job, grace, &NativeCancellationRuntime, progress)
+        .map_err(cancellation_error)
 }
 
-fn cancel_active_run(
-    store: &mut JobStore,
-    run: &Run,
-    grace: DurationSeconds,
-    clock: NativeClock,
-) -> Result<Run, ManagementError> {
-    let boot_identity = clock.boot_identity().map_err(management_store_error)?;
-    let inspector = NativeProcessInspector::new(boot_identity);
-    let grace_duration = Duration::from_secs(grace.get());
-    let result = cancel_claimed_run(
-        store,
-        &NativeGroupCanceller::new(&inspector, grace_duration),
-        run.id(),
-        run.claim_token(),
-    )
-    .map_err(management_store_error)?;
-    if let CancelRunResult::CommittedBeforeSpawn(run) = result {
-        store
-            .record_run_terminal(
-                run.id(),
-                run.claim_token(),
-                clock.now_utc().map_err(management_store_error)?,
-                RunOutcome::Cancelled("cancelled before command start".to_owned()),
-            )
-            .map_err(management_store_error)?;
-    }
-
-    let deadline = std::time::Instant::now()
-        .checked_add(grace_duration + Duration::from_secs(2))
-        .ok_or(ManagementError::StateConflict("cancel wait overflowed"))?;
-    let terminal_run = loop {
-        let current = store
-            .load_run(run.id())
-            .map_err(management_store_error)?
-            .ok_or(ManagementError::StateConflict("active run disappeared"))?;
-        if current.state().is_terminal() {
-            break current;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(ManagementError::StateConflict(
-                "run did not stop before the cancellation deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Ok(terminal_run)
-}
-
-fn finish_job_cancellation(
-    store: &mut JobStore,
-    job_id: crate::domain::JobId,
-    run_state: RunState,
-    clock: NativeClock,
-) -> Result<Job, ManagementError> {
-    let target = match run_state {
-        RunState::Succeeded => JobState::Succeeded,
-        RunState::Cancelled => JobState::Cancelled,
-        RunState::Failed => JobState::Failed,
-        RunState::Interrupted => JobState::Interrupted,
-        _ => {
-            return Err(ManagementError::StateConflict(
-                "run remained nonterminal after cancellation",
-            ));
-        }
-    };
-    let current = store.load(job_id).map_err(management_store_error)?;
-    let current = current.ok_or(ManagementError::NotFound)?;
-    if current.state().is_terminal() {
-        return Ok(current);
-    }
-    // A concurrent canceller may finish the transition first, or the run may
-    // have completed naturally and the job moved on (a recurring job returns
-    // to Waiting); either way the terminal outcome the caller wanted already
-    // happened or no longer applies.
-    match store.transition_job(
-        current.id(),
-        current.revision(),
-        target,
-        false,
-        TransitionActor::Cli,
-        "cancellation finished",
-        clock.now_utc().map_err(management_store_error)?,
-    ) {
-        Ok(finished) => Ok(finished),
-        Err(StoreError::Domain(_) | StoreError::Conflict) => {
-            let final_state = store
-                .load(current.id())
-                .map_err(management_store_error)?
-                .ok_or(ManagementError::NotFound)?;
-            if final_state.state().is_terminal() || matches!(final_state.state(), JobState::Waiting)
-            {
-                return Ok(final_state);
-            }
-            Err(ManagementError::StateConflict(
-                "job changed state during cancellation",
-            ))
-        }
-        Err(error) => Err(management_store_error(error)),
+fn cancellation_error(error: CancelJobError) -> ManagementError {
+    match error {
+        CancelJobError::NotFound => ManagementError::NotFound,
+        CancelJobError::StateConflict(reason) => ManagementError::StateConflict(reason),
+        CancelJobError::Store(error) => management_store_error(error),
+        CancelJobError::Run(error) => management_store_error(error),
+        CancelJobError::Clock(error) => management_store_error(error),
     }
 }
 
@@ -967,7 +1041,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         eprintln!("Warning: --capture-env may save credentials in the state database.");
     }
     let paths = platform_paths(args.global.state_dir.as_deref())
-        .map_err(|error| CliError::permission(json, error))?;
+        .map_err(|error| CliError::path(json, error))?;
     let config = load_effective_config(&paths, &args.global, args.options.durable)
         .map_err(|error| CliError::usage(json, error))?;
     if args.options.shell {
@@ -1006,8 +1080,8 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
         return Ok((outcome, json, quiet));
     }
 
-    ensure_private_dir(paths.state_dir()).map_err(|error| CliError::permission(json, error))?;
-    let database = Database::open(&paths.state_dir().join("atx.db"), Duration::from_secs(2))
+    ensure_private_dir(paths.state_dir()).map_err(|error| CliError::path(json, error))?;
+    let database = Database::open(&paths.state_dir().join("atx.db"), DATABASE_BUSY_TIMEOUT)
         .map_err(|error| CliError::storage(json, error))?;
     let mut store = JobStore::new(database);
     let acknowledger =
@@ -1017,9 +1091,7 @@ fn schedule(args: &SchedulingArgs) -> Result<(SubmissionOutcome, bool, bool), Cl
     Ok((outcome, json, quiet))
 }
 
-fn platform_paths(
-    state_override: Option<&Path>,
-) -> Result<crate::infrastructure::paths::PlatformPaths, impl std::fmt::Display> {
+fn platform_paths(state_override: Option<&Path>) -> Result<PlatformPaths, PathError> {
     let environment = PathEnvironment {
         home: std::env::var_os("HOME").map(PathBuf::from),
         xdg_state_home: std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -1126,6 +1198,10 @@ fn load_effective_config(
 /// site observes a single policy without threading a second struct through
 /// dispatch.
 fn resolve_output_policy(global: &mut GlobalArgs) {
+    if global.color.is_none() && super::human::output_color(None, ColorArg::Auto) == ColorArg::Never
+    {
+        global.color = Some(ColorArg::Never);
+    }
     let Ok(paths) = platform_paths(global.state_dir.as_deref()) else {
         return;
     };
@@ -1489,21 +1565,20 @@ fn render_processes(runs: &[crate::domain::Run], global: &GlobalArgs) -> Result<
             ("monitor", run.monitor_identity()),
             ("command", run.command_identity()),
         ] {
-            if let Some(identity) = identity {
-                if inspector
+            if let Some(identity) = identity
+                && inspector
                     .classify(identity)
                     .map_err(|error| CliError::internal(global.json, error))?
                     == NativeIdentityStatus::Alive
-                {
-                    processes.push(ProcessView {
-                        job_id: run.job_id().to_string(),
-                        run_id: run.id().to_string(),
-                        role,
-                        pid: identity.pid,
-                        process_group_id: identity.process_group_id,
-                        state: run.state(),
-                    });
-                }
+            {
+                processes.push(ProcessView {
+                    job_id: run.job_id().to_string(),
+                    run_id: run.id().to_string(),
+                    role,
+                    pid: identity.pid,
+                    process_group_id: identity.process_group_id,
+                    state: run.state(),
+                });
             }
         }
     }
@@ -1654,6 +1729,17 @@ struct CliError {
 }
 
 impl CliError {
+    fn path(json: bool, error: PathError) -> Self {
+        match error {
+            PathError::RelativePath | PathError::InvalidLeafName => Self::usage(json, error),
+            PathError::MissingHome
+            | PathError::MissingRuntimeRoot
+            | PathError::Insecure(_)
+            | PathError::Io(_)
+            | PathError::System(_) => Self::permission(json, error),
+        }
+    }
+
     fn usage(json: bool, error: impl std::fmt::Display) -> Self {
         Self::new(exit::usage(), "INVALID_ARGUMENT", json, error)
     }
@@ -1712,14 +1798,63 @@ mod tests {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
-    use tempfile::tempdir;
+    use crate::infrastructure::paths::private_tempdir as tempdir;
+
+    #[test]
+    fn path_error_variants_keep_usage_and_permission_classifications() {
+        use crate::infrastructure::paths::PathError;
+
+        for json in [false, true] {
+            let cases = [
+                (PathError::RelativePath, exit::usage(), "INVALID_ARGUMENT"),
+                (
+                    PathError::InvalidLeafName,
+                    exit::usage(),
+                    "INVALID_ARGUMENT",
+                ),
+                (
+                    PathError::MissingHome,
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::MissingRuntimeRoot,
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::Insecure("wrong owner"),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+                (
+                    PathError::System(rustix::io::Errno::ACCESS),
+                    exit::permission(),
+                    "PERMISSION_ERROR",
+                ),
+            ];
+            for (error, expected_exit, expected_code) in cases {
+                let message = error.to_string();
+                let actual = super::CliError::path(json, error);
+                assert_eq!(actual.exit, expected_exit, "{message}");
+                assert_eq!(actual.code, expected_code, "{message}");
+                assert_eq!(actual.message, message);
+                assert_eq!(actual.json, json);
+            }
+        }
+    }
 
     use super::{
-        SessionAcknowledger, build_doctor_report, build_job, cancel_job, check_database,
-        check_live_supervisor, check_private_directory, check_supervisor, doctor_exit,
-        finish_job_cancellation, print_error, read_env_file, render_job, render_jobs,
-        render_processes, render_run_output, render_runs, render_submission,
-        resolve_submitting_tty, run, schedule, split_assignment,
+        SessionAcknowledger, build_doctor_report, build_job, cancel_job_with_progress,
+        check_database, check_live_supervisor, check_private_directory, check_supervisor,
+        doctor_exit, print_error, read_env_file, render_job, render_jobs, render_processes,
+        render_run_output, render_runs, render_submission, resolve_submitting_tty, run, schedule,
+        split_assignment,
     };
     use crate::application::{
         DiagnosticStatus, DoctorReportBuilder, ElapsedClock, ManagementError, ManagementStore,
@@ -1730,8 +1865,8 @@ mod tests {
     use crate::cli::exit;
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
-        MissedPolicy, ProcessIdentitySnapshot, Revision, RunId, RunOutcome, RunState, RuntimeTier,
-        Schedule, TransitionActor, UtcTimestamp,
+        MissedPolicy, ProcessIdentitySnapshot, Revision, Run, RunId, RunOutcome, RunState,
+        RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
     use crate::infrastructure::config::{ConfigOverrides, load_config};
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
@@ -1769,6 +1904,14 @@ mod tests {
         JobStore::new(database)
     }
 
+    fn cancel_job(
+        store: &mut JobStore,
+        prefix: &str,
+        grace: DurationSeconds,
+    ) -> Result<Job, ManagementError> {
+        cancel_job_with_progress(store, prefix, grace, &())
+    }
+
     fn global(json: bool, quiet: bool) -> GlobalArgs {
         GlobalArgs {
             quiet,
@@ -1777,6 +1920,65 @@ mod tests {
             color: Some(ColorArg::Never),
             state_dir: None,
         }
+    }
+
+    #[test]
+    fn cancellation_progress_is_only_for_a_nonquiet_human_tty() {
+        for (json, quiet, tty, expected) in [
+            (
+                false,
+                false,
+                true,
+                Some("Waiting up to 4s for cancellation."),
+            ),
+            (true, false, true, None),
+            (false, true, true, None),
+            (true, true, true, None),
+            (false, false, false, None),
+            (true, false, false, None),
+            (false, true, false, None),
+            (true, true, false, None),
+        ] {
+            let notice = super::cancellation_progress_line(
+                &global(json, quiet),
+                tty,
+                Duration::from_secs(4),
+            );
+            assert_eq!(
+                notice.as_deref(),
+                expected,
+                "json={json}, quiet={quiet}, tty={tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_notice_uses_a_real_tty_and_leaves_machine_output_empty() {
+        use crate::application::CancellationProgress;
+        use crate::run_monitor::Pty;
+
+        for (json, quiet, expected) in [
+            (false, false, "Waiting up to 4s for cancellation.\n"),
+            (true, false, ""),
+            (false, true, ""),
+            (true, true, ""),
+        ] {
+            let pty = Pty::open().expect("owned PTY");
+            let options = global(json, quiet);
+            let notice =
+                super::CancellationNotice::new(&options, pty.writer().expect("PTY writer"));
+            notice.waiting(Duration::from_secs(4));
+            assert_eq!(
+                pty.read_available().expect("PTY notice"),
+                expected.as_bytes()
+            );
+        }
+        let root = tempdir().expect("root");
+        let path = root.path().join("stderr");
+        let output = std::fs::File::create(&path).expect("regular output");
+        let options = global(false, false);
+        super::CancellationNotice::new(&options, output).waiting(Duration::from_secs(4));
+        assert!(std::fs::read(&path).expect("non-TTY output").is_empty());
     }
 
     /// Parse a schedule invocation, panicking on anything else.
@@ -1971,6 +2173,146 @@ mod tests {
         let blocker = root.path().join("blocker");
         fs::write(&blocker, b"").expect("file");
         assert!(super::export_man_pages(&blocker).is_err());
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn man_pages_use_conventional_titles_sections_and_shipped_references() {
+        let first = tempdir().expect("first");
+        let second = tempdir().expect("second");
+        let stale = first.path().join("atx-obsolete.1");
+        let unrelated = first.path().join("keep.txt");
+        fs::write(&stale, b"stale").expect("stale page");
+        fs::write(&unrelated, b"keep").expect("unrelated file");
+        super::export_man_pages_with_date(first.path(), "2026-09-10").expect("first export");
+        super::export_man_pages_with_date(second.path(), "2026-09-10").expect("second export");
+        assert!(!stale.exists(), "stale atx man page must be removed");
+        assert!(unrelated.exists(), "unrelated files must be preserved");
+
+        let mut pages = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(first.path()).expect("read first dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".1") {
+                let bytes = fs::read(entry.path()).expect("read page");
+                let second_bytes = fs::read(second.path().join(&name)).expect("read second page");
+                assert_eq!(bytes, second_bytes, "nondeterministic page {name}");
+                let text = String::from_utf8(bytes).expect("utf8 page");
+                pages.insert(name, text);
+            }
+        }
+
+        // Nested service subcommands must ship alongside top-level pages.
+        for required in [
+            "atx.1",
+            "atx-list.1",
+            "atx-service.1",
+            "atx-service-install.1",
+            "atx-service-status.1",
+            "atx-service-uninstall.1",
+            "atx-help.1",
+        ] {
+            assert!(
+                pages.contains_key(required),
+                "missing generated page {required}"
+            );
+        }
+
+        let expected_source = format!("\"atx {}\"", env!("CARGO_PKG_VERSION"));
+        for (file, text) in &pages {
+            let stem = file.strip_suffix(".1").expect(".1 suffix");
+            let expected_th = format!(
+                ".TH {} 1 2026-09-10 {expected_source}",
+                stem.to_ascii_uppercase()
+            );
+            assert!(
+                text.lines().any(|line| line == expected_th),
+                "{file}: expected header {expected_th:?}, got {:?}",
+                text.lines().find(|line| line.starts_with(".TH "))
+            );
+            assert!(
+                !text.lines().any(|line| line == ".SH EXTRA"),
+                "{file}: unexpected .SH EXTRA section"
+            );
+
+            // Every atx*(1) cross-reference must resolve to a generated page.
+            let unescaped = text.replace("\\-", "-");
+            let mut rest = unescaped.as_str();
+            while let Some(pos) = rest.find("(1)") {
+                let prefix = &rest[..pos];
+                let token_start = prefix
+                    .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+                    .map_or(0, |index| index + 1);
+                let target = &prefix[token_start..];
+                if target == "atx" || target.starts_with("atx-") {
+                    let target_file = format!("{target}.1");
+                    assert!(
+                        pages.contains_key(&target_file),
+                        "{file}: unresolved manual reference {target}(1)"
+                    );
+                }
+                rest = &rest[pos + 3..];
+            }
+        }
+
+        // Root manual must expose standard Unix sections instead of EXTRA.
+        let root_page = &pages["atx.1"];
+        for section in [
+            ".SH EXAMPLES",
+            ".SH EXIT STATUS",
+            ".SH FILES",
+            ".SH SEE ALSO",
+        ] {
+            assert!(
+                root_page.lines().any(|line| line == section),
+                "atx.1 missing {section}"
+            );
+        }
+        assert!(
+            pages["atx-service.1"]
+                .lines()
+                .any(|line| line == ".SH EXAMPLES"),
+            "atx-service.1 missing .SH EXAMPLES"
+        );
+    }
+
+    #[cfg(feature = "man")]
+    #[test]
+    fn man_page_export_preserves_existing_pages_on_failure_and_replaces_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().expect("root");
+        let existing = root.path().join("atx.1");
+        fs::write(&existing, b"working manual").expect("existing page");
+        let blocker_dir = root.path().join("atx-list.1");
+        fs::create_dir(&blocker_dir).expect("blocking directory");
+        assert!(super::export_man_pages_with_date(root.path(), "2026-09-10").is_err());
+        assert_eq!(
+            fs::read(&existing).expect("existing page preserved"),
+            b"working manual"
+        );
+        fs::remove_dir(&blocker_dir).expect("remove blocker");
+
+        let external_target = root.path().join("outside-target.txt");
+        let dangling_link = root.path().join("atx-obsolete.1");
+        let current_link = root.path().join("atx-show.1");
+        symlink(root.path().join("missing-target"), &dangling_link).expect("dangling link");
+        symlink(&external_target, &current_link).expect("current link");
+
+        super::export_man_pages_with_date(root.path(), "2026-09-10").expect("export");
+        assert!(
+            fs::symlink_metadata(&dangling_link).is_err(),
+            "dangling stale symlink must be removed"
+        );
+        assert!(
+            !external_target.exists(),
+            "export must not write through an existing symlink"
+        );
+        let show_meta = fs::symlink_metadata(&current_link).expect("installed page");
+        assert!(
+            show_meta.file_type().is_file(),
+            "installed page must be a regular file, not a symlink"
+        );
     }
 
     #[test]
@@ -2173,63 +2515,6 @@ mod tests {
         let done_id = done.id().to_string();
         assert!(matches!(
             cancel_job(&mut store, &done_id, grace),
-            Err(ManagementError::StateConflict(_))
-        ));
-    }
-
-    #[test]
-    fn finish_cancellation_maps_run_outcomes_to_terminal_jobs() {
-        for (run_state, expected) in [
-            (RunState::Succeeded, JobState::Succeeded),
-            (RunState::Cancelled, JobState::Cancelled),
-            (RunState::Failed, JobState::Failed),
-            (RunState::Interrupted, JobState::Interrupted),
-        ] {
-            let root = tempdir().expect("root");
-            let mut store = opened_store(root.path());
-            let job = fixture_job(3_000);
-            store.create(&job).expect("create");
-            let requested = store
-                .transition_job(
-                    job.id(),
-                    job.revision(),
-                    JobState::CancelRequested,
-                    false,
-                    TransitionActor::Cli,
-                    "seed",
-                    UtcTimestamp::from_second(3_001).expect("ts"),
-                )
-                .expect("cancel requested");
-            let finished = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
-                .expect("finish");
-            assert_eq!(finished.state(), expected);
-            // Already-terminal jobs return as-is instead of re-transitioning.
-            let again = finish_job_cancellation(&mut store, job.id(), run_state, NativeClock)
-                .expect("repeat");
-            assert_eq!(again.revision(), finished.revision());
-            drop(requested);
-        }
-    }
-
-    #[test]
-    fn finish_cancellation_refuses_nonterminal_runs() {
-        let root = tempdir().expect("root");
-        let mut store = opened_store(root.path());
-        let job = fixture_job(4_000);
-        store.create(&job).expect("create");
-        store
-            .transition_job(
-                job.id(),
-                job.revision(),
-                JobState::CancelRequested,
-                false,
-                TransitionActor::Cli,
-                "seed",
-                UtcTimestamp::from_second(4_001).expect("ts"),
-            )
-            .expect("cancel requested");
-        assert!(matches!(
-            finish_job_cancellation(&mut store, job.id(), RunState::Starting, NativeClock),
             Err(ManagementError::StateConflict(_))
         ));
     }
@@ -2959,6 +3244,199 @@ mod tests {
         assert_eq!(run.state(), RunState::Cancelled);
     }
 
+    fn claim_after_cancellation_blocks(
+        path: &Path,
+        waiting: &Job,
+        locked: &std::sync::mpsc::SyncSender<()>,
+        release: &std::sync::mpsc::Receiver<()>,
+        committed: &std::sync::mpsc::SyncSender<()>,
+    ) -> Run {
+        let mut peer = opened_store(path);
+        peer.database()
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        locked.send(()).expect("signal locked writer");
+        release
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation reached CAS");
+        peer.database()
+            .connection()
+            .execute_batch("ROLLBACK")
+            .expect("release writer lock");
+        let now = UtcTimestamp::from_second(6_030).expect("due timestamp");
+        let starting = peer
+            .transition_job(
+                waiting.id(),
+                waiting.revision(),
+                JobState::Starting,
+                false,
+                TransitionActor::Supervisor,
+                "deadline became due",
+                now,
+            )
+            .expect("starting");
+        let run = peer
+            .claim_run(starting.id(), starting.next_due_utc(), now)
+            .expect("claim");
+        peer.transition_job(
+            starting.id(),
+            starting.revision(),
+            JobState::Running,
+            false,
+            TransitionActor::Supervisor,
+            "run monitor claimed command",
+            now,
+        )
+        .expect("running job before monitor spawn");
+        committed.send(()).expect("signal committed claim");
+        run
+    }
+
+    #[test]
+    fn cancel_reloads_the_active_run_after_a_revision_conflict() {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+
+        thread_local! {
+            static CLAIM_HANDSHAKE: RefCell<Option<(SyncSender<()>, Receiver<()>)>> = const { RefCell::new(None) };
+        }
+        fn release_claim_writer(_attempt: i32) -> bool {
+            CLAIM_HANDSHAKE.with(|handshake| {
+                handshake
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|(release, committed)| {
+                        release.send(()).is_ok()
+                            && committed.recv_timeout(Duration::from_secs(2)).is_ok()
+                    })
+            })
+        }
+
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        let waiting = store
+            .transition_job(
+                job.id(),
+                job.revision(),
+                JobState::Waiting,
+                false,
+                TransitionActor::Supervisor,
+                "supervisor loaded deadline",
+                UtcTimestamp::from_second(6_001).expect("waiting timestamp"),
+            )
+            .expect("waiting");
+        let path = root.path().to_owned();
+        let (locked_tx, locked_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        let (committed_tx, committed_rx) = sync_channel(1);
+        let (result, claimed) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                claim_after_cancellation_blocks(
+                    &path,
+                    &waiting,
+                    &locked_tx,
+                    &release_rx,
+                    &committed_tx,
+                )
+            });
+            locked_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer owns lock");
+            CLAIM_HANDSHAKE
+                .with(|handshake| *handshake.borrow_mut() = Some((release_tx, committed_rx)));
+            store
+                .database_mut()
+                .connection_mut()
+                .busy_handler(Some(release_claim_writer))
+                .expect("install controlled contention hook");
+            let result = cancel_job(
+                &mut store,
+                &job.id().to_string(),
+                DurationSeconds::new(1).expect("grace"),
+            );
+            store
+                .database()
+                .connection()
+                .busy_timeout(Duration::from_millis(100))
+                .expect("restore fixture timeout");
+            CLAIM_HANDSHAKE.with(|handshake| {
+                handshake.borrow_mut().take();
+            });
+            (result, writer.join().expect("claim writer"))
+        });
+        assert_eq!(
+            result.expect("cancel after concurrent claim").state(),
+            JobState::Cancelled
+        );
+        let run = store
+            .load_run(claimed.id())
+            .expect("load claimed run")
+            .expect("claimed run exists");
+        assert_eq!(run.state(), RunState::Cancelled);
+    }
+
+    fn assert_cancellation_blocks_claims(finish: bool) {
+        let root = tempdir().expect("root");
+        let mut store = opened_store(root.path());
+        let job = fixture_job(6_000);
+        store.create(&job).expect("create");
+        if finish {
+            let cancelled = cancel_job(
+                &mut store,
+                &job.id().to_string(),
+                DurationSeconds::new(1).expect("grace"),
+            )
+            .expect("cancel before claim");
+            assert_eq!(cancelled.state(), JobState::Cancelled);
+        } else {
+            store
+                .transition_job(
+                    job.id(),
+                    job.revision(),
+                    JobState::CancelRequested,
+                    false,
+                    TransitionActor::Cli,
+                    "cancel requested",
+                    UtcTimestamp::from_second(6_001).expect("request timestamp"),
+                )
+                .expect("committed cancellation request");
+        }
+        let claim = store.claim_run(
+            job.id(),
+            job.next_due_utc(),
+            UtcTimestamp::from_second(6_030).expect("due timestamp"),
+        );
+        assert!(
+            matches!(
+                &claim,
+                Err(crate::infrastructure::sqlite::StoreError::Conflict)
+            ),
+            "unexpected claim after cancellation: {:?}",
+            claim.as_ref().map(Run::state)
+        );
+        assert!(
+            crate::application::JobCancellationStore::latest_active_run_for_cancellation(
+                &store,
+                job.id()
+            )
+            .expect("active run")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cancel_requested_jobs_reject_later_run_claims() {
+        assert_cancellation_blocks_claims(false);
+    }
+
+    #[test]
+    fn cancelled_jobs_reject_later_run_claims() {
+        assert_cancellation_blocks_claims(true);
+    }
+
     #[test]
     fn cancel_deadline_reports_conflict_when_the_run_never_stops() {
         let root = tempdir().expect("root");
@@ -3325,42 +3803,6 @@ mod tests {
             .find(|&(key, _)| key == "LC_ATX_RESIDUAL_TEST")
             .map(|(_, value)| value.expose().to_owned());
         assert_eq!(seeded.as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn finish_cancellation_conflicts_when_the_reload_is_still_active() {
-        let root = tempdir().expect("root");
-        let mut store = opened_store(root.path());
-        let job = fixture_job(6_000);
-        store.create(&job).expect("create");
-        let requested = store
-            .transition_job(
-                job.id(),
-                job.revision(),
-                JobState::CancelRequested,
-                false,
-                TransitionActor::Cli,
-                "seed",
-                UtcTimestamp::from_second(6_001).expect("ts"),
-            )
-            .expect("cancel requested");
-        // RAISE(IGNORE) skips every UPDATE, so the cancellation transition
-        // conflicts and the reload still shows the active CancelRequested
-        // state instead of a terminal or waiting one.
-        store
-            .database()
-            .connection()
-            .execute_batch(
-                "CREATE TRIGGER stall_job_updates BEFORE UPDATE ON jobs
-                 BEGIN SELECT RAISE(IGNORE); END;",
-            )
-            .expect("trigger");
-
-        assert!(matches!(
-            finish_job_cancellation(&mut store, job.id(), RunState::Succeeded, NativeClock),
-            Err(ManagementError::StateConflict(_))
-        ));
-        drop(requested);
     }
 
     #[cfg(target_os = "linux")]

@@ -1,7 +1,8 @@
 name: mutation
 
-# Mutate the four pure domain modules named in the project plan. The unit-test
-# filter keeps the run short; a whole-run timeout is reported separately.
+# Mutate duration parsing, calendar syntax, recurrence and state transitions.
+# The unit-test filter keeps the run short; a whole-run timeout is reported
+# separately.
 on:
   workflow_dispatch:
   schedule:

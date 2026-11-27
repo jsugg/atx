@@ -19,10 +19,11 @@ use crate::application::{ElapsedClock, WallClock, reconcile_startup};
 use crate::domain::{ElapsedInstant, JobState, RunOutcome, TransitionActor};
 use crate::infrastructure::paths::ensure_private_dir;
 use crate::infrastructure::process::NativeProcessInspector;
-use crate::infrastructure::sqlite::{Database, JobStore, RetentionPolicy, StartupStore};
+use crate::infrastructure::sqlite::{
+    DATABASE_BUSY_TIMEOUT, Database, JobStore, RetentionPolicy, StartupStore,
+};
 use crate::infrastructure::time::NativeClock;
 
-const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -62,15 +63,22 @@ extern "C" fn child_exit_notification(_: libc::c_int) {}
 fn start_signal_worker(
     children: Arc<MonitorChildren>,
     sender: mpsc::Sender<SupervisorEvent>,
-) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, DaemonError> {
     start_signal_worker_with_configuration(children, sender, configure_supervisor_signals)
 }
 
 fn configure_supervisor_signals() -> std::io::Result<()> {
+    configure_supervisor_signals_with_mask(|operation, mask| {
+        // SAFETY: the borrowed signal set is initialized and valid for this call.
+        unsafe { libc::pthread_sigmask(operation, std::ptr::from_ref(mask), std::ptr::null_mut()) }
+    })
+}
+
+fn configure_supervisor_signals_with_mask(
+    set_mask: impl FnOnce(libc::c_int, &libc::sigset_t) -> libc::c_int,
+) -> std::io::Result<()> {
     let mask = supervisor_signal_set();
-    // SAFETY: the initialized mask pointer is valid for this call.
-    let result =
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &raw const mask, std::ptr::null_mut()) };
+    let result = set_mask(libc::SIG_BLOCK, &mask);
     if result != 0 {
         return Err(std::io::Error::from_raw_os_error(result));
     }
@@ -93,8 +101,8 @@ fn start_signal_worker_with_configuration(
     children: Arc<MonitorChildren>,
     sender: mpsc::Sender<SupervisorEvent>,
     configure: impl FnOnce() -> std::io::Result<()>,
-) -> std::io::Result<std::thread::JoinHandle<std::io::Result<()>>> {
-    configure()?;
+) -> Result<std::thread::JoinHandle<std::io::Result<()>>, DaemonError> {
+    configure().map_err(DaemonError::SignalStartup)?;
     std::thread::Builder::new()
         .name("atx-signals".into())
         .spawn(move || {
@@ -105,6 +113,7 @@ fn start_signal_worker_with_configuration(
             }
             result
         })
+        .map_err(DaemonError::SignalStartup)
 }
 
 fn stop_signal_worker(
@@ -211,7 +220,7 @@ pub(crate) fn run_session_supervisor(
         .inspect(std::process::id())?
         .ok_or(DaemonError::MissingIdentity)?;
     let runtime = RuntimeGuard::acquire(runtime_directory, &identity, &inspector)?;
-    let mut store = JobStore::new(Database::open(&database_path, DATABASE_TIMEOUT)?);
+    let mut store = JobStore::new(Database::open(&database_path, DATABASE_BUSY_TIMEOUT)?);
     let mut heap = recover_startup_state(
         &mut store,
         state_directory,
@@ -226,7 +235,7 @@ pub(crate) fn run_session_supervisor(
     // disposition.
     let listener = runtime.listener().try_clone()?;
     let fallback_elapsed = clock.now_elapsed()?;
-    let child_mask = current_signal_mask()?;
+    let child_mask = current_signal_mask().map_err(DaemonError::SignalStartup)?;
     let children = Arc::new(MonitorChildren::default());
     let (sender, receiver) = mpsc::channel();
     let signal_thread = start_signal_worker(Arc::clone(&children), sender.clone())?;
@@ -327,13 +336,12 @@ fn serve_ipc(
                 // contention, then nack with the reason.
                 let reply = match load_wake_with_retry(database_path, job_id) {
                     Ok(disposition) => {
-                        if let WakeDisposition::Schedule(deadline) = disposition {
-                            if sender
+                        if let WakeDisposition::Schedule(deadline) = disposition
+                            && sender
                                 .send(SupervisorEvent::Schedule { job_id, deadline })
                                 .is_err()
-                            {
-                                break;
-                            }
+                        {
+                            break;
                         }
                         IpcMessage::Ack {
                             protocol: 1,
@@ -389,7 +397,7 @@ fn load_wake(
     database_path: &Path,
     job_id: crate::domain::JobId,
 ) -> Result<WakeDisposition, DaemonError> {
-    let store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
+    let store = JobStore::new(Database::open(database_path, DATABASE_BUSY_TIMEOUT)?);
     let job = store.load(job_id)?.ok_or(DaemonError::MissingJob)?;
     if job.state().is_terminal() {
         return Ok(WakeDisposition::AlreadyTerminal);
@@ -491,7 +499,7 @@ fn execute_single_due_job(
     child_mask: libc::sigset_t,
 ) -> Result<(), DaemonError> {
     let clock = NativeClock;
-    let mut store = JobStore::new(Database::open(database_path, DATABASE_TIMEOUT)?);
+    let mut store = JobStore::new(Database::open(database_path, DATABASE_BUSY_TIMEOUT)?);
     let Some(mut job) = store.load(job_id)? else {
         return Ok(());
     };
@@ -627,6 +635,8 @@ pub(crate) enum DaemonError {
     Ipc(#[from] super::ipc::IpcError),
     #[error("supervisor I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("supervisor signal startup failed: {0}")]
+    SignalStartup(#[source] std::io::Error),
     #[error("startup recovery failed: {0}")]
     Recovery(String),
     #[error("supervisor process identity disappeared")]
@@ -650,8 +660,6 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::{
         DaemonError, WakeDisposition, execute_due_jobs, load_wake, load_wake_with_retry,
         request_ipc_shutdown, serve_ipc, stop_signal_set,
@@ -660,6 +668,7 @@ mod tests {
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
         MissedPolicy, Revision, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
     use crate::infrastructure::sqlite::{Database, JobStore};
     use crate::supervisor::ipc::{IpcMessage, read_frame, write_frame};
     use crate::supervisor::loop_driver::SupervisorEvent;
@@ -705,6 +714,64 @@ mod tests {
     }
 
     #[test]
+    fn signal_setup_preserves_an_inherited_blocked_signal() {
+        std::thread::spawn(|| {
+            let mut inherited = super::stop_signal_set();
+            // SAFETY: the initialized set and valid signal number are local to this thread.
+            assert_eq!(
+                unsafe { libc::sigaddset(&raw mut inherited, libc::SIGUSR1) },
+                0
+            );
+            // SAFETY: the initialized set pointer is valid and the previous mask is not requested.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(
+                        libc::SIG_BLOCK,
+                        &raw const inherited,
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            super::configure_supervisor_signals().expect("configure signals");
+            let actual = super::current_signal_mask().expect("current mask");
+            for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
+                // SAFETY: the queried set is initialized and all signal numbers are valid.
+                assert_eq!(unsafe { libc::sigismember(&raw const actual, signal) }, 1);
+            }
+        })
+        .join()
+        .expect("mask test thread");
+    }
+
+    #[test]
+    fn mask_call_failure_is_a_typed_startup_error_without_a_worker() {
+        let children = std::sync::Arc::new(super::MonitorChildren::default());
+        let (sender, receiver) = mpsc::channel();
+        let result = super::start_signal_worker_with_configuration(children, sender, || {
+            super::configure_supervisor_signals_with_mask(|operation, mask| {
+                assert_eq!(operation, libc::SIG_BLOCK);
+                for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGCHLD] {
+                    // SAFETY: the borrowed set is initialized and the signals are valid.
+                    assert_eq!(
+                        unsafe { libc::sigismember(std::ptr::from_ref(mask), signal) },
+                        1
+                    );
+                }
+                libc::EINVAL
+            })
+        });
+        let super::DaemonError::SignalStartup(error) = result.expect_err("mask failure") else {
+            panic!("mask failure must retain its startup classification");
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn signal_setup_failure_does_not_start_a_worker() {
         let children = std::sync::Arc::new(super::MonitorChildren::default());
         let (sender, receiver) = mpsc::channel();
@@ -713,7 +780,7 @@ mod tests {
         });
         assert_eq!(
             result.expect_err("startup failure").to_string(),
-            "injected signal setup failure"
+            "supervisor signal startup failed: injected signal setup failure"
         );
         assert!(matches!(
             receiver.try_recv(),

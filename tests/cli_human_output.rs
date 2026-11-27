@@ -19,6 +19,82 @@ fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
 }
 
+#[test]
+fn management_typos_keep_usage_exit_and_json_error_envelope() {
+    for (word, command) in [
+        ("lst", "list"),
+        ("hisotry", "history"),
+        ("docter", "doctor"),
+        ("hepl", "help"),
+        ("verison", "version"),
+    ] {
+        for json in [false, true] {
+            let mut child = atx();
+            child.args(["--color", "never"]);
+            if json {
+                child.arg("--json");
+            }
+            let output = child.arg(word).output().expect("typo diagnostic");
+            assert_eq!(output.status.code(), Some(2));
+            assert!(output.stdout.is_empty());
+            let message = if json {
+                let value: Value = serde_json::from_slice(&output.stderr).expect("error JSON");
+                assert_eq!(value["error"]["code"], "INVALID_ARGUMENT");
+                value["error"]["message"]
+                    .as_str()
+                    .expect("error message")
+                    .to_owned()
+            } else {
+                String::from_utf8(output.stderr).expect("human error")
+            };
+            assert!(
+                message.contains(&format!("did you mean `{command}`")),
+                "{message}"
+            );
+            assert_eq!(message.matches("did you mean").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn relative_state_directory_is_usage_in_human_and_json_modes() {
+    let root = tempdir().expect("root");
+    let commands: &[&[&str]] = &[
+        &["list"],
+        &["doctor"],
+        &["service", "install"],
+        &["--dry-run", "30s", "--", "true"],
+    ];
+    for args in commands {
+        for json in [false, true] {
+            let mut command = atx();
+            command
+                .current_dir(root.path())
+                .args(["--state-dir", "relative-state"]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args(*args).output().expect("relative state-dir");
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{args:?}, JSON={json}: {output:?}"
+            );
+            assert!(output.stdout.is_empty(), "{output:?}");
+            if json {
+                let error = json_line(&output.stderr);
+                assert_eq!(error["schema_version"], 1);
+                assert_eq!(error["ok"], false);
+                assert_eq!(error["error"]["code"], "INVALID_ARGUMENT");
+                assert_eq!(error["error"]["message"], "path must be absolute");
+            } else {
+                assert_eq!(output.stderr, b"atx: path must be absolute\n");
+            }
+            assert!(!root.path().join("relative-state").exists());
+        }
+    }
+}
+
 /// Client pointed at the not-yet-existing state subdirectory, so ATX
 /// creates it with its required 0700 mode.
 fn tools(root: &std::path::Path) -> Command {

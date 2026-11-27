@@ -1,5 +1,6 @@
 //! `SQLite` job-store adapter.
 
+mod job_cancel;
 mod job_store;
 mod management;
 mod reconcile;
@@ -10,17 +11,19 @@ pub(crate) use job_store::JobStore;
 pub(crate) use reconcile::StartupStore;
 pub(crate) use retention::RetentionPolicy;
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rustix::fs::{FlockOperation, flock};
 use rustix::process::geteuid;
 use thiserror::Error;
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../../../migrations/0001_initial.sql")),
     (2, include_str!("../../../migrations/0002_hidden_jobs.sql")),
@@ -30,42 +33,38 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
 ];
 const MAX_BUSY_TIMEOUT_MS: u128 = 2_147_483_647;
-/// Attempts to observe a schema before declaring an existing empty DB corrupt.
-const INIT_SCHEMA_ATTEMPTS: u32 = 10;
-/// Delay between schema-observation retries while a peer initializes the DB.
-const INIT_SCHEMA_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 pub(crate) struct Database {
     connection: Connection,
 }
 
 impl Database {
+    /// Open and initialize under a bounded directory lease without rebuilding existing corrupt data.
     pub(crate) fn open(path: &Path, busy_timeout: Duration) -> Result<Self, StoreError> {
+        validate_busy_timeout(busy_timeout)?;
         let path = canonical_database_path(path)?;
+        // The directory lease covers publication/configuration/migration, not later SQL writes.
+        let _initialization = acquire_initialization(&path, busy_timeout)?;
         let created = prepare_database_file(&path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_FULL_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
         let mut connection = Connection::open_with_flags(path, flags)?;
-        configure_connection(&connection, busy_timeout)?;
-        // A pre-existing file without a schema is truncation or corruption,
-        // never a fresh install: refuse instead of silently rebuilding.
-        // Exception: a peer process may be mid-initialization with its
-        // migration transaction uncommitted, so retry briefly before
-        // declaring the empty file corrupt.
-        let mut attempts_left = INIT_SCHEMA_ATTEMPTS;
-        while !created
-            && connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0
-        {
-            attempts_left -= 1;
-            if attempts_left == 0 {
-                return Err(StoreError::Corrupt(
-                    "existing database file carries no schema".to_owned(),
-                ));
-            }
-            std::thread::sleep(INIT_SCHEMA_RETRY_DELAY);
+        connection.busy_timeout(busy_timeout)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if !created && version == 0 {
+            return Err(StoreError::Corrupt(
+                "existing database file carries no schema".to_owned(),
+            ));
         }
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(StoreError::NewerSchema {
+                found: version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        configure_connection(&connection, busy_timeout)?;
         apply_migrations(&mut connection, MIGRATIONS, CURRENT_SCHEMA_VERSION)?;
         let database = Self { connection };
         database.verify_pragmas(busy_timeout)?;
@@ -130,6 +129,81 @@ fn canonical_database_path(path: &Path) -> Result<std::path::PathBuf, StoreError
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
+fn validate_busy_timeout(timeout: Duration) -> Result<(), StoreError> {
+    if timeout.is_zero() || timeout.as_millis() > MAX_BUSY_TIMEOUT_MS {
+        return Err(StoreError::InvalidBusyTimeout);
+    }
+    Ok(())
+}
+
+fn remaining_initialization_budget(deadline: Instant) -> Result<Duration, StoreError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or(StoreError::Busy)
+}
+
+/// Exclude peer openers before file creation, releasing the lease when the descriptor drops.
+fn acquire_initialization(path: &Path, timeout: Duration) -> Result<File, StoreError> {
+    acquire_initialization_with_wait(path, timeout, std::thread::sleep)
+}
+
+fn acquire_initialization_with_wait(
+    path: &Path,
+    timeout: Duration,
+    mut wait: impl FnMut(Duration),
+) -> Result<File, StoreError> {
+    let parent = path.parent().ok_or(StoreError::InvalidDatabasePath)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(parent)?;
+    let held = directory.metadata()?;
+    if !held.is_dir() || held.uid() != geteuid().as_raw() || held.permissions().mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+                "database initialization directory must be owned by this user and not writable by others",
+        )
+        .into());
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(StoreError::InvalidBusyTimeout)?;
+    let mut waited = false;
+    loop {
+        if waited {
+            remaining_initialization_budget(deadline)?;
+        }
+        match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let current = fs::symlink_metadata(parent)?;
+                if !current.is_dir()
+                    || current.dev() != held.dev()
+                    || current.ino() != held.ino()
+                    || current.uid() != held.uid()
+                    || current.permissions().mode() & 0o022 != 0
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "database initialization directory changed while waiting",
+                    )
+                    .into());
+                }
+                return Ok(directory);
+            }
+            Err(rustix::io::Errno::WOULDBLOCK | rustix::io::Errno::INTR) => {
+                waited = true;
+                let remaining = remaining_initialization_budget(deadline)?;
+                let jitter = u64::try_from(remaining.as_nanos() % 11)
+                    .map_err(|_| StoreError::InvalidBusyTimeout)?;
+                wait(Duration::from_millis(10 + jitter).min(remaining));
+            }
+            Err(error) => return Err(io::Error::from(error).into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectionPragmas {
     pub(crate) foreign_keys: bool,
@@ -165,12 +239,14 @@ fn prepare_database_file(path: &Path) -> Result<bool, StoreError> {
 }
 
 fn configure_connection(connection: &Connection, busy_timeout: Duration) -> Result<(), StoreError> {
-    if busy_timeout.is_zero() || busy_timeout.as_millis() > MAX_BUSY_TIMEOUT_MS {
-        return Err(StoreError::InvalidBusyTimeout);
-    }
+    validate_busy_timeout(busy_timeout)?;
     connection.busy_timeout(busy_timeout)?;
     connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    }
     connection.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
 }
@@ -256,10 +332,10 @@ fn map_write_error(error: rusqlite::Error) -> StoreError {
 }
 
 fn map_read_error(error: rusqlite::Error) -> StoreError {
-    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error {
-        if let Some(StoreError::Corrupt(message)) = source.downcast_ref::<StoreError>() {
-            return StoreError::Corrupt(message.clone());
-        }
+    if let rusqlite::Error::FromSqlConversionFailure(_, _, source) = &error
+        && let Some(StoreError::Corrupt(message)) = source.downcast_ref::<StoreError>()
+    {
+        return StoreError::Corrupt(message.clone());
     }
     StoreError::Sqlite(error)
 }
@@ -274,9 +350,9 @@ mod tests {
 
     use rusqlite::Connection;
     use rustix::fs::OpenOptionsExt as _;
-    use tempfile::tempdir;
 
     use super::{CURRENT_SCHEMA_VERSION, Database, StoreError, apply_migrations, map_read_error};
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     #[test]
     fn schema_has_expected_constraints_and_indexes() {
@@ -337,6 +413,280 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn peer_bootstrap_waits_for_the_creator_instead_of_declaring_corruption() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::sync::mpsc;
+
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        let lease = std::fs::File::open(root.path()).expect("initializer directory");
+        flock(&lease, FlockOperation::NonBlockingLockExclusive).expect("creator lease");
+        assert!(super::prepare_database_file(&path).expect("create database"));
+        let (started, ready) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let peer_path = path.clone();
+        let peer = std::thread::spawn(move || {
+            started.send(()).expect("notify peer start");
+            let result = Database::open(&peer_path, Duration::from_secs(5))
+                .and_then(|database| database.schema_version());
+            finished.send(result).expect("peer result");
+        });
+        ready
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer started");
+        let early = completion.recv_timeout(Duration::from_millis(350));
+        let mut creator = Connection::open(&path).expect("creator connection");
+        super::configure_connection(&creator, Duration::from_secs(5)).expect("creator pragmas");
+        apply_migrations(&mut creator, super::MIGRATIONS, CURRENT_SCHEMA_VERSION)
+            .expect("creator migration");
+        drop(creator);
+        drop(lease);
+        let result = match early {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => completion
+                .recv_timeout(Duration::from_secs(5))
+                .expect("peer completed"),
+            Err(error) => {
+                assert!(
+                    matches!(error, mpsc::RecvTimeoutError::Timeout),
+                    "peer disconnected: {error}"
+                );
+                completion
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("peer completed")
+            }
+        };
+        peer.join().expect("peer joined");
+        assert_eq!(
+            result.expect("peer must not mistake a slow creator for corruption"),
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn held_initialization_lease_expires_without_changing_database_bytes() {
+        use rustix::fs::{FlockOperation, flock};
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        drop(Database::open(&path, Duration::from_secs(5)).expect("initial database"));
+        let before = std::fs::read(&path).expect("database bytes");
+        let lease = std::fs::File::open(root.path()).expect("directory");
+        flock(&lease, FlockOperation::NonBlockingLockExclusive).expect("held lease");
+        let started = std::time::Instant::now();
+        let error = Database::open(&path, Duration::from_millis(50))
+            .err()
+            .expect("lease must exclude a peer open");
+        assert!(matches!(error, StoreError::Busy), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(std::fs::read(&path).expect("unchanged database"), before);
+        drop(lease);
+        Database::open(&path, Duration::from_secs(5)).expect("lease released");
+    }
+
+    #[test]
+    fn invalid_initialization_budget_does_not_publish_an_empty_database() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        assert!(matches!(
+            Database::open(&path, Duration::ZERO),
+            Err(StoreError::InvalidBusyTimeout)
+        ));
+        assert!(
+            !path.exists(),
+            "an invalid budget poisoned a future first open"
+        );
+    }
+
+    #[test]
+    fn shared_default_timeout_matches_the_five_second_adr() {
+        let root = tempdir().expect("root");
+        assert_eq!(super::DATABASE_BUSY_TIMEOUT, Duration::from_secs(5));
+        let database = Database::open(&root.path().join("atx.db"), super::DATABASE_BUSY_TIMEOUT)
+            .expect("database");
+        assert_eq!(database.pragmas().expect("pragmas").busy_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn uncontended_initialization_does_not_consume_the_sqlite_busy_wait_budget() {
+        let root = tempdir().expect("root");
+        let database = Database::open(&root.path().join("atx.db"), Duration::from_nanos(1))
+            .expect("no lock contention requires no waiting budget");
+        assert_eq!(
+            database.schema_version().expect("schema"),
+            CURRENT_SCHEMA_VERSION
+        );
+        assert_eq!(database.pragmas().expect("pragmas").busy_timeout_ms, 0);
+    }
+
+    #[test]
+    fn concurrent_first_openers_observe_one_complete_schema() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let peers: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                barrier.wait();
+                let database = Database::open(&path, super::DATABASE_BUSY_TIMEOUT).expect("peer open");
+                assert_eq!(database.schema_version().expect("schema"), CURRENT_SCHEMA_VERSION);
+                assert_eq!(database.pragmas().expect("timeout").busy_timeout_ms, 5000);
+                let migrations: u32 = database.connection().query_row("SELECT count(*) FROM migrations", [], |row| row.get(0)).expect("migration count");
+                assert_eq!(migrations, 1);
+                let latest_index: u32 = database.connection().query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='jobs_hidden_id_idx'",
+                    [], |row| row.get(0),
+                ).expect("latest migration index");
+                assert_eq!(latest_index, 1);
+            })).collect();
+            for peer in peers {
+                peer.join().expect("peer joined");
+            }
+        });
+    }
+
+    #[test]
+    fn failed_initializer_releases_the_lease_but_is_not_rebuilt_as_fresh() {
+        use rustix::fs::{FlockOperation, flock};
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        let lease = std::fs::File::open(root.path()).expect("directory");
+        flock(&lease, FlockOperation::NonBlockingLockExclusive).expect("creator lease");
+        assert!(super::prepare_database_file(&path).expect("created"));
+        let mut connection = Connection::open(&path).expect("connection");
+        super::configure_connection(&connection, Duration::from_secs(5)).expect("pragmas");
+        assert!(
+            apply_migrations(
+                &mut connection,
+                &[
+                    (1, "CREATE TABLE first(value);"),
+                    (2, "CREATE TABLE broken(")
+                ],
+                2
+            )
+            .is_err()
+        );
+        drop(connection);
+        drop(lease);
+        let before = std::fs::read(&path).expect("failed initializer bytes");
+        assert!(matches!(
+            Database::open(&path, Duration::from_secs(5)),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::read(&path).expect("preserved failure"), before);
+    }
+
+    #[test]
+    fn schema_less_corruption_is_rejected_without_writing_a_sqlite_header() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("empty existing file");
+        assert!(matches!(
+            Database::open(&path, Duration::from_secs(5)),
+            Err(StoreError::Corrupt(_))
+        ));
+        assert_eq!(std::fs::metadata(&path).expect("untouched file").len(), 0);
+    }
+
+    #[test]
+    fn initialization_refuses_a_directory_writable_by_other_users() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("loose directory");
+        let result = Database::open(&path, Duration::from_secs(5));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private fixture");
+        assert!(
+            matches!(result, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn initialization_refuses_a_group_writable_directory() {
+        let root = tempdir().expect("root");
+        let path = root.path().join("atx.db");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775))
+            .expect("group-writable directory");
+        let result = Database::open(&path, Duration::from_secs(5));
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore private fixture");
+        assert!(
+            matches!(result, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn initialization_rejects_directory_replacement_while_waiting() {
+        use rustix::fs::{FlockOperation, flock};
+        let parent = tempdir().expect("parent");
+        let directory = parent.path().join("state");
+        std::fs::create_dir(&directory).expect("state");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private state");
+        let moved = parent.path().join("old-state");
+        let mut owner = Some(std::fs::File::open(&directory).expect("directory"));
+        flock(
+            owner.as_ref().expect("owner"),
+            FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("owner lease");
+        let mut changed = false;
+        let result = super::acquire_initialization_with_wait(
+            &directory.join("atx.db"),
+            Duration::from_secs(5),
+            |_| {
+                assert!(!changed);
+                std::fs::rename(&directory, &moved).expect("move locked directory");
+                std::fs::create_dir(&directory).expect("replacement");
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                    .expect("private replacement");
+                drop(owner.take());
+                changed = true;
+            },
+        );
+        assert!(
+            changed,
+            "replacement must occur after the blocked acquisition"
+        );
+        assert!(
+            matches!(result, Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        assert!(!directory.join("atx.db").exists());
+        assert!(!moved.join("atx.db").exists());
+    }
+
+    #[test]
+    fn a_late_lease_release_cannot_extend_an_expired_wait_budget() {
+        use rustix::fs::{FlockOperation, flock};
+        let root = tempdir().expect("root");
+        let mut owner = Some(std::fs::File::open(root.path()).expect("directory"));
+        flock(
+            owner.as_ref().expect("owner"),
+            FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("owner lease");
+        let result = super::acquire_initialization_with_wait(
+            &root.path().join("atx.db"),
+            Duration::from_millis(30),
+            |_| {
+                std::thread::sleep(Duration::from_millis(60));
+                drop(owner.take());
+            },
+        );
+        assert!(
+            matches!(result, Err(StoreError::Busy)),
+            "late release was accepted after the wait deadline"
+        );
+        assert!(!root.path().join("atx.db").exists());
     }
 
     #[test]
@@ -606,12 +956,17 @@ mod tests {
         }
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("restrict mode");
+        let before = std::fs::read(&path).expect("newer database bytes");
         assert!(matches!(
             Database::open(&path, Duration::from_secs(5)),
             Err(super::StoreError::NewerSchema { found, supported })
                 if found == CURRENT_SCHEMA_VERSION + 1
                     && supported == CURRENT_SCHEMA_VERSION
         ));
+        assert_eq!(
+            std::fs::read(&path).expect("unchanged newer database"),
+            before
+        );
         let connection = Connection::open(path).expect("reopen");
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))

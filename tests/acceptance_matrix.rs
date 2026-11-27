@@ -1,10 +1,10 @@
-//! Version 1 Acceptance Matrix eval pack (`.local/plan.md` §12).
+//! Representative CLI cases for the public matrix in `docs/acceptance.md`.
 //!
-//! One test per matrix scenario. Each test either exercises the real binary
+//! Each test either exercises the real binary
 //! end-to-end or asserts the scenario's observable invariant through the
 //! public CLI surface. Deep invariants already owned by unit/integration
-//! suites get a representative end-to-end check here so the matrix stays a
-//! single executable document.
+//! suites get a representative end-to-end check here so the matrix stays
+//! executable. The public matrix maps distinct primary tests across suites.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -68,6 +68,58 @@ fn wait_for(predicate: impl Fn() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
+/// Check the job and its own finished run before trusting a command's output file.
+fn successful_run_finished(state: &std::path::Path, job: &str, deadline: Instant) -> bool {
+    let shown = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(state)
+            .args(["show", job]),
+        deadline,
+    )
+    .expect("bounded job status");
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("job JSON");
+    assert_eq!(shown["schema_version"], 1);
+    assert_eq!(shown["ok"], true);
+    match shown["data"]["state"].as_str().expect("job state") {
+        "scheduled" | "waiting" | "starting" | "running" | "cancel_requested" => return false,
+        "succeeded" => {}
+        other => panic!("expected job {job} to succeed, got {other}"),
+    }
+    let history = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(state)
+            .args(["history", job, "--limit", "1"]),
+        deadline,
+    )
+    .expect("bounded matching history");
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+    assert_eq!(history["schema_version"], 1);
+    assert_eq!(history["ok"], true);
+    let run = history["data"]
+        .as_array()
+        .expect("history array")
+        .first()
+        .expect("successful job must have a recorded run");
+    assert_eq!(run["job_id"], job);
+    run["state"] == "succeeded" && run["finished_at_utc"].is_string() && run["outcome"].is_object()
+}
+
+/// Wait for the successful job and its matching run to finish.
+fn wait_for_successful_run(state: &std::path::Path, job: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !successful_run_finished(state, job, deadline) {
+        assert!(
+            Instant::now() < deadline,
+            "job {job} never completed successfully"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Kill only the supervisor serving `state` to simulate a crash.
 fn kill_state_supervisors(state: &std::path::Path) {
     support::kill_session_supervisor(state).expect("kill fixture supervisor");
@@ -95,6 +147,7 @@ fn s1_direct_argv_preserves_special_characters_and_unicode() {
     // the child's argv verbatim.
     let payload = "a'b\"c$d%e\\f;g|&h→😀";
     let submitted = atx()
+        .arg("--json")
         .arg("--state-dir")
         .arg(&state)
         .args([
@@ -110,8 +163,48 @@ fn s1_direct_argv_preserves_special_characters_and_unicode() {
         .output()
         .expect("submit");
     assert!(submitted.status.success(), "{submitted:?}");
-    wait_for(|| marker.exists(), "argv job to write its payload");
+    let response: serde_json::Value =
+        serde_json::from_slice(&submitted.stdout).expect("submission JSON");
+    let job = response["data"]["job_id"].as_str().expect("job ID");
+    wait_for_successful_run(&state, job);
     assert_eq!(fs::read_to_string(&marker).expect("payload"), payload);
+}
+
+#[test]
+fn payload_readiness_rejects_an_open_file_while_its_writer_is_running() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let _ = json_run(&state, &["30m", "--", "/bin/true"]);
+    let payload = root.path().join("payload");
+    let opened = root.path().join("opened");
+    let release = root.path().join("release");
+    let submitted = atx()
+        .args(["--json", "--state-dir"])
+        .arg(&state)
+        .args([
+            "1s", "--", "/bin/sh", "-c",
+            ": > \"$1\"; printf opened > \"$2\"; while [ ! -f \"$3\" ]; do /bin/sleep 0.01; done; printf complete > \"$1\"",
+            "writer",
+        ])
+        .arg(&payload).arg(&opened).arg(&release)
+        .output().expect("submit controlled writer");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let response: serde_json::Value =
+        serde_json::from_slice(&submitted.stdout).expect("submission JSON");
+    let job = response["data"]["job_id"].as_str().expect("job ID");
+    wait_for(|| opened.exists(), "writer to open its payload");
+    assert_eq!(fs::read(&payload).expect("opened payload"), b"");
+    assert_eq!(job_state(&state, job).as_deref(), Some("running"));
+    assert!(
+        !successful_run_finished(&state, job, Instant::now() + Duration::from_secs(5)),
+        "an open file was treated as a completed run"
+    );
+    fs::write(&release, "release writer").expect("release");
+    wait_for_successful_run(&state, job);
+    assert_eq!(
+        fs::read_to_string(&payload).expect("completed payload"),
+        "complete"
+    );
 }
 
 /// S2: Shell operators are inert without explicit `--shell`.
@@ -457,13 +550,24 @@ fn s13_s14_cancellation_reaches_group_and_escalates() {
     let state = root.path().join("state");
     let started = root.path().join("started");
     let script = format!(
-        "touch '{}'; trap '' TERM; while :; do sleep 0.2; done",
+        "trap '' TERM; printf '%s\\n' \"$$\" > '{}'; while :; do sleep 0.2; done",
         started.display()
     );
     let submission = json_run(&state, ["5s", "--", "/bin/sh", "-c", &script].as_slice());
     let job_id = submission["job_id"].as_str().expect("id").to_owned();
 
-    wait_for(|| started.exists(), "TERM-immune child to start");
+    wait_for(
+        || {
+            fs::read_to_string(&started)
+                .is_ok_and(|text| text.trim().parse::<i32>().is_ok_and(|pid| pid > 1))
+        },
+        "TERM-immune child PID to be recorded",
+    );
+    let command_pid = fs::read_to_string(&started)
+        .expect("command PID")
+        .trim()
+        .parse::<i32>()
+        .expect("valid command PID");
     let cancelled = atx()
         .arg("--state-dir")
         .arg(&state)
@@ -475,7 +579,7 @@ fn s13_s14_cancellation_reaches_group_and_escalates() {
 
     // The TERM-ignoring child must still die (KILL escalation).
     wait_for(
-        || !term_immune_child_alive(),
+        || !term_immune_child_alive(root.path(), command_pid),
         "KILL escalation to reap TERM-immune child",
     );
     wait_for(
@@ -488,12 +592,45 @@ fn s13_s14_cancellation_reaches_group_and_escalates() {
     );
 }
 
-fn term_immune_child_alive() -> bool {
-    Command::new("/usr/bin/pgrep")
-        .args(["-f", "trap '' TERM; while :; do sleep 0.2; done"])
-        .stdout(Stdio::piped())
-        .output()
-        .is_ok_and(|o| o.status.success())
+fn term_immune_child_alive(root: &std::path::Path, pid: i32) -> bool {
+    support::fixture_process_ids(root)
+        .expect("scoped command census")
+        .contains(&pid)
+}
+
+#[test]
+fn cancellation_observer_ignores_a_matching_foreign_fixture() {
+    let root = tempdir().expect("root");
+    let peer = tempdir().expect("peer");
+    let marker = peer.path().join("ready");
+    let script = format!(
+        "trap '' TERM; printf '%s\\n' \"$$\" > '{}'; while :; do sleep 0.2; done",
+        marker.display()
+    );
+    let peer_state = peer.path().join("state");
+    json_run(&peer_state, &["2s", "--", "/bin/sh", "-c", &script]);
+    wait_for(
+        || {
+            fs::read_to_string(&marker)
+                .is_ok_and(|text| text.trim().parse::<i32>().is_ok_and(|pid| pid > 1))
+        },
+        "owned ATX peer ready",
+    );
+    let pid = fs::read_to_string(&marker)
+        .expect("peer PID")
+        .trim()
+        .parse::<i32>()
+        .expect("signed peer PID");
+    assert!(
+        term_immune_child_alive(peer.path(), pid),
+        "peer must really be live"
+    );
+    assert!(
+        !term_immune_child_alive(root.path(), pid),
+        "foreign fixture contaminated this root {}",
+        root.path().display()
+    );
+    peer.stop_background().expect("stop owned ATX peer");
 }
 
 /// S15: Cancelling an already-terminal run is idempotent — no signal ever
@@ -529,11 +666,11 @@ fn s15_late_cancellation_is_idempotent_never_signals() {
     assert_eq!(late.status.code(), Some(4), "{late:?}");
 }
 
-/// S16/S17: Recovery paths preserve outcomes exactly once — repeated
+/// S26: Recovery paths preserve outcomes exactly once — repeated
 /// reconciliation neither duplicates nor mutates recorded history. Deep
 /// crash scenarios are owned by tests/resilience.rs.
 #[test]
-fn s16_s17_reconciliation_preserves_outcomes_exactly_once() {
+fn s26_reconciliation_preserves_outcomes_exactly_once() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let submission = json_run(&state, &["2s", "--", "/bin/true"]);

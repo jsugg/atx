@@ -137,7 +137,8 @@ artifacts are checksummed and attested. There is no "fixing" a bad
 release — you cut a new one. If a release is broken:
 
 1. Yank nothing yet; first decide how bad it is (see criteria below).
-2. Fix forward: cut `vX.Y+1` with the fix, following the normal process.
+2. Fix forward: cut the next patch version (for example, `v0.1.2` after
+   `v0.1.1`) with the fix, following the normal process.
 3. If the draft release has not been published yet, just fix and re-run;
    drafts can be deleted freely.
 4. Point any announcements at the fixed release.

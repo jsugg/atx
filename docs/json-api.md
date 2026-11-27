@@ -140,9 +140,10 @@ These are JSON values. CLI option values may use different spelling, such as
 | `execution` | object | execution settings below |
 | `active_run_id` | string or null | currently always null; use `ps` or `history` for runs |
 
-The last run's outcome is not part of the job object. Read it from `history` or
-`output`. `remaining_seconds` can be zero just after the deadline and becomes
-negative once the job is at least one second overdue.
+Unlike human `atx show`, which prints a summary of the last run's outcome for
+convenience, the JSON job object intentionally omits run outcomes. Read them
+from `history` or `output`. `remaining_seconds` can be zero just after the
+deadline and becomes negative once the job is at least one second overdue.
 
 ### Execution object
 

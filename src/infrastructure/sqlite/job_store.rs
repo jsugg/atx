@@ -36,6 +36,11 @@ impl JobStore {
         &self.database
     }
 
+    #[cfg(test)]
+    pub(crate) const fn database_mut(&mut self) -> &mut Database {
+        &mut self.database
+    }
+
     pub(crate) fn create(&mut self, job: &Job) -> Result<(), StoreError> {
         let snapshot = job.snapshot();
         let schedule = serde_json::to_string(&snapshot.schedule)
@@ -124,7 +129,6 @@ impl JobStore {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn transition_job(
         &mut self,
         id: JobId,
@@ -357,14 +361,13 @@ pub(super) mod tests {
 
     use std::time::{Duration, Instant};
 
-    use tempfile::tempdir;
-
     use super::super::{Database, StoreError};
     use super::{JobStore, MAX_PAGE_SIZE};
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, JobId, JobState,
         MissedPolicy, RuntimeTier, Schedule, TransitionActor, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     pub(crate) fn sample_job(now: i64, due: i64) -> Job {
         let now = UtcTimestamp::from_second(now).expect("valid timestamp");

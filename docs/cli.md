@@ -43,7 +43,13 @@ not assemble this string from untrusted input.
   `--verbose`; diagnostics still go to stderr.
 - `-v`, `--verbose` requests extra diagnostics.
 - `--color MODE` chooses color behavior. `MODE` is `auto`, `always`, or `never`;
-  without the flag, the configured color mode applies.
+  an explicit flag takes priority over configuration and environment defaults.
+  Without it, `NO_COLOR` being present, even empty, or `TERM=dumb` disables
+  color. Otherwise the configured mode applies. `auto` checks the destination
+  stream: stdout for human results and help, stderr for parser errors.
+  Explicit `--color auto` uses that TTY check even with either environment
+  disable set. `always` forces color and `never` disables it. JSON output and
+  plain runtime diagnostics do not gain color.
 - `-h`, `--help` prints help and exits successfully. `atx help` is also
   available.
 - `-V`, `--version` prints the program version and exits successfully.
@@ -85,7 +91,11 @@ rejected unless `--dst earlier` or `--dst later` chooses an offset.
   supervisor was running. `POLICY` is `hold`, `run-latest`, or `skip`.
 - `--durable` requires installed launchd or systemd integration. It never falls
   back to session mode.
-- `--cwd DIRECTORY` runs from an existing absolute working directory.
+- `--cwd DIRECTORY` runs from an existing directory. An absolute path is used
+  directly; a relative path is resolved from the submitting shell's current
+  directory at submission. ATX stores the canonical absolute path, so later
+  shell directory changes do not affect the job. Without this option, ATX
+  saves the submitting shell's current directory in the same form.
 - `--name NAME` sets a short display name; `--description TEXT` stores a longer
   note.
 - `--shell` runs one command string through the configured shell.
@@ -124,13 +134,21 @@ output, and `doctor`.
 `JOB` and `RUN` accept a full ID or a unique prefix. A non-unique prefix is an
 error. Commands that produce a list default to 100 records.
 
+A close command typo such as `atx hisotry` gets a hint when one command is the
+clear match. Hints never rewrite the input or run a command. Time expressions
+and program arguments after `--` are not treated as command typos.
+
 - `atx list [--state STATE] [--limit N]` lists saved jobs (`ls` is an alias).
   States are `scheduled`, `waiting`, `starting`, `running`, `cancel-requested`,
   `succeeded`, `failed`, `cancelled`, `interrupted`, and `missed`.
 - `atx show JOB` shows one job, its schedule, execution details, and last
   outcome.
 - `atx cancel JOB [--grace DURATION]` requests cancellation; the configured
-  grace period applies when omitted.
+  grace period applies when omitted. It waits for the active run to stop and
+  for its terminal record. A human stderr TTY gets one wait notice; `--quiet`,
+  `--json` and non-TTY stderr get none. The process may use one grace period,
+  followed by a terminal-record window of grace plus two seconds. The notice
+  reports those combined waits. Database work can add time outside that window.
 - `atx rm JOB [--cancel] [--keep-history]` removes a job. It refuses a live job
   unless `--cancel` is supplied. History is removed unless `--keep-history` is
   supplied.

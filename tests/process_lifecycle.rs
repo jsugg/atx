@@ -5,10 +5,10 @@
 mod support;
 
 use std::fs;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
@@ -20,8 +20,541 @@ use support::{
     process_exists, process_is_terminal, retry_inspection, tempdir, tempdir_in,
 };
 
+#[test]
+fn owned_child_guard_reaps_an_exited_child_and_preserves_another_fixture() {
+    let root = support::tempdir().expect("root");
+    let other = support::tempdir().expect("other root");
+    let mut outsider = other
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args(["-c", "read hold"])
+                .stdin(Stdio::piped()),
+        )
+        .expect("held child");
+    let pid;
+    {
+        let child = root
+            .spawn_owned(Command::new("/bin/sh").args(["-c", "exit 9"]))
+            .expect("exiting child");
+        pid = i32::try_from(child.id()).expect("PID");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: zero is valid for siginfo storage, including the no-event result.
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            // SAFETY: this guard owns an unreaped child; WNOWAIT observes without consuming it.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid.try_into().expect("child ID"),
+                    &raw mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "observe child exit: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: initialized storage contains child-status information or all-zero no event.
+            if unsafe { info.si_pid() } == pid {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    assert!(!support::process_exists(pid).expect("child census"));
+    assert!(outsider.try_wait().expect("outsider status").is_none());
+    let outsider_pid = i32::try_from(outsider.id()).expect("PID");
+    drop(outsider);
+    assert!(!support::process_exists(outsider_pid).expect("outsider census"));
+}
+
+#[test]
+fn root_cleanup_cannot_reap_a_child_while_its_guard_is_live() {
+    let root = support::tempdir().expect("root");
+    let child = root
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args(["-c", "read hold"])
+                .stdin(Stdio::piped()),
+        )
+        .expect("held child");
+    let error = root
+        .stop_background()
+        .expect_err("child guard owns reaping");
+    assert!(error.contains("owned child guards"), "{error}");
+    drop(child);
+    root.stop_background().expect("cleanup after child reaped");
+}
+
+#[test]
+fn failed_root_cleanup_preserves_diagnostics_and_runtime_evidence() {
+    let root = tempdir().expect("root");
+    let path = root.path().to_owned();
+    let runtime = path.join("state/runtime");
+    fs::create_dir_all(&runtime).expect("runtime");
+    fs::write(runtime.join("supervisor.lock"), "malformed identity").expect("invalid lock");
+    fs::write(path.join("daemon.err"), "useful failure evidence").expect("diagnostic");
+    let result = catch_unwind(AssertUnwindSafe(|| drop(root)));
+    let retained = path.exists();
+    let evidence = fs::read_to_string(path.join("daemon.err"));
+    if retained {
+        fs::remove_dir_all(&path).expect("remove this process-free fault fixture");
+    }
+    assert!(
+        result.is_err(),
+        "malformed cleanup identity must remain an error"
+    );
+    assert!(
+        retained,
+        "failed cleanup deleted its retry/diagnostic evidence"
+    );
+    assert_eq!(
+        evidence.expect("retained diagnostic"),
+        "useful failure evidence"
+    );
+}
+
+#[test]
+fn owned_child_stop_forces_an_ignored_sigterm_and_is_idempotent() {
+    let root = support::tempdir().expect("root");
+    let ready = root.path().join("ready");
+    let mut child = root
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; printf ready > \"$1\"; read hold",
+                    "held-child",
+                ])
+                .arg(&ready)
+                .stdin(Stdio::piped()),
+        )
+        .expect("TERM-ignoring child");
+    let pid = i32::try_from(child.id()).expect("PID");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "child did not install TERM handler"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let started = Instant::now();
+    let status = child.stop().expect("bounded force-stop");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(child.stop().expect("repeat stop"), status);
+    drop(child);
+    assert!(!support::process_exists(pid).expect("child census"));
+}
+
 fn atx() -> Command {
     Command::new(env!("CARGO_BIN_EXE_atx"))
+}
+
+#[test]
+fn terminal_reaping_requires_matching_identity_user_and_parent() {
+    let owner = rustix::process::geteuid().as_raw();
+    let parent = i32::try_from(std::process::id()).expect("parent PID");
+    let expected = ProcessIdentity::for_test("boot", 42, 100, 42);
+    let row = ProcessRow::for_test(42, parent, 42, owner).with_state_for_test("Z");
+    let cases = [
+        (
+            row.clone(),
+            Inspection::Present(expected.clone()),
+            true,
+            true,
+        ),
+        (
+            row.clone(),
+            Inspection::Present(ProcessIdentity::for_test("boot", 42, 101, 42)),
+            false,
+            true,
+        ),
+        (row.clone(), Inspection::Absent, false, false),
+        (row.clone(), Inspection::Transient, false, false),
+        (
+            ProcessRow::for_test(42, 0, 42, owner).with_state_for_test("Z"),
+            Inspection::Present(expected.clone()),
+            false,
+            false,
+        ),
+        (
+            ProcessRow::for_test(42, parent, 42, owner + 1).with_state_for_test("Z"),
+            Inspection::Present(expected.clone()),
+            false,
+            true,
+        ),
+    ];
+    for (row, current, should_reap, finished) in cases {
+        let called = std::cell::Cell::new(false);
+        let result = support::reap_terminal_with_identity(&expected, &row, current, |pid| {
+            assert_eq!(pid, 42);
+            called.set(true);
+            Ok(true)
+        })
+        .expect("terminal disposition");
+        assert_eq!(called.get(), should_reap);
+        assert_eq!(result, finished);
+    }
+}
+
+#[test]
+fn bounded_probe_drains_both_pipes_and_preserves_a_failed_exit() {
+    let output = support::bounded_probe_output(
+        Command::new("/bin/sh").args(["-c", "i=0; while [ $i -lt 2000 ]; do printf 0123456789abcdef; printf fedcba9876543210 >&2; i=$((i+1)); done; exit 7"]),
+        Instant::now() + Duration::from_secs(2),
+    ).expect("bounded output");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"0123456789abcdef".repeat(2000));
+    assert_eq!(output.stderr, b"fedcba9876543210".repeat(2000));
+}
+
+#[test]
+fn concurrent_census_requests_share_one_fresh_capture() {
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let provider = Arc::new(support::CensusProvider::default());
+    let barrier = Arc::new(Barrier::new(8));
+    let captures = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let result = provider.snapshot(Instant::now() + Duration::from_secs(5), || {
+                        if captures.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            while provider.waiter_count().expect("waiters") != 7 {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "followers did not join capture"
+                                );
+                                std::thread::yield_now();
+                            }
+                        }
+                        Ok(Vec::new())
+                    });
+                    assert!(result.expect("shared census").is_empty());
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+    });
+    let batched = captures.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&batched));
+    provider
+        .snapshot(Instant::now() + Duration::from_secs(2), || {
+            captures.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        })
+        .expect("next observation must be fresh");
+    assert_eq!(captures.load(Ordering::SeqCst), batched + 1);
+}
+
+#[test]
+fn census_requests_cannot_use_a_snapshot_started_before_their_request() {
+    use std::sync::{Arc, mpsc};
+    let provider = Arc::new(support::CensusProvider::default());
+    let (started, ready) = mpsc::channel();
+    let (release, permission) = mpsc::channel();
+    let owner = Arc::clone(&provider);
+    let worker = std::thread::spawn(move || {
+        owner.snapshot(Instant::now() + Duration::from_secs(2), || {
+            started.send(()).expect("old capture started");
+            permission
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release");
+            Ok(vec![ProcessRow::for_test(42, 1, 42, 502)])
+        })
+    });
+    ready
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner active");
+    let watched = Arc::clone(&provider);
+    let releaser = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while watched.waiter_count().expect("waiters") == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        release.send(()).expect("release old capture");
+    });
+    let result = provider
+        .snapshot(Instant::now() + Duration::from_secs(2), || {
+            Ok(vec![ProcessRow::for_test(43, 1, 43, 502)])
+        })
+        .expect("fresh subsequent capture");
+    worker.join().expect("owner").expect("owner result");
+    releaser.join().expect("releaser");
+    assert_eq!(result, vec![ProcessRow::for_test(43, 1, 43, 502)]);
+}
+
+#[test]
+fn census_follower_timeout_does_not_cancel_the_capture_owner() {
+    use std::sync::{Arc, mpsc};
+    let provider = Arc::new(support::CensusProvider::default());
+    let (started, ready) = mpsc::channel();
+    let (release, permission) = mpsc::channel();
+    let owner = Arc::clone(&provider);
+    let worker = std::thread::spawn(move || {
+        owner.snapshot(Instant::now() + Duration::from_secs(2), || {
+            started.send(()).expect("started");
+            permission
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release");
+            Ok(Vec::new())
+        })
+    });
+    ready
+        .recv_timeout(Duration::from_secs(2))
+        .expect("owner running");
+    let result = provider.snapshot(Instant::now() + Duration::from_millis(5), || {
+        panic!("a follower must not start another capture");
+    });
+    release.send(()).expect("release capture");
+    assert!(
+        worker
+            .join()
+            .expect("owner")
+            .expect("owner result")
+            .is_empty()
+    );
+    assert!(result.expect_err("follower timeout").contains("deadline"));
+    assert_eq!(provider.waiter_count().expect("waiters"), 0);
+}
+
+#[test]
+fn census_capture_failure_is_visible_and_does_not_leave_an_inflight_owner() {
+    let provider = support::CensusProvider::default();
+    let error = provider
+        .snapshot(Instant::now() + Duration::from_secs(2), || {
+            panic!("injected census capture failure");
+        })
+        .expect_err("capture panic must be visible");
+    assert!(error.contains("capture panicked"), "{error}");
+    assert_eq!(provider.waiter_count().expect("waiters"), 0);
+    assert!(
+        provider
+            .snapshot(Instant::now() + Duration::from_secs(2), || Ok(Vec::new()))
+            .expect("next fresh capture")
+            .is_empty()
+    );
+}
+
+#[test]
+fn targeted_process_observers_reject_group_and_kernel_ids() {
+    for pid in [0, -1] {
+        assert!(support::process_exists(pid).is_err());
+        assert!(support::process_is_terminal(pid).is_err());
+    }
+}
+
+#[test]
+fn process_census_uses_the_accounting_name_before_argv_validation() {
+    for pid in [None, Some(i32::try_from(std::process::id()).expect("PID"))] {
+        let command = support::process_census_command(pid).expect("census command");
+        assert_eq!(command.get_program(), "/bin/ps");
+        assert_eq!(
+            command.get_args().last().expect("columns"),
+            "pid=,ppid=,pgid=,uid=,state=,ucomm=",
+            "the ownership prefilter must not read executable paths or process arguments"
+        );
+    }
+    for pid in [0, -1] {
+        assert!(support::process_census_command(Some(pid)).is_err());
+    }
+}
+
+#[test]
+fn terminal_identity_rechecks_a_process_that_exits_during_state_observation() {
+    let expected = ProcessIdentity::for_test("boot", 42, 100, 42);
+    let mut inspections = [Inspection::Present(expected.clone()), Inspection::Absent].into_iter();
+    let result = support::terminal_identity_with_probes(
+        &expected,
+        || Ok(inspections.next().expect("two identity observations")),
+        || Ok(false),
+    )
+    .expect("terminal observation");
+    assert!(
+        result,
+        "a departed process was treated as live from an older state sample"
+    );
+}
+
+#[test]
+fn completed_probe_does_not_wait_for_another_process_holding_its_pipes() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::{ChildStderr, ChildStdout};
+
+    let root = tempdir().expect("root");
+    let (stdout_reader, stdout_writer) = UnixStream::pair().expect("stdout pair");
+    let (stderr_reader, stderr_writer) = UnixStream::pair().expect("stderr pair");
+    let mut holder = root
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args(["-c", "read hold"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(
+                    stdout_writer.try_clone().expect("holder stdout"),
+                )))
+                .stderr(Stdio::from(OwnedFd::from(
+                    stderr_writer.try_clone().expect("holder stderr"),
+                ))),
+        )
+        .expect("owned pipe holder");
+    let mut producer = root
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args(["-c", "printf producer-done; exit 7"])
+                .stdout(Stdio::from(OwnedFd::from(stdout_writer)))
+                .stderr(Stdio::from(OwnedFd::from(stderr_writer))),
+        )
+        .expect("owned producer");
+    producer.stdout = Some(ChildStdout::from(OwnedFd::from(stdout_reader)));
+    producer.stderr = Some(ChildStderr::from(OwnedFd::from(stderr_reader)));
+    let started = Instant::now();
+    let result = support::bounded_owned_probe_output(
+        &mut producer,
+        Instant::now() + Duration::from_millis(500),
+    );
+    let elapsed = started.elapsed();
+    let holder_was_alive = holder.try_wait().expect("holder status").is_none();
+    let holder_pid = i32::try_from(holder.id()).expect("holder PID");
+    drop(holder);
+    assert!(!process_exists(holder_pid).expect("reaped holder"));
+    assert!(
+        holder_was_alive,
+        "the probe must not stop the other pipe holder"
+    );
+    let output = result.expect("completed producer must not wait for another writer's EOF");
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.stdout, b"producer-done");
+    assert!(elapsed < Duration::from_millis(400), "{elapsed:?}");
+}
+
+#[test]
+fn process_census_capture_accepts_large_tables_but_bounds_a_held_ps() {
+    let rows = support::process_table_with_command(
+        Command::new("/bin/sh").args(["-c", "i=0; while [ $i -lt 3000 ]; do printf '42 1 42 502 S /bin/test-command\\n'; i=$((i+1)); done"]),
+        Instant::now() + Duration::from_secs(2),
+    ).expect("large bounded process table");
+    assert_eq!(rows.len(), 3000);
+    let started = Instant::now();
+    let error = support::process_table_with_command(
+        Command::new("/bin/sleep").arg("2"),
+        Instant::now() + Duration::from_millis(100),
+    )
+    .expect_err("held census command");
+    assert!(error.contains("deadline"), "{error}");
+    assert!(started.elapsed() < Duration::from_millis(1500));
+}
+
+#[test]
+fn bounded_probe_reaps_either_stream_after_an_output_limit() {
+    let root = tempdir().expect("root");
+    for descriptor in ["1", "2"] {
+        let pid_file = root.path().join(format!("writer-{descriptor}.pid"));
+        let error = support::bounded_probe_output(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '%s' $$ > \"$1\"; i=0; while [ $i -lt 9000 ]; do printf 0123456789abcdef >&\"$2\"; i=$((i+1)); done", "writer"])
+                .arg(&pid_file).arg(descriptor),
+            Instant::now() + Duration::from_secs(2),
+        ).expect_err("oversized output");
+        assert!(error.contains("output limit"), "{error}");
+        assert!(error.len() < 20_000, "fault output must use bounded tails");
+        let pid: i32 = fs::read_to_string(pid_file)
+            .expect("writer PID")
+            .parse()
+            .expect("PID");
+        assert!(!process_exists(pid).expect("writer census"));
+    }
+}
+
+#[test]
+fn expired_probe_deadline_does_not_spawn_a_child() {
+    let root = tempdir().expect("root");
+    let marker = root.path().join("unexpected-spawn");
+    let error = support::bounded_probe_output(
+        Command::new("/bin/sh")
+            .args(["-c", "printf spawned > \"$1\"", "probe"])
+            .arg(&marker),
+        Instant::now(),
+    )
+    .expect_err("expired deadline");
+    assert!(error.contains("deadline"), "{error}");
+    assert!(!marker.exists());
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config {
+        cases: 64,
+        failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::Direct(
+            "tests/fixtures/process-lifecycle.proptest-regressions",
+        ))),
+        ..proptest::test_runner::Config::default()
+    })]
+    #[test]
+    fn diagnostic_tails_are_bounded_for_arbitrary_bytes(
+        bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..32_768),
+    ) {
+        let log = tempfile::NamedTempFile::new().expect("log");
+        fs::write(log.path(), &bytes).expect("diagnostic bytes");
+        let tail = support::bounded_log_tail(log.path()).expect("tail");
+        let expected = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..]);
+        proptest::prop_assert!(tail.ends_with(expected.as_ref()));
+        proptest::prop_assert!(tail.len() <= 8192 * 3 + 80);
+        proptest::prop_assert_eq!(tail.starts_with("[truncated"), bytes.len() > 8192);
+    }
+}
+
+#[test]
+fn diagnostic_tail_reads_large_sparse_files_and_reports_missing_logs() {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut log = tempfile::NamedTempFile::new().expect("log");
+    log.as_file()
+        .set_len(128 * 1024 * 1024)
+        .expect("sparse diagnostic");
+    log.seek(SeekFrom::End(-13)).expect("tail position");
+    log.write_all(b"startup-fault").expect("tail");
+    let tail = support::bounded_log_tail(log.path()).expect("bounded sparse tail");
+    assert!(tail.ends_with("startup-fault"));
+    assert!(tail.len() < 10_000);
+    let missing = log.path().with_extension("missing");
+    assert_eq!(
+        support::bounded_log_tail(&missing)
+            .expect_err("missing log")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn diagnostic_tail_rejects_symlinks_directories_and_fifos() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().expect("root");
+    let file = root.path().join("log");
+    fs::write(&file, "private log").expect("log");
+    let link = root.path().join("link");
+    symlink(&file, &link).expect("symlink");
+    assert!(support::bounded_log_tail(&link).is_err());
+    assert!(support::bounded_log_tail(root.path()).is_err());
+    let fifo = root.path().join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: the owned path is NUL-terminated and `mkfifo` takes an integer mode.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let started = Instant::now();
+    assert!(support::bounded_log_tail(&fifo).is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 fn submit(state: &Path, delay: &str, command: &[&str]) -> String {
@@ -237,6 +770,8 @@ fn hard_stop_is_scoped_to_one_fixture() {
 
     kill_session_supervisor(&first_state).expect("kill first supervisor");
 
+    assert!(process_is_terminal(first_pid).expect("first supervisor terminal"));
+    first.stop_background().expect("reap first fixture");
     assert_process_gone(first_pid);
     assert!(
         process_exists(second_pid).expect("inspect second supervisor"),
@@ -391,10 +926,12 @@ fn service_readiness_reports_early_exit_and_reaps_the_child() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let log = root.path().join("daemon.err");
-    let mut child = std::process::Command::new("/bin/sh")
-        .args(["-c", "echo startup-fault >&2; exit 9"])
-        .stderr(fs::File::create(&log).expect("log"))
-        .spawn()
+    let mut child = root
+        .spawn_owned(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "echo startup-fault >&2; exit 9"])
+                .stderr(fs::File::create(&log).expect("log")),
+        )
         .expect("failing service");
     let error = support::wait_for_service(&mut child, &state, &state.join("runtime"), &log)
         .expect_err("early service exit");
@@ -406,6 +943,42 @@ fn service_readiness_reports_early_exit_and_reaps_the_child() {
             .expect("reaped child")
             .expect("exit")
             .code(),
+        Some(9)
+    );
+}
+
+#[test]
+fn early_service_failure_retains_only_a_bounded_diagnostic_tail() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let log = root.path().join("daemon.err");
+    fs::write(&log, "old startup noise\n".repeat(20_000)).expect("large log");
+    let mut child = root
+        .spawn_owned(
+            Command::new("/bin/sh")
+                .args(["-c", "printf useful-startup-fault >&2; exit 9"])
+                .stderr(
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&log)
+                        .expect("append log"),
+                ),
+        )
+        .expect("failing child");
+    let error = support::wait_for_service(&mut child, &state, &state.join("runtime"), &log)
+        .expect_err("startup failure");
+    assert!(
+        error.contains("useful-startup-fault"),
+        "tail lost the fault"
+    );
+    assert!(
+        error.len() < 10_000,
+        "diagnostic allocated {} bytes",
+        error.len()
+    );
+    assert!(error.contains("truncated"), "truncation must be explicit");
+    assert_eq!(
+        child.try_wait().expect("status").expect("reaped").code(),
         Some(9)
     );
 }
@@ -431,11 +1004,13 @@ fn service_readiness_timeout_is_bounded_and_does_not_signal_the_child() {
     let root = tempdir().expect("root");
     let state = root.path().join("state");
     let log = root.path().join("daemon.err");
-    let mut child = std::process::Command::new("/bin/sh")
-        .args(["-c", "read token"])
-        .stdin(std::process::Stdio::piped())
-        .stderr(fs::File::create(&log).expect("log"))
-        .spawn()
+    let mut child = root
+        .spawn_owned(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "read token"])
+                .stdin(std::process::Stdio::piped())
+                .stderr(fs::File::create(&log).expect("log")),
+        )
         .expect("held service");
     let started = Instant::now();
     let result = support::wait_for_service_with_timeout(
@@ -448,8 +1023,7 @@ fn service_readiness_timeout_is_bounded_and_does_not_signal_the_child() {
     let elapsed = started.elapsed();
     let still_running = child.try_wait().expect("child status").is_none();
     if still_running {
-        child.kill().expect("stop held child");
-        child.wait().expect("reap held child");
+        child.stop().expect("stop and reap held child");
     }
     assert!(still_running);
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
@@ -474,18 +1048,19 @@ fn assert_supervisor_reaps_monitors(service_managed: bool) {
     let state = root.path().join("state");
     let mut daemon = service_managed.then(|| {
         let log = fs::File::create(root.path().join("daemon.err")).expect("daemon log");
-        atx()
-            .arg("__supervisor")
-            .arg("--state-dir")
-            .arg(&state)
-            .arg("--runtime-dir")
-            .arg(state.join("runtime"))
-            .arg("--service-managed")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("start service supervisor")
+        root.spawn_owned(
+            atx()
+                .arg("__supervisor")
+                .arg("--state-dir")
+                .arg(&state)
+                .arg("--runtime-dir")
+                .arg(state.join("runtime"))
+                .arg("--service-managed")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(log),
+        )
+        .expect("start service supervisor")
     });
     if let Some(daemon) = daemon.as_mut() {
         support::wait_for_service(

@@ -2,11 +2,12 @@
 name = "xtask"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 publish = false
 
 [dependencies]
 serde_json = "1.0.151"
+yaml-rust2 = { version = "=0.13.0", default-features = false }
 
 [dev-dependencies]
 proptest = "1.11.0"

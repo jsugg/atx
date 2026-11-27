@@ -1,16 +1,36 @@
-# Local checks
+# Checks and helpers
 
-`check.sh quick` is the normal edit loop. It checks formatting, builds, tests, and runs
-Clippy. Any failing command stops the script and keeps its exit status.
+`check.sh quick` is the edit loop. `check.sh pre-merge` adds static, hygiene and
+man stages; `full` is its compatibility alias. Every failed command stops the
+gate and keeps its status. CI uses the same named stages on its runners.
 
-`check.sh msrv` selects the installed Rust 1.85.0 compiler, checks and prints its
-version, then checks all targets and features with that compiler. It ignores
+`check.sh msrv` selects the installed Rust 1.89.0 compiler, checks and prints its
+version, then checks every workspace member, target and feature with that compiler. It ignores
 compiler overrides and wrappers for this check. CI and `check.sh full` use the
 same stage.
 
-`check.sh full` adds MSRV, rustdoc, dependency policy, docs, package contents,
-and a crates.io dry run. Run it from a clean checkout because Cargo rejects a
-dirty publish rehearsal.
+Run pre-merge from a clean checkout because Cargo rejects dirty publish
+rehearsals. Install Rust 1.89.0, Node.js 22+/npm, Git, ShellCheck, actionlint
+1.7.12, mandoc and sqlite3, plus the pinned Rust tools below.
+
+| Stage | Work |
+| --- | --- |
+| `fmt`, `check`, `test`, `clippy` | Format/build/test/lint the workspace |
+| `msrv`, `docs`, `dependencies` | Actual Rust 1.89, rustdoc, audit/deny |
+| `markdown`, `links-offline` | Tracked Markdown rules and local links |
+| `links-online` | Live URLs, 20-second timeout, two retries, concurrency eight |
+| `package` | File policy and publish dry run |
+| `hygiene` | Shellcheck-all, workflow guards and fixture harnesses |
+| `man` | Xtask tests/lint, pages under `dist/man`, mandoc lint |
+| `quick` | Format, check, test and Clippy |
+| `static` | MSRV, docs, dependencies, Markdown, offline links and package |
+
+Coverage floors, commit titles, native architecture/libc/user variants, extracted
+package consumers, CodeQL/dependency review and release archives are separate CI
+evidence. Fuzz, mutation and performance have scheduled workflows. A local green
+gate does not claim those checks ran. Online links run on documentation PRs and
+weekly, separate from offline pre-merge. A read-only `GITHUB_TOKEN` can avoid
+GitHub rate limits; no broad failure-status acceptance is configured.
 
 Pinned extra tools:
 
@@ -34,6 +54,42 @@ in a temporary fixture repository. It never changes this checkout's index.
 
 Other scripts install nothing. None writes to GitHub or crates.io. Missing or
 wrong required tool versions fail with an actionable message.
+
+## Script contracts
+
+- `check.sh MODE` composes the named stages and makes no remote mutation.
+  Its package stage verifies the extracted crate in a fresh private Cargo target,
+  then removes that target on success or failure. The caller's workspace target
+  is left alone. Cleanup failures stay visible and fail an otherwise green stage.
+- `check-hygiene.sh` shellchecks every shell script and runs workflow guards,
+  aggregate failure tests, Markdown scope tests and mocked link scope tests.
+- `check-man.sh` tests/lints xtask, renders `dist/man` and lints its pages. Build
+  outputs stay in the selected Cargo target; normal Cargo cache fills may occur.
+- `check-links.sh offline|online` selects tracked Markdown with NUL-safe paths,
+  escapes linter glob syntax, pins lychee and preserves failures. Offline mode
+  makes no network request; online uses the bounds above.
+- `test-links-harness.sh [--real]` tests scope, tool versions and statuses in a
+  temporary fixture repository. Real mode starts an owned loopback server,
+  proves success/404 rejection, then stops and reaps that child.
+- `test-check-harness.sh` copies the real gate to an owned fixture, replaces
+  external/helper commands at test boundaries, and checks failure propagation.
+  It performs no real build, upload or remote Git command and cannot recurse
+  into the real hygiene harness. Fixture cleanup does not change this index.
+- `check-workflow-guards.sh` actionlints all workflows and asserts required
+  policy values through `cargo xtask check-workflows`. The unpublished tool uses
+  pinned YAML 1.2 parsing, accepts formatting changes, and bounds file size,
+  nesting and alias expansion. Diagnostics name the workflow and policy field.
+  Limits are 256 KiB input, 64 container levels, 20,000 nodes and 8 MiB of
+  scalar text, including anchor and alias copies.
+  Script and issue-template prose checks stay separate. It reads files and makes
+  no remote change; Rust 1.89 or newer must be installed before the hygiene stage.
+- `mock_registry.py [PORT [WORKDIR]]` binds the loopback test registry with
+  dummy credentials, recording `state.json` and `requests.log` in its work dir.
+  It never talks to crates.io and is not a real credential exchange.
+- `assert-mock-published.sh VERSION REQUESTS_LOG CRATE_FILE` requires exactly
+  one expected mock upload with matching metadata/checksum, reading those files.
+
+Markdown scope, package policy and scanner helper contracts follow below.
 
 `check-package-list.sh PACKAGE_LIST` checks Cargo's package file list. Embedded
 test fixtures are required and allowed; other tests and internal directories are

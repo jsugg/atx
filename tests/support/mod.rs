@@ -1,15 +1,17 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::FileTypeExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
@@ -26,12 +28,91 @@ const CENSUS_TIMEOUT: Duration = Duration::from_secs(5);
 const TERM_GRACE: Duration = Duration::from_millis(250);
 const CLEANUP_POLL: Duration = Duration::from_millis(100);
 const STABLE_EMPTY_SCANS: u8 = 2;
+const PROBE_CAPTURE_LIMIT: usize = 64 * 1024;
+const CENSUS_CAPTURE_LIMIT: usize = 4 * 1024 * 1024;
+const DIAGNOSTIC_TAIL_LIMIT: usize = 8 * 1024;
+const PROBE_POLL: Duration = Duration::from_millis(10);
+static CENSUS_PROVIDER: OnceLock<CensusProvider> = OnceLock::new();
 #[cfg(target_os = "macos")]
 const ARGV_INSPECTION_ATTEMPTS: usize = 3;
 
 /// Temporary test root that stops every ATX process rooted beneath it.
 pub(crate) struct TestRoot {
     inner: TempDir,
+    owned_children: Cell<usize>,
+}
+
+/// Direct child whose fixture cannot reap it behind the owning handle.
+pub(crate) struct OwnedChild<'root> {
+    child: Child,
+    root: Option<&'root TestRoot>,
+}
+
+impl std::ops::Deref for OwnedChild<'_> {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl OwnedChild<'_> {
+    /// Stop and reap this direct child within the fixture's cleanup deadlines.
+    #[allow(dead_code)]
+    pub(crate) fn stop(&mut self) -> Result<ExitStatus, String> {
+        if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
+            return Ok(status);
+        }
+        let raw_pid = i32::try_from(self.child.id()).map_err(|error| error.to_string())?;
+        let pid = Pid::from_raw(raw_pid).ok_or_else(|| format!("invalid child PID {raw_pid}"))?;
+        // An unreaped direct child reserves its PID; fixture cleanup cannot reap a live guard.
+        match rustix::process::kill_process(pid, Signal::TERM) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => return Err(format!("stop owned child PID {raw_pid}: {error}")),
+        }
+        let mut status = None;
+        if !wait_until(TERM_GRACE, || {
+            status = self.child.try_wait().map_err(|error| error.to_string())?;
+            Ok(status.is_some())
+        })? {
+            match self.child.kill() {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(format!("kill owned child PID {raw_pid}: {error}")),
+            }
+            if !wait_until(CLEANUP_TIMEOUT, || {
+                status = self.child.try_wait().map_err(|error| error.to_string())?;
+                Ok(status.is_some())
+            })? {
+                return Err(format!(
+                    "owned child PID {raw_pid} did not exit after SIGKILL"
+                ));
+            }
+        }
+        status.ok_or_else(|| format!("owned child PID {raw_pid} has no exit status"))
+    }
+}
+
+impl Drop for OwnedChild<'_> {
+    fn drop(&mut self) {
+        let result = self.stop();
+        if let Some(root) = self.root {
+            root.owned_children.set(root.owned_children.get() - 1);
+        }
+        if let Err(error) = result {
+            if std::thread::panicking() {
+                eprintln!("ATX owned child cleanup failed during unwind: {error}");
+            } else {
+                panic!("ATX owned child cleanup failed: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,6 +123,96 @@ pub(crate) struct ProcessRow {
     user_id: u32,
     state: String,
     command_name: String,
+}
+
+#[derive(Default)]
+struct CensusFlight {
+    running: bool,
+    generation: u64,
+    waiters: usize,
+    result_started: Option<Instant>,
+    result: Option<Result<Arc<Vec<ProcessRow>>, String>>,
+}
+
+/// Share an in-flight system census without caching a later observation as fresh.
+#[derive(Default)]
+pub(crate) struct CensusProvider {
+    state: Mutex<CensusFlight>,
+    changed: Condvar,
+}
+
+impl CensusProvider {
+    #[allow(dead_code)]
+    pub(crate) fn waiter_count(&self) -> Result<usize, String> {
+        self.state
+            .lock()
+            .map(|state| state.waiters)
+            .map_err(|_| "census state poisoned".to_owned())
+    }
+
+    /// Bound follower waits while allowing only the owner to run the capture.
+    pub(crate) fn snapshot(
+        &self,
+        deadline: Instant,
+        capture: impl FnOnce() -> Result<Vec<ProcessRow>, String>,
+    ) -> Result<Vec<ProcessRow>, String> {
+        let requested = Instant::now();
+        if requested >= deadline {
+            return Err("process census deadline elapsed before capture".to_owned());
+        }
+        let mut state = self.state.lock().map_err(|_| "census state poisoned")?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err("process census follower deadline elapsed".to_owned());
+            }
+            if state
+                .result_started
+                .is_some_and(|started| started >= requested)
+            {
+                return state
+                    .result
+                    .as_ref()
+                    .ok_or("completed census has no result")?
+                    .as_ref()
+                    .map(|rows| rows.as_ref().clone())
+                    .map_err(Clone::clone);
+            }
+            if !state.running {
+                break;
+            }
+            let generation = state.generation;
+            state.waiters += 1;
+            while state.generation == generation {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    state.waiters -= 1;
+                    return Err("process census follower deadline elapsed".to_owned());
+                }
+                state = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .map_err(|_| "census state poisoned")?
+                    .0;
+            }
+            state.waiters -= 1;
+            if Instant::now() >= deadline {
+                return Err("process census follower deadline elapsed".to_owned());
+            }
+        }
+        state.running = true;
+        let started = Instant::now();
+        drop(state);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(capture))
+            .unwrap_or_else(|_| Err("process census capture panicked".to_owned()))
+            .map(Arc::new);
+        let mut state = self.state.lock().map_err(|_| "census state poisoned")?;
+        state.result = Some(result.clone());
+        state.result_started = Some(started);
+        state.generation = state.generation.wrapping_add(1);
+        state.running = false;
+        self.changed.notify_all();
+        result.map(|rows| rows.as_ref().clone())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -208,7 +379,6 @@ fn enable_child_subreaper() -> io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn reap_terminal_child(pid: i32) -> Result<bool, String> {
     loop {
         // SAFETY: `waitpid` writes no status when passed a null status pointer.
@@ -230,11 +400,39 @@ fn reap_terminal_child(pid: i32) -> Result<bool, String> {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn reap_terminal_with_identity(
+    expected: &ProcessIdentity,
+    row: &ProcessRow,
+    current: Inspection<ProcessIdentity>,
+    reap: impl FnOnce(i32) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let uid = rustix::process::geteuid().as_raw();
+    match classify_identity(expected, uid, current, row.user_id) {
+        IdentityMatch::Different | IdentityMatch::WrongUser => Ok(true),
+        // A terminal census row can outlive its native identity on macOS.
+        IdentityMatch::Absent | IdentityMatch::Unknown => Ok(false),
+        IdentityMatch::Same => {
+            let parent = i32::try_from(std::process::id()).map_err(|error| error.to_string())?;
+            if row.parent_pid != parent {
+                return Ok(false);
+            }
+            if u32::try_from(row.pid).ok() != Some(expected.pid) {
+                return Err("terminal row PID disagrees with its captured identity".to_owned());
+            }
+            reap(row.pid)
+        }
+    }
+}
+
 /// Create an ATX-aware temporary root.
 pub(crate) fn tempdir() -> io::Result<TestRoot> {
     #[cfg(target_os = "linux")]
     enable_child_subreaper()?;
-    tempfile::tempdir().map(|inner| TestRoot { inner })
+    tempfile::tempdir().map(|inner| TestRoot {
+        inner,
+        owned_children: Cell::new(0),
+    })
 }
 
 /// Create an ATX-aware temporary root beneath `parent`.
@@ -242,7 +440,10 @@ pub(crate) fn tempdir() -> io::Result<TestRoot> {
 pub(crate) fn tempdir_in(parent: &Path) -> io::Result<TestRoot> {
     #[cfg(target_os = "linux")]
     enable_child_subreaper()?;
-    tempfile::tempdir_in(parent).map(|inner| TestRoot { inner })
+    tempfile::tempdir_in(parent).map(|inner| TestRoot {
+        inner,
+        owned_children: Cell::new(0),
+    })
 }
 
 #[allow(dead_code)]
@@ -274,6 +475,27 @@ pub(crate) fn wait_for_service_with_timeout(
     stderr_log: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    wait_for_service_with_probe_command(daemon, state, runtime, stderr_log, timeout, |state| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_atx"));
+        command
+            .arg("--json")
+            .arg("--state-dir")
+            .arg(state)
+            .arg("doctor");
+        command
+    })
+}
+
+/// Apply the readiness contract to an owned command factory for probe fault tests.
+#[allow(dead_code)]
+pub(crate) fn wait_for_service_with_probe_command(
+    daemon: &mut Child,
+    state: &Path,
+    runtime: &Path,
+    stderr_log: &Path,
+    timeout: Duration,
+    mut probe_command: impl FnMut(&Path) -> Command,
+) -> Result<(), String> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or("service timeout overflow")?;
@@ -282,37 +504,45 @@ pub(crate) fn wait_for_service_with_timeout(
         if let Some(status) = daemon.try_wait().map_err(|error| error.to_string())? {
             return Err(format!(
                 "service exited before readiness: {status}; {}",
-                fs::read_to_string(stderr_log).unwrap_or_else(|error| error.to_string())
+                bounded_log_tail(stderr_log).unwrap_or_else(|error| error.to_string())
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "service readiness timed out: {last_probe}; {}",
+                bounded_log_tail(stderr_log).unwrap_or_else(|error| error.to_string())
             ));
         }
         match read_identity_if_present(&runtime.join("supervisor.lock")) {
             Ok(Some(identity))
                 if identity.pid == daemon.id() && runtime.join("supervisor.sock").exists() =>
             {
-                let output = Command::new(env!("CARGO_BIN_EXE_atx"))
-                    .arg("--json")
-                    .arg("--state-dir")
-                    .arg(state)
-                    .arg("doctor")
-                    .output()
-                    .map_err(|error| error.to_string())?;
+                let output = match bounded_probe_output(&mut probe_command(state), deadline) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        last_probe = error;
+                        continue;
+                    }
+                };
                 if output.status.success()
                     && serde_json::from_slice(&output.stdout)
                         .is_ok_and(|report| service_report_is_ready(&report))
-                    && supervisor_matches(
+                    && supervisor_matches_with_deadline(
                         &identity,
                         runtime,
                         Some(state),
                         state.parent().unwrap_or(state),
+                        deadline,
                     )?
+                    && Instant::now() < deadline
                 {
                     return Ok(());
                 }
                 last_probe = format!(
                     "doctor {:?}: stdout={}, stderr={}",
                     output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+                    diagnostic_bytes(&output.stdout),
+                    diagnostic_bytes(&output.stderr)
                 );
             }
             Ok(Some(_)) => "identity or socket not ready".clone_into(&mut last_probe),
@@ -322,10 +552,206 @@ pub(crate) fn wait_for_service_with_timeout(
         if Instant::now() >= deadline {
             return Err(format!(
                 "service readiness timed out: {last_probe}; {}",
-                fs::read_to_string(stderr_log).unwrap_or_else(|error| error.to_string())
+                bounded_log_tail(stderr_log).unwrap_or_else(|error| error.to_string())
             ));
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(
+            Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+/// Capture a direct probe without blocking pipes, respecting a shared deadline and byte caps.
+#[allow(dead_code)]
+pub(crate) fn bounded_probe_output(
+    command: &mut Command,
+    deadline: Instant,
+) -> Result<Output, String> {
+    bounded_command_output(command, deadline, PROBE_CAPTURE_LIMIT)
+}
+
+fn bounded_command_output(
+    command: &mut Command,
+    deadline: Instant,
+    capture_limit: usize,
+) -> Result<Output, String> {
+    if Instant::now() >= deadline {
+        return Err("readiness probe deadline elapsed before spawn".to_owned());
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("spawn readiness probe: {error}"))?;
+    // Probe roles never enter the background census; this guard alone owns their wait status.
+    let mut probe = OwnedChild { child, root: None };
+    capture_command_output(&mut probe, deadline, capture_limit)
+}
+
+/// Capture an owned probe whose output descriptors have already been attached.
+#[allow(dead_code)]
+pub(crate) fn bounded_owned_probe_output(
+    probe: &mut OwnedChild<'_>,
+    deadline: Instant,
+) -> Result<Output, String> {
+    capture_command_output(probe, deadline, PROBE_CAPTURE_LIMIT)
+}
+
+fn capture_command_output(
+    probe: &mut OwnedChild<'_>,
+    deadline: Instant,
+    capture_limit: usize,
+) -> Result<Output, String> {
+    let mut stdout = probe.stdout.take().ok_or("probe stdout pipe missing")?;
+    let mut stderr = probe.stderr.take().ok_or("probe stderr pipe missing")?;
+    set_nonblocking(&stdout).map_err(|error| format!("probe stdout flags: {error}"))?;
+    set_nonblocking(&stderr).map_err(|error| format!("probe stderr flags: {error}"))?;
+    let mut captured_stdout = Vec::new();
+    let mut captured_stderr = Vec::new();
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut observed_status = None;
+    let outcome = (|| {
+        loop {
+            if Instant::now() >= deadline {
+                return Err("readiness probe deadline elapsed".to_owned());
+            }
+            if !stdout_closed {
+                stdout_closed = drain_probe_pipe(
+                    &mut stdout,
+                    &mut captured_stdout,
+                    "stdout",
+                    deadline,
+                    capture_limit,
+                )?;
+            }
+            if !stderr_closed {
+                stderr_closed = drain_probe_pipe(
+                    &mut stderr,
+                    &mut captured_stderr,
+                    "stderr",
+                    deadline,
+                    capture_limit,
+                )?;
+            }
+            observed_status = probe
+                .try_wait()
+                .map_err(|error| format!("wait for readiness probe: {error}"))?;
+            if let Some(status) = observed_status {
+                // Drain after exit; another process can keep inherited writers open indefinitely.
+                drain_probe_pipe(
+                    &mut stdout,
+                    &mut captured_stdout,
+                    "stdout",
+                    deadline,
+                    capture_limit,
+                )?;
+                drain_probe_pipe(
+                    &mut stderr,
+                    &mut captured_stderr,
+                    "stderr",
+                    deadline,
+                    capture_limit,
+                )?;
+                return Ok(status);
+            }
+            std::thread::sleep(PROBE_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    })();
+    match outcome {
+        Ok(status) => Ok(Output {
+            status,
+            stdout: captured_stdout,
+            stderr: captured_stderr,
+        }),
+        Err(error) => {
+            probe
+                .stop()
+                .map_err(|cleanup| format!("{error}; probe cleanup failed: {cleanup}"))?;
+            Err(format!(
+                "{error}; pid={}; status={observed_status:?}; pipe EOF stdout={stdout_closed}, stderr={stderr_closed}; stdout={}; stderr={}",
+                probe.id(),
+                diagnostic_bytes(&captured_stdout),
+                diagnostic_bytes(&captured_stderr)
+            ))
+        }
+    }
+}
+
+fn set_nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe).map_err(io::Error::from)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK).map_err(io::Error::from)
+}
+
+fn drain_probe_pipe(
+    pipe: &mut impl Read,
+    captured: &mut Vec<u8>,
+    name: &str,
+    deadline: Instant,
+    capture_limit: usize,
+) -> Result<bool, String> {
+    let mut bytes = [0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err("readiness probe deadline elapsed".to_owned());
+        }
+        match pipe.read(&mut bytes) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                if captured
+                    .len()
+                    .checked_add(count)
+                    .is_none_or(|size| size > capture_limit)
+                {
+                    return Err(format!(
+                        "probe {name} output limit exceeded ({capture_limit} bytes)"
+                    ));
+                }
+                captured.extend_from_slice(&bytes[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("read probe {name}: {error}")),
+        }
+    }
+}
+
+fn diagnostic_bytes(bytes: &[u8]) -> String {
+    let tail = &bytes[bytes.len().saturating_sub(DIAGNOSTIC_TAIL_LIMIT)..];
+    let text = String::from_utf8_lossy(tail);
+    if bytes.len() > DIAGNOSTIC_TAIL_LIMIT {
+        format!("[truncated; last {DIAGNOSTIC_TAIL_LIMIT} bytes]\n{text}")
+    } else {
+        text.into_owned()
+    }
+}
+
+/// Read at most the final 8 KiB of a regular diagnostic file without following symlinks.
+#[allow(dead_code)]
+pub(crate) fn bounded_log_tail(path: &Path) -> io::Result<String> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "diagnostic is not a regular file",
+        ));
+    }
+    let limit = u64::try_from(DIAGNOSTIC_TAIL_LIMIT).map_err(io::Error::other)?;
+    file.seek(SeekFrom::Start(metadata.len().saturating_sub(limit)))?;
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    if metadata.len() > limit {
+        Ok(format!(
+            "[truncated; last {DIAGNOSTIC_TAIL_LIMIT} bytes]\n{text}"
+        ))
+    } else {
+        Ok(text.into_owned())
     }
 }
 
@@ -350,6 +776,18 @@ pub(crate) fn kill_session_supervisor(state: &Path) -> Result<(), String> {
     }
     signal_process(&identity, Signal::KILL)?;
     if wait_until(CLEANUP_TIMEOUT, || process_identity_is_terminal(&identity))? {
+        let pid = i32::try_from(identity.pid).map_err(|error| error.to_string())?;
+        let parent = i32::try_from(std::process::id()).map_err(|error| error.to_string())?;
+        if let Some(row) = process_row_with_deadline(pid, Instant::now() + CENSUS_TIMEOUT)?
+            && row.is_terminal()
+            && row.parent_pid == parent
+        {
+            let current = inspect_process_identity(pid, &boot_identity()?)?;
+            // Crash fixtures own adopted session children; observers never consume their status.
+            if !reap_terminal_with_identity(&identity, &row, current, reap_terminal_child)? {
+                return Err(format!("cannot safely reap stopped supervisor PID {pid}"));
+            }
+        }
         Ok(())
     } else {
         Err(format!(
@@ -642,23 +1080,15 @@ fn shift_fixture_timestamp(value: &str, shift: SignedDuration) -> Result<String,
 /// Return whether `pid` is still present, including zombie processes.
 #[allow(dead_code)]
 pub(crate) fn process_exists(pid: i32) -> Result<bool, String> {
-    Ok(process_table()?.iter().any(|process| process.pid == pid))
+    Ok(process_row_with_deadline(pid, Instant::now() + CENSUS_TIMEOUT)?.is_some())
 }
 
 /// Return whether `pid` has exited or reached an unreaped terminal state.
 #[allow(dead_code)]
 pub(crate) fn process_is_terminal(pid: i32) -> Result<bool, String> {
-    match process_table()?
-        .into_iter()
-        .find(|process| process.pid == pid)
-    {
+    match process_row_with_deadline(pid, Instant::now() + CENSUS_TIMEOUT)? {
         None => Ok(true),
-        Some(process) if process.is_terminal() => {
-            #[cfg(target_os = "linux")]
-            return reap_terminal_child(pid);
-            #[cfg(not(target_os = "linux"))]
-            return Ok(true);
-        }
+        Some(process) if process.is_terminal() => Ok(true),
         Some(_) => Ok(false),
     }
 }
@@ -690,18 +1120,13 @@ pub(crate) fn fixture_monitor_process_ids(root: &Path) -> Result<Vec<i32>, Strin
         if process.user_id != rustix::process::geteuid().as_raw() {
             continue;
         }
-        #[cfg(target_os = "macos")]
-        if !OsStr::new(env!("CARGO_BIN_EXE_atx"))
-            .as_bytes()
-            .starts_with(process.command_name.trim_matches(['(', ')']).as_bytes())
-            || !process_executable_is_atx(process.pid)?
+        if Path::new(process.command_name.trim_matches(['(', ')'])).file_name()
+            != Path::new(env!("CARGO_BIN_EXE_atx")).file_name()
         {
             continue;
         }
-        #[cfg(target_os = "linux")]
-        if Path::new(process.command_name.trim_matches(['(', ')'])).file_name()
-            != Some(OsStr::new("atx"))
-        {
+        #[cfg(target_os = "macos")]
+        if !process_executable_is_atx(process.pid)? {
             continue;
         }
         let Inspection::Present(command) = process_arguments(process.pid)? else {
@@ -715,12 +1140,31 @@ pub(crate) fn fixture_monitor_process_ids(root: &Path) -> Result<Vec<i32>, Strin
 }
 
 impl TestRoot {
+    /// Spawn a direct child and reserve its reaping ownership until guard drop.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_owned(&self, command: &mut Command) -> io::Result<OwnedChild<'_>> {
+        let count = self
+            .owned_children
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("too many owned child guards"))?;
+        let child = command.spawn()?;
+        self.owned_children.set(count);
+        Ok(OwnedChild {
+            child,
+            root: Some(self),
+        })
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.inner.path()
     }
 
     #[allow(dead_code)]
     pub(crate) fn stop_background(&self) -> Result<(), String> {
+        if self.owned_children.get() != 0 {
+            return Err("stop owned child guards before fixture background cleanup".to_owned());
+        }
         cleanup_root(self.path())
     }
 }
@@ -728,6 +1172,8 @@ impl TestRoot {
 impl Drop for TestRoot {
     fn drop(&mut self) {
         if let Err(error) = cleanup_root(self.path()) {
+            self.inner.disable_cleanup(true);
+            let error = format!("{error}; retained fixture at {}", self.path().display());
             if std::thread::panicking() {
                 eprintln!("ATX test fixture cleanup failed during unwind: {error}");
             } else {
@@ -914,8 +1360,12 @@ fn fixture_processes(
             continue;
         };
         if process.is_terminal() {
-            #[cfg(target_os = "linux")]
-            reap_terminal_child(process.pid)?;
+            let current = inspect_process_identity(process.pid, &current_boot)?;
+            if reap_terminal_with_identity(expected, process, current, reap_terminal_child)? {
+                owned.remove(&process.pid);
+            } else {
+                owned.insert(process.pid);
+            }
             continue;
         }
         match classify_live_identity(expected, process.user_id)? {
@@ -961,18 +1411,13 @@ fn is_fixture_atx_process(process: &ProcessRow, root: &Path) -> Result<Inspectio
     if process.user_id != rustix::process::geteuid().as_raw() || process.is_terminal() {
         return Ok(Inspection::Present(false));
     }
-    #[cfg(target_os = "linux")]
     if Path::new(process.command_name.trim_matches(['(', ')'])).file_name()
-        != Some(OsStr::new("atx"))
+        != Path::new(env!("CARGO_BIN_EXE_atx")).file_name()
     {
         return Ok(Inspection::Present(false));
     }
     #[cfg(target_os = "macos")]
-    if !OsStr::new(env!("CARGO_BIN_EXE_atx"))
-        .as_bytes()
-        .starts_with(process.command_name.trim_matches(['(', ')']).as_bytes())
-        || !process_executable_is_atx(process.pid)?
-    {
+    if !process_executable_is_atx(process.pid)? {
         return Ok(Inspection::Present(false));
     }
     let command = match process_arguments(process.pid)? {
@@ -1038,16 +1483,27 @@ fn supervisor_matches(
     expected_state: Option<&Path>,
     root: &Path,
 ) -> Result<bool, String> {
+    supervisor_matches_with_deadline(
+        identity,
+        runtime,
+        expected_state,
+        root,
+        Instant::now() + CENSUS_TIMEOUT,
+    )
+}
+
+fn supervisor_matches_with_deadline(
+    identity: &ProcessIdentity,
+    runtime: &Path,
+    expected_state: Option<&Path>,
+    root: &Path,
+    deadline: Instant,
+) -> Result<bool, String> {
     let pid = i32::try_from(identity.pid).map_err(|_| format!("invalid PID {}", identity.pid))?;
-    let Some(process) = process_table()?
-        .into_iter()
-        .find(|process| process.pid == pid)
-    else {
+    let Some(process) = process_row_with_deadline(pid, deadline)? else {
         return Ok(false);
     };
     if process.is_terminal() {
-        #[cfg(target_os = "linux")]
-        reap_terminal_child(process.pid)?;
         return Ok(false);
     }
     if process.user_id != rustix::process::geteuid().as_raw()
@@ -1401,9 +1857,68 @@ fn sysctl_process_error(pid: i32) -> Result<Inspection<Vec<OsString>>, String> {
 }
 
 fn process_table() -> Result<Vec<ProcessRow>, String> {
-    let output = Command::new("/bin/ps")
-        .args(["-axww", "-o", "pid=,ppid=,pgid=,uid=,state=,comm="])
-        .output()
+    process_table_with_deadline(Instant::now() + CENSUS_TIMEOUT)
+}
+
+fn process_table_with_deadline(deadline: Instant) -> Result<Vec<ProcessRow>, String> {
+    CENSUS_PROVIDER
+        .get_or_init(CensusProvider::default)
+        .snapshot(deadline, || {
+            process_table_with_command(&mut process_census_command(None)?, deadline)
+        })
+}
+
+fn process_row_with_deadline(pid: i32, deadline: Instant) -> Result<Option<ProcessRow>, String> {
+    let output = bounded_command_output(
+        &mut process_census_command(Some(pid))?,
+        deadline,
+        PROBE_CAPTURE_LIMIT,
+    )?;
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "observe PID {pid}: {}",
+            diagnostic_bytes(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(line) = lines.next() else {
+        return Ok(None);
+    };
+    let row = parse_process_row(line)?;
+    if row.pid != pid || lines.next().is_some() {
+        return Err("targeted process observer returned a different or multiple PIDs".to_owned());
+    }
+    Ok(Some(row))
+}
+
+/// Build a census prefilter; native identity and full argv still authorize ownership.
+#[allow(dead_code)]
+pub(crate) fn process_census_command(pid: Option<i32>) -> Result<Command, String> {
+    let mut command = Command::new("/bin/ps");
+    match pid {
+        Some(pid) if pid <= 0 => return Err(format!("invalid observed PID {pid}")),
+        Some(pid) => {
+            command.args(["-ww", "-p"]).arg(pid.to_string());
+        }
+        None => {
+            command.arg("-axww");
+        }
+    }
+    command.args(["-o", "pid=,ppid=,pgid=,uid=,state=,ucomm="]);
+    Ok(command)
+}
+
+/// Capture and parse a bounded census command, with a larger cap than doctor output.
+#[allow(dead_code)]
+pub(crate) fn process_table_with_command(
+    command: &mut Command,
+    deadline: Instant,
+) -> Result<Vec<ProcessRow>, String> {
+    let output = bounded_command_output(command, deadline, CENSUS_CAPTURE_LIMIT)
         .map_err(|error| format!("read process table: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -1491,10 +2006,7 @@ fn signal_process(expected: &ProcessIdentity, signal: Signal) -> Result<(), Stri
 fn signal_process(expected: &ProcessIdentity, signal: Signal) -> Result<(), String> {
     let raw_pid =
         i32::try_from(expected.pid).map_err(|_| format!("invalid PID {}", expected.pid))?;
-    let Some(process) = process_table()?
-        .into_iter()
-        .find(|process| process.pid == raw_pid)
-    else {
+    let Some(process) = process_row_with_deadline(raw_pid, Instant::now() + CENSUS_TIMEOUT)? else {
         return Ok(());
     };
     if classify_live_identity(expected, process.user_id)? != IdentityMatch::Same {
@@ -1513,8 +2025,31 @@ fn process_identity_is_terminal(expected: &ProcessIdentity) -> Result<bool, Stri
     if current_boot != expected.boot_identity {
         return Ok(true);
     }
-    match inspect_process_identity(pid, &current_boot)? {
-        Inspection::Present(current) if current == *expected => process_is_terminal(pid),
+    terminal_identity_with_probes(
+        expected,
+        || inspect_process_identity(pid, &current_boot),
+        || process_is_terminal(pid),
+    )
+}
+
+/// Recheck identity after a nonterminal state sample, which may race process exit.
+#[allow(dead_code)]
+pub(crate) fn terminal_identity_with_probes(
+    expected: &ProcessIdentity,
+    mut inspect: impl FnMut() -> Result<Inspection<ProcessIdentity>, String>,
+    terminal: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    match inspect()? {
+        Inspection::Present(current) if current == *expected => {
+            if terminal()? {
+                return Ok(true);
+            }
+            match inspect()? {
+                Inspection::Present(current) => Ok(current != *expected),
+                Inspection::Absent => Ok(true),
+                Inspection::Transient => Ok(false),
+            }
+        }
         Inspection::Present(_) | Inspection::Absent => Ok(true),
         Inspection::Transient => Ok(false),
     }
@@ -1539,7 +2074,8 @@ fn describe_processes(processes: &[OwnedProcess]) -> String {
         .join("; ")
 }
 
-fn wait_until(
+/// Poll a bounded test predicate without changing process or fixture ownership.
+pub(crate) fn wait_until(
     timeout: Duration,
     mut predicate: impl FnMut() -> Result<bool, String>,
 ) -> Result<bool, String> {

@@ -212,14 +212,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::{MonitorError, RunMonitor};
     use crate::application::ElapsedClock;
     use crate::domain::{
         DurationSeconds, Environment, ExecutionMode, ExecutionSpec, Job, MissedPolicy, RunOutcome,
         RunState, RuntimeTier, Schedule, UtcTimestamp,
     };
+    use crate::infrastructure::paths::private_tempdir as tempdir;
     use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
     use crate::run_monitor::tty::test_support::Pty;
     use rusqlite::params;
@@ -488,6 +487,19 @@ mod tests {
             monitor.execute(&run, &execution),
             Err(MonitorError::AlreadyStarted)
         ));
+        let snapshot = completed.snapshot();
+        let started = snapshot.started_at_utc.expect("started timestamp");
+        assert!(snapshot.finished_at_utc.expect("finished timestamp") >= started);
+        assert_eq!(
+            fs::read(root.path().join(snapshot.stdout_path.expect("stdout path")))
+                .expect("captured stdout"),
+            vec![b'x'; 128]
+        );
+        assert!(
+            fs::read(root.path().join(snapshot.stderr_path.expect("stderr path")))
+                .expect("captured stderr")
+                .is_empty()
+        );
         let stdout_truncated: bool = store
             .database()
             .connection()

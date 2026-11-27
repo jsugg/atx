@@ -13,10 +13,9 @@ The public `v0.1.0` tag was an unpublished release rehearsal, not a supported
 release. It stays unchanged for history. `0.1.1` is the first public release
 candidate; it has not shipped yet.
 
-<!-- RELEASE: remove this notice and enable the two badges below once the
+<!-- RELEASE: remove this notice and enable the crate badge below once the
      first release exists on crates.io. -->
 <!-- [![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx) -->
-<!-- [![Documentation](https://docs.rs/atx/badge.svg)](https://docs.rs/atx) -->
 
 ATX schedules commands for later without making you write a cron entry.
 
@@ -45,6 +44,13 @@ Once released: `cargo install atx` (recommended; the binary is
 self-contained), or grab a prebuilt archive from the
 [releases page](https://github.com/jsugg/atx/releases) — static musl binaries
 for Linux (`x86_64`, `aarch64`) plus macOS builds, with SHA-256 checksums.
+
+After publication, `cargo binstall atx` can use those official archives with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall). The metadata
+disables its third-party quick-install mirror; source compilation remains a
+fallback when an official archive is unavailable.
+
+This project does not maintain Homebrew, AUR or distro packages.
 
 ## What to expect
 

@@ -3,6 +3,8 @@
 mod cancel;
 mod spawn;
 
+pub(crate) use cancel::NativeCancellationRuntime;
+#[cfg(test)]
 pub(crate) use cancel::NativeGroupCanceller;
 #[cfg(test)]
 pub(crate) use cancel::{CancellationResult, cancel_validated_group};
@@ -269,6 +271,11 @@ fn inspect_zombie_via_sysctl(
     // SAFETY-CONTRACT: 648 bytes matches sizeof(struct kinfo_proc) on arm64
     // and x86_64; sysctl rejects smaller buffers with ENOMEM. Field offsets
     // verified with offsetof() against <sys/sysctl.h>.
+    // `kp_proc.p_starttime.tv_sec` at offset 0 is an 8-byte little-endian
+    // `time_t`. Reading 4 bytes as signed `i32` yields a low-32-bit equality
+    // token that matches `proc_pidinfo`'s full `pbi_start_tvsec` while
+    // `tv_sec < 2^31`; starting at `2^31` (year 2038), `start_token` becomes
+    // negative and this fallback returns `Malformed` instead of matching.
     const KINFO_PROC_SIZE: usize = 648;
     const STARTTIME_SEC_OFFSET: usize = 0;
     const STARTTIME_USEC_OFFSET: usize = 8;

@@ -168,14 +168,13 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use rusqlite::params;
 
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore};
     use super::{RetentionPolicy, discover_orphan_artifacts};
     use crate::domain::{JobState, RunId, UtcTimestamp};
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     #[test]
     fn cleanup_covers_every_terminal_job_state_and_is_idempotent() {

@@ -227,6 +227,74 @@ fn killed_monitor_classifies_unknown_outcome_exactly_once() {
     );
     let (run_state, _) = states(&state, &submission.job_id).expect("states");
     assert_eq!(run_state, "interrupted");
+    for _ in 0..3 {
+        poke_supervisor(&state);
+        assert_eq!(
+            states(&state, &submission.job_id),
+            Some(("interrupted".into(), "interrupted".into()))
+        );
+        assert_eq!(
+            history_length(&state, &submission.job_id),
+            1,
+            "recovery retried or duplicated the run"
+        );
+    }
+}
+
+/// A live monitor finishes its command after its supervisor is killed.
+#[test]
+fn supervisor_crash_preserves_the_live_monitors_outcome() {
+    let root = tempdir().expect("root");
+    let state = root.path().join("state");
+    let started = root.path().join("started");
+    let release = root.path().join("release");
+    let done = root.path().join("done");
+    let script = "printf started > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.1; done; printf finished > \"$3\"";
+    let submitted = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(&state)
+            .args(["2s", "--", "/bin/sh", "-c", script, "fixture"])
+            .arg(&started)
+            .arg(&release)
+            .arg(&done),
+        Instant::now() + Duration::from_secs(15),
+    )
+    .expect("held command submission");
+    assert!(submitted.status.success(), "{submitted:?}");
+    let submitted: serde_json::Value =
+        serde_json::from_slice(&submitted.stdout).expect("submission JSON");
+    let job = submitted["data"]["job_id"].as_str().expect("job ID");
+    wait_for(|| started.exists(), "held command started");
+    assert!(!done.exists());
+    kill_state_supervisors(&state);
+    fs::write(&release, b"release").expect("release command after supervisor death");
+    wait_for(
+        || states(&state, job) == Some(("succeeded".into(), "succeeded".into())),
+        "monitor-recorded completion",
+    );
+    assert_eq!(
+        fs::read(&done).expect("command completion marker"),
+        b"finished"
+    );
+    let history = support::bounded_probe_output(
+        atx()
+            .args(["--json", "--state-dir"])
+            .arg(&state)
+            .args(["history", job]),
+        Instant::now() + Duration::from_secs(15),
+    )
+    .expect("completed history");
+    assert!(history.status.success(), "{history:?}");
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history JSON");
+    let rows = history["data"].as_array().expect("history rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["outcome"],
+        serde_json::json!({"kind":"exit", "value":0})
+    );
+    assert!(rows[0]["started_at_utc"].is_string());
+    assert!(rows[0]["finished_at_utc"].is_string());
 }
 
 /// Supervisor dies before the deadline: recovery marks the missed one-shot

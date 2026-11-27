@@ -6,9 +6,11 @@ resolver = "3"
 name = "atx"
 version = "0.1.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Reliable per-user command scheduler for macOS and Linux"
 repository = "https://github.com/jsugg/atx"
+homepage = "https://github.com/jsugg/atx"
+documentation = "https://github.com/jsugg/atx"
 readme = "README.md"
 license = "MIT"
 keywords = ["scheduler", "cli", "jobs", "timer", "automation"]
@@ -25,8 +27,11 @@ include = [
     "/LICENSE-MIT",
 ]
 
-[package.metadata.docs.rs]
-all-features = true
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/atx-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
 
 [[bin]]
 name = "atx"
@@ -49,8 +54,8 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 toml = "1.1.4"
 uuid = { version = "1.24.0", features = ["serde", "v7"] }
-rustix = { version = "1.1.4", features = ["fs", "process", "time"] }
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+rustix = { version = "1.1.6", features = ["fs", "process", "time"] }
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled"] }
 libc = "0.2.189"
 clap_complete = "4"
 clap_mangen = { version = "0.3.3", optional = true }

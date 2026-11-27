@@ -153,7 +153,7 @@ fn configured_retention_purges_old_terminal_jobs_at_startup() {
 
     let runtime = state.join("runtime");
     let log = root.path().join("daemon.err");
-    let mut daemon = spawn_retention_daemon(&state, &runtime, &log);
+    let mut daemon = spawn_retention_daemon(&root, &state, &runtime, &log);
     support::wait_for_service(&mut daemon, &state, &runtime, &log)
         .expect("default service readiness");
     let _ = json(&state, &["30m", "--", "/bin/true"]);
@@ -162,15 +162,17 @@ fn configured_retention_purges_old_terminal_jobs_at_startup() {
         original_job["state"]
     );
     assert!(daemon.try_wait().expect("default daemon status").is_none());
-    daemon.kill().expect("stop the default-retention daemon");
-    daemon.wait().expect("reap the default-retention daemon");
+    daemon
+        .stop()
+        .expect("stop and reap the default-retention daemon");
+    drop(daemon);
 
     fs::write(
         state.join("config.toml"),
         "history_days = 1\nterminal_job_days = 1\n",
     )
     .expect("write config");
-    let mut daemon = spawn_retention_daemon(&state, &runtime, &log);
+    let mut daemon = spawn_retention_daemon(&root, &state, &runtime, &log);
     support::wait_for_service(&mut daemon, &state, &runtime, &log)
         .expect("configured service readiness");
     let _ = json(&state, &["30m", "--", "/bin/true"]);
@@ -194,8 +196,7 @@ fn configured_retention_purges_old_terminal_jobs_at_startup() {
         },
         "configured retention to purge the two-day-old terminal job",
     );
-    daemon.kill().expect("stop daemon");
-    daemon.wait().expect("reap daemon");
+    daemon.stop().expect("stop and reap daemon");
 }
 
 fn assert_aged_timestamps(original: &serde_json::Value, aged: &serde_json::Value, fields: &[&str]) {
@@ -225,22 +226,24 @@ fn assert_aged_timestamps(original: &serde_json::Value, aged: &serde_json::Value
     }
 }
 
-fn spawn_retention_daemon(
+fn spawn_retention_daemon<'root>(
+    root: &'root support::TestRoot,
     state: &std::path::Path,
     runtime: &std::path::Path,
     log: &std::path::Path,
-) -> std::process::Child {
+) -> support::OwnedChild<'root> {
     let stderr = fs::File::create(log).expect("daemon log");
-    atx()
-        .arg("__supervisor")
-        .arg("--state-dir")
-        .arg(state)
-        .arg("--runtime-dir")
-        .arg(runtime)
-        .arg("--service-managed")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .expect("start service-managed supervisor")
+    root.spawn_owned(
+        atx()
+            .arg("__supervisor")
+            .arg("--state-dir")
+            .arg(state)
+            .arg("--runtime-dir")
+            .arg(runtime)
+            .arg("--service-managed")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr),
+    )
+    .expect("start service-managed supervisor")
 }

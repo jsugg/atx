@@ -11,15 +11,16 @@ mod lifecycle;
 mod tty;
 
 pub(crate) use lifecycle::RunMonitor;
+#[cfg(test)]
+pub(crate) use tty::test_support::Pty;
 
 use crate::application::{ElapsedClock, SupervisorAcknowledger, WallClock};
 use crate::domain::{JobId, JobState, RunId, RunState, Schedule, TransitionActor};
 use crate::infrastructure::process::{NativeProcessInspector, NativeProcessRunner};
-use crate::infrastructure::sqlite::{Database, JobStore};
+use crate::infrastructure::sqlite::{DATABASE_BUSY_TIMEOUT, Database, JobStore};
 use crate::infrastructure::time::NativeClock;
 use crate::supervisor::SocketAcknowledger;
 
-const DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 
@@ -33,7 +34,7 @@ pub(crate) fn run_monitor_process(
     let run_id = RunId::from_str(run_id).map_err(|_| MonitorProcessError::InvalidIdentity)?;
     let mut store = JobStore::new(Database::open(
         &state_directory.join("atx.db"),
-        DATABASE_TIMEOUT,
+        DATABASE_BUSY_TIMEOUT,
     )?);
     let job = store.load(job_id)?.ok_or(MonitorProcessError::MissingJob)?;
     let run = store

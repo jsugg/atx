@@ -28,11 +28,21 @@ Before adding a crate, check:
    here?
 
 Avoid wildcard versions, Git dependencies, default features that are not used,
-and duplicate major versions. A duplicate is acceptable only when the journal
-records why it cannot yet be removed.
+and duplicate major versions. Document any unavoidable duplicate in this page,
+including why it cannot yet be removed.
+
+`deny.toml` checks advisories, licenses and sources. Yanked versions, wildcard
+requirements and unknown registries or Git sources fail the gate. The allowed
+licenses are Apache-2.0, MIT, Unicode-3.0 and Unlicense. Multiple versions produce
+a warning so transitive duplicates can be reviewed rather than hidden. Only
+crates.io is an allowed registry; runtime code needs no registry connection.
 
 Runtime code must not need a network service, an external date parser, or a
 separately installed SQLite library.
 
 The development-only `xtask` reuses `serde_json` to read Cargo's build messages
 and run the executable Cargo actually produced, including custom target paths.
+It also uses pinned `yaml-rust2` 0.13.0 to check workflow policy values without
+depending on indentation or a global YAML interpreter. UTF-8 input, nesting and
+alias expansion are bounded, including the copied string bytes. This parser is
+not shipped with ATX.

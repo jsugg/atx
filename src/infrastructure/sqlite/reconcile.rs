@@ -288,8 +288,6 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
-    use tempfile::tempdir;
-
     use super::super::job_store::tests::sample_job;
     use super::super::{Database, JobStore, RetentionPolicy, StartupStore, StoreError};
     use super::{MAX_RECOVERY_RECORDS, load_nonterminal};
@@ -302,6 +300,7 @@ mod tests {
         UtcTimestamp,
     };
     use crate::domain::{JobId, RunId};
+    use crate::infrastructure::paths::private_tempdir as tempdir;
 
     struct UnusedInspector(Cell<usize>);
 
