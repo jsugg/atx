@@ -4,11 +4,10 @@ This file tracks user-visible changes. It follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic
 versioning.
 
-## [0.1.1] - Unreleased
+## [0.1.1] - 2026-11-27
 
-First public release candidate. No GitHub release or crate has been published
-yet. The public `v0.1.0` tag below was an unpublished rehearsal, not a supported
-release. The publication date will be recorded when this version ships.
+First public release. The public `v0.1.0` tag below was an unpublished
+rehearsal, not a supported release.
 
 ### Added
 
