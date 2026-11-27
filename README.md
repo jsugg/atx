@@ -3,19 +3,8 @@
 [![quality gates](https://github.com/jsugg/atx/actions/workflows/ci.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/ci.yml)
 [![tests](https://github.com/jsugg/atx/actions/workflows/platform.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/platform.yml)
 [![security](https://github.com/jsugg/atx/actions/workflows/security.yml/badge.svg)](https://github.com/jsugg/atx/actions/workflows/security.yml)
+[![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
-
-> **Pre-release.** ATX is not yet published: there is no crates.io crate, no
-> GitHub release, and no prebuilt binaries yet. The install instructions and
-> badges below activate when the first release ships.
-
-The public `v0.1.0` tag was an unpublished release rehearsal, not a supported
-release. It stays unchanged for history. `0.1.1` is the first public release
-candidate; it has not shipped yet.
-
-<!-- RELEASE: remove this notice and enable the crate badge below once the
-     first release exists on crates.io. -->
-<!-- [![crates.io](https://img.shields.io/crates/v/atx.svg)](https://crates.io/crates/atx) -->
 
 ATX schedules commands for later without making you write a cron entry.
 
@@ -32,7 +21,27 @@ it crashes.
 
 ## Install
 
-Not published yet. Until the first release, build from source:
+Install from crates.io (recommended; the binary is self-contained):
+
+```console
+cargo install atx
+```
+
+Or install a prebuilt archive with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```console
+cargo binstall atx
+```
+
+You can also grab a prebuilt archive directly from the
+[releases page](https://github.com/jsugg/atx/releases) — static musl binaries
+for Linux (`x86_64`, `aarch64`) plus macOS builds, with SHA-256 checksums,
+CycloneDX SBOMs, and GitHub provenance attestations. The package metadata
+disables third-party quick-install mirrors; source compilation remains a
+fallback when an official archive is unavailable.
+
+To build from source:
 
 ```console
 git clone https://github.com/jsugg/atx
@@ -40,17 +49,9 @@ cd atx
 cargo install --path .
 ```
 
-Once released: `cargo install atx` (recommended; the binary is
-self-contained), or grab a prebuilt archive from the
-[releases page](https://github.com/jsugg/atx/releases) — static musl binaries
-for Linux (`x86_64`, `aarch64`) plus macOS builds, with SHA-256 checksums.
-
-After publication, `cargo binstall atx` can use those official archives with
-[cargo-binstall](https://github.com/cargo-bins/cargo-binstall). The metadata
-disables its third-party quick-install mirror; source compilation remains a
-fallback when an official archive is unavailable.
-
-This project does not maintain Homebrew, AUR or distro packages.
+The historical `v0.1.0` tag was an unpublished release rehearsal, not a
+supported release; `0.1.1` is the first public release. This project does not
+maintain Homebrew, AUR or distro packages.
 
 ## What to expect
 
