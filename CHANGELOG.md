@@ -56,5 +56,5 @@ Unpublished release rehearsal. No GitHub release or crates.io publication was
 made for this version. The public tag remains unchanged; its source is
 historical rehearsal code, not a supported release.
 
-[0.1.1]: https://github.com/jsugg/atx/compare/v0.1.0...HEAD
+[0.1.1]: https://github.com/jsugg/atx/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jsugg/atx/tree/v0.1.0

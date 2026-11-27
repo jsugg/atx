@@ -1,8 +1,7 @@
 # Releasing
 
-There is no published release yet.
-
-Release work is deliberately split:
+The first public release is `v0.1.1` (published on GitHub Releases and
+crates.io). Release automation stays split into verifiable stages:
 
 1. Finish and verify the crate locally.
 2. Publish the repository only after the owner's exact repository approval.
@@ -62,12 +61,12 @@ release.
 
 ## Publishing the crate
 
-Publishing to crates.io is wired but switched off. Every pull request
-rehearses the whole publish flow against a local registry mock with dummy
-credentials — upload, checksum, duplicate rejection, failure handling — so
-the machinery is exercised without anything ever reaching crates.io.
+Every pull request rehearses the publish flow against a local registry mock
+with dummy credentials — upload, checksum, duplicate rejection, failure
+handling — so the machinery is exercised without anything ever reaching
+crates.io.
 
-The real publish job only runs when a GitHub release is published *and* the
+The real publish job runs when a GitHub release is published *and* the
 repository variable `CRATES_IO_PUBLISH_ENABLED` is set to `true`, inside
 the protected `crates-io` environment. It re-checks that the release tag,
 `Cargo.toml`, and `CHANGELOG.md` all agree, refuses to republish an
